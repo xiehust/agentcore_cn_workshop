@@ -1,13 +1,12 @@
--- Part 1 数据摄入 pipeline 建表 DDL
+-- Part 1 数据摄入 pipeline 建表 DDL（Aurora PostgreSQL）
 -- 数据库: product_hunting（由 CloudFormation 创建）
 --
--- 执行方式（redshift-data API，无需客户端）：
---   aws redshift-data execute-statement \
---     --workgroup-name agentcore-workshop \
---     --database product_hunting \
---     --sql "$(cat setup_tables.sql)" \
---     --region us-west-2
--- 或在 Redshift 控制台 Query Editor v2 中直接执行。
+-- 执行方式（RDS Data API，无需客户端；rds-data 一次只能执行一条语句，
+-- deploy.sh 会按分号拆分逐条执行）：
+--   aws rds-data execute-statement \
+--     --resource-arn <ClusterArn> --secret-arn <SecretArn> \
+--     --database product_hunting --sql "<单条语句>" --region us-west-2
+-- 认证走集群主用户 Secret，无需额外 GRANT。
 
 -- ============================================================
 -- 表 1：选品判定记录表
@@ -24,11 +23,12 @@ CREATE TABLE IF NOT EXISTS selection_verdicts (
     current_price   DECIMAL(10,2),                   -- 当前价格（默认变体价）
     monthly_sales   INT,                             -- 总月销量（多变体合计）
     product_score   DECIMAL(10,4),                   -- 预估产品点（若算到）
-    created_at      TIMESTAMP     NOT NULL DEFAULT GETDATE(),
+    created_at      TIMESTAMP     NOT NULL DEFAULT NOW(),
     PRIMARY KEY (verdict_id)
-)
-DISTSTYLE AUTO
-SORTKEY (created_at);
+);
+
+CREATE INDEX IF NOT EXISTS idx_verdicts_created_at
+    ON selection_verdicts (created_at);
 
 -- ============================================================
 -- 表 2：候选档案表（verdict = 采集 的商品）
@@ -47,21 +47,16 @@ CREATE TABLE IF NOT EXISTS product_candidates (
     competitor_min_price_url VARCHAR(1024),           -- 最低价竞品链接
     estimated_price          DECIMAL(10,2),           -- 预估售价 = 竞对最低价 × 0.85
     estimated_monthly_sales  INT,                     -- 预估月销 = 总月销 × 0.5
-    product_score            DECIMAL(10,4) NOT NULL,  -- 预估产品点（> 0.05）
+    product_score            DECIMAL(10,4) NOT NULL,  -- 预估产品点（达标才采集）
     price_flag               VARCHAR(128),            -- 定价标注（如 存疑·待人工补竞品）
     main_image_url           VARCHAR(2048),           -- 主图 URL
-    variants                 SUPER,                   -- 子体明细（JSON：变体名/价/销）
+    variants                 JSONB,                   -- 子体明细（JSON：变体名/价/销）
     certification            VARCHAR(1024),           -- 认证需求（寻源可直接用）
     material_spec            VARCHAR(1024),           -- 材质/规格
     ai_summary               VARCHAR(4096),           -- AI 选品总结
-    created_at               TIMESTAMP     NOT NULL DEFAULT GETDATE(),
+    created_at               TIMESTAMP     NOT NULL DEFAULT NOW(),
     PRIMARY KEY (candidate_id)
-)
-DISTSTYLE AUTO
-SORTKEY (created_at);
+);
 
--- workshop 简化：授权库内所有用户读写两张表。Runtime 执行角色映射的
--- DB 用户（IAMR:<角色名>）由 redshift-data 首次连接时自动创建，
--- 建表时无法点名授权，故用 PUBLIC；生产环境应改为最小授权。
-GRANT SELECT, INSERT, UPDATE, DELETE ON selection_verdicts TO PUBLIC;
-GRANT SELECT, INSERT, UPDATE, DELETE ON product_candidates TO PUBLIC;
+CREATE INDEX IF NOT EXISTS idx_candidates_created_at
+    ON product_candidates (created_at);

@@ -24,19 +24,19 @@
 │   │  │ Strands Agent          │  │      └─────────────────────┘               │
 │   │  │  + AgentSkills 插件     │  │      ┌─────────────────────┐               │
 │   │  │    (选品 SOP Skill)     │  │─────▶│ Code Interpreter    │ 产品点测算     │
-│   │  │  + Redshift 入库工具    │  │      └─────────────────────┘               │
+│   │  │  + Aurora 入库工具      │  │      └─────────────────────┘               │
 │   │  └────────────────────────┘  │                                            │
 │   └──────────────┬───────────────┘                                            │
-│                  │  redshift-data API                                         │
+│                  │  RDS Data API（无需 VPC）                                    │
 │                  ▼                                                            │
 │   ┌──────────────────────────────┐                                            │
-│   │  Redshift Serverless         │  候选档案表 + 判定记录表                     │
+│   │  Aurora Serverless v2 (PG)   │  候选档案表 + 判定记录表（自建 VPC 内）       │
 │   └──────────────────────────────┘                                            │
 └────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────── Part 2: Web Chat 分析门户（预留） ───────────────────────┐
 │   Web 门户 ──▶ AgentCore Identity（认证）──▶ Runtime（分析 Agent）              │
-│                     └─▶ Gateway（数据查询 MCP 工具）──▶ Redshift               │
+│                     └─▶ Gateway（MCP 工具）─▶ Lambda(VPC) ─▶ Aurora(同 VPC)    │
 │                     └─▶ Code Interpreter（图表 / 统计分析）                    │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -67,10 +67,10 @@ Part 1 的核心思路是 **"Agent 框架不变，业务逻辑用 Skill 插拔"*
 │   │   │   └── product-selection/   # 选品 Skill —— 亚马逊（需代理）
 │   │   │       └── SKILL.md
 │   │   └── tools/                   # 自定义工具
-│   │       ├── redshift_tools.py    # Redshift Serverless 入库工具
+│   │       ├── aurora_tools.py      # Aurora 入库工具（RDS Data API）
 │   │       └── browser_ext.py       # Browser 扩展（Web Bot Auth / Profile）
 │   ├── infra/                       # 基础设施
-│   │   ├── redshift-serverless.yaml # CloudFormation：Redshift Serverless
+│   │   ├── aurora-serverless.yaml   # CloudFormation：Aurora Serverless v2 + VPC
 │   │   └── setup_tables.sql         # 建表 DDL
 │   └── scripts/                     # 部署与测试脚本
 │       ├── deploy.sh                # 一键部署（infra + agent）

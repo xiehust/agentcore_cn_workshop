@@ -1,13 +1,18 @@
-"""Redshift Serverless 入库工具。
+"""Aurora Serverless（PostgreSQL）入库工具。
 
-通过 redshift-data API（无需管理连接/驱动）把选品判定结果写入 Redshift Serverless：
+通过 RDS Data API（无需数据库连接/驱动/VPC）把选品判定结果写入 Aurora：
 - save_verdict     : 每个商品的判定记录（PASS / 排除 / 补采 / 采集）
 - save_candidate   : 判定为"采集"的商品的完整候选档案
 
 设计说明：
-- 使用 boto3 redshift-data API，Agent 运行角色只需要 redshift-data:* 与
-  redshift-serverless:GetCredentials 权限，无需网络直连数仓（适合托管 Runtime）。
-- SQL 一律使用参数化（Parameters），避免拼接注入。
+- 使用 boto3 rds-data API（同步返回），Agent 运行角色只需要
+  rds-data:ExecuteStatement 等 + 集群主用户 Secret 的读取权限，
+  无需网络直连数据库（适合托管 Runtime，Runtime 不用挂 VPC）。
+  Part 2 的数据查询 Lambda 则计划挂进 Aurora 所在 VPC 直连集群，
+  验证 Gateway -> Lambda(VPC) -> Aurora 方案。
+- SQL 一律使用参数化（parameters），避免拼接注入。
+- 集群 MinCapacity=0 会空闲自动暂停，首次调用触发冷恢复
+  （约 15 秒~1 分钟），_execute 内置重试等待。
 - 表结构见 infra/setup_tables.sql。
 """
 
@@ -17,64 +22,70 @@ import time
 import uuid
 
 import boto3
+from botocore.exceptions import ClientError
 from strands import tool
 
-# ---- 环境变量配置（部署时通过 agentcore configure --env 或控制台注入） ----
+# ---- 环境变量配置（deploy.sh 从 CloudFormation 输出注入） ----
 REGION = os.environ.get("AWS_REGION", "us-west-2")
-# Redshift Serverless 工作组名称
-WORKGROUP = os.environ.get("REDSHIFT_WORKGROUP", "agentcore-workshop")
-# 目标数据库名
-DATABASE = os.environ.get("REDSHIFT_DATABASE", "product_hunting")
+CLUSTER_ARN = os.environ.get("AURORA_CLUSTER_ARN", "")
+SECRET_ARN = os.environ.get("AURORA_SECRET_ARN", "")
+DATABASE = os.environ.get("AURORA_DATABASE", "product_hunting")
 
 _client = None
 
 
-def _rs_client():
-    """惰性创建 redshift-data 客户端（避免 import 阶段就要求凭证）。"""
+def _rds_client():
+    """惰性创建 rds-data 客户端（避免 import 阶段就要求凭证）。"""
     global _client
     if _client is None:
-        _client = boto3.client("redshift-data", region_name=REGION)
+        _client = boto3.client("rds-data", region_name=REGION)
     return _client
 
 
 def _execute(sql: str, parameters: list | None = None) -> dict:
-    """执行一条 SQL 并等待完成，返回执行状态。
+    """执行一条 SQL，返回执行状态。
 
-    redshift-data 是异步 API：先 execute_statement 拿 Id，再轮询 describe_statement。
+    rds-data 是同步 API；集群自动暂停后首次调用会抛 DatabaseResumingException
+    （或提示 resuming 的 BadRequestException），等待重试即可。
     """
-    client = _rs_client()
+    if not CLUSTER_ARN or not SECRET_ARN:
+        return {
+            "status": "error",
+            "error": "缺少 AURORA_CLUSTER_ARN / AURORA_SECRET_ARN 环境变量",
+        }
+
     kwargs: dict = {
-        "WorkgroupName": WORKGROUP,
-        "Database": DATABASE,
-        "Sql": sql,
+        "resourceArn": CLUSTER_ARN,
+        "secretArn": SECRET_ARN,
+        "database": DATABASE,
+        "sql": sql,
     }
     if parameters:
-        kwargs["Parameters"] = parameters
+        kwargs["parameters"] = parameters
 
-    resp = client.execute_statement(**kwargs)
-    statement_id = resp["Id"]
-
-    # 轮询直到语句结束。入库语句通常 1~2 秒完成，但 Redshift Serverless
-    # 空闲自动暂停后，冷恢复需要 1~3 分钟，窗口须覆盖恢复时间，
-    # 否则语句实际会成功、工具却误报 timeout
-    for _ in range(180):
-        desc = client.describe_statement(Id=statement_id)
-        status = desc["Status"]
-        if status == "FINISHED":
-            return {"status": "ok", "statement_id": statement_id}
-        if status in ("FAILED", "ABORTED"):
-            return {
-                "status": "error",
-                "statement_id": statement_id,
-                "error": desc.get("Error", "unknown"),
-            }
-        time.sleep(1)
-    return {"status": "error", "statement_id": statement_id, "error": "timeout"}
+    last_err = "unknown"
+    for _ in range(36):  # 最长约 3 分钟，覆盖冷恢复
+        try:
+            _rds_client().execute_statement(**kwargs)
+            return {"status": "ok"}
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            msg = str(e)
+            # 集群从暂停中恢复：等待后重试；其余错误直接返回
+            if code == "DatabaseResumingException" or "resum" in msg.lower():
+                last_err = msg
+                time.sleep(5)
+                continue
+            return {"status": "error", "error": msg}
+    return {"status": "error", "error": f"集群恢复等待超时: {last_err}"}
 
 
 def _p(name: str, value) -> dict:
-    """构造 redshift-data 的参数对象（值统一转字符串）。"""
-    return {"name": name, "value": "" if value is None else str(value)}
+    """构造 rds-data 的参数对象（值统一转字符串，SQL 里按需 cast）。"""
+    return {
+        "name": name,
+        "value": {"stringValue": "" if value is None else str(value)},
+    }
 
 
 @tool
@@ -88,13 +99,13 @@ def save_verdict(
     monthly_sales: int | None = None,
     product_score: float | None = None,
 ) -> str:
-    """把一个商品的选品判定结果写入 Redshift（每个商品判定完必须调用）。
+    """把一个商品的选品判定结果写入数仓（每个商品判定完必须调用）。
 
     Args:
         asin_or_url: 商品 ASIN 或详情页 URL
         product_title: 商品英文标题（listing 标题）
         verdict: 判定结果，只能是: PASS / 排除 / 补采 / 采集
-        reason: 判定原因，如 "价≤£10"、"黑名单:3C"、"产品点0.12达标"
+        reason: 判定原因，如 "价≤£5"、"黑名单:3C"、"产品点达标"
         site: 站点，默认 UK
         current_price: 当前价格（默认变体价，单位为站点货币）
         monthly_sales: 总月销量（多变体合计）
@@ -115,7 +126,7 @@ def save_verdict(
              NULLIF(:current_price, '')::DECIMAL(10,2),
              NULLIF(:monthly_sales, '')::INT,
              NULLIF(:product_score, '')::DECIMAL(10,4),
-             GETDATE())
+             NOW())
     """
     result = _execute(
         sql,
@@ -155,10 +166,10 @@ def save_candidate(
     site: str = "UK",
     price_flag: str = "",
 ) -> str:
-    """把判定为"采集"的商品完整候选档案写入 Redshift。
+    """把判定为"采集"的商品完整候选档案写入数仓。
 
     Args:
-        asin_or_url: 竞对链接（= 候选品自己的 Amazon 详情页）
+        asin_or_url: 竞对链接（= 候选品自己的详情页）
         product_name_cn: 商品中文名（简短，如"桌面储物套装"）
         product_title_en: 商品英文名（listing 标题）
         search_keyword: 经哪个词/类目搜到的
@@ -166,7 +177,7 @@ def save_candidate(
         monthly_sales: 总月销量（多变体合计）
         competitor_min_price: 同赛道竞对最低价（无竞品兜底时=当前价）
         competitor_min_price_url: 最低价竞品链接（兜底时可留空）
-        product_score: 预估产品点（沙箱计算结果，必须 > 0.05）
+        product_score: 预估产品点（沙箱计算结果，须达标）
         main_image_url: 主图 URL
         variants: 子体明细 JSON 字符串，如 [{"name":"红色","price":12.9,"sales":"展示用"}]
         certification: 认证需求（一句寻源可直接用的话）
@@ -193,10 +204,10 @@ def save_candidate(
              ROUND(:competitor_min_price::DECIMAL(10,2) * 0.85, 2),
              (:monthly_sales::INT / 2),
              :product_score::DECIMAL(10,4), :price_flag,
-             :main_image_url, JSON_PARSE(NULLIF(:variants, '')), :certification,
-             :material_spec, :ai_summary, GETDATE())
+             :main_image_url, NULLIF(:variants, '')::JSONB, :certification,
+             :material_spec, :ai_summary, NOW())
     """
-    # variants 必须是合法 JSON 才能 JSON_PARSE，先做一次校验，坏数据降级为空
+    # variants 必须是合法 JSON 才能转 JSONB，先做一次校验，坏数据降级包装
     variants_json = ""
     if variants:
         try:

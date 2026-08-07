@@ -15,7 +15,7 @@ AgentCore Identity ──── 校验用户身份，为 Agent 换取访问下�
    │
    ▼
 AgentCore Runtime（数据分析 Agent，Strands SDK）
-   ├──▶ AgentCore Gateway ──▶ 数据查询 API（Lambda）──▶ Redshift Serverless
+   ├──▶ AgentCore Gateway ──▶ 数据查询 Lambda（挂进 Aurora 所在 VPC）──▶ Aurora Serverless（同 VPC 直连）
    │        （把 REST/Lambda 转成 MCP 工具，Agent 直接调用）
    └──▶ Code Interpreter：统计分析、图表生成（如选品漏斗、产品点分布）
 ```
@@ -25,7 +25,7 @@ AgentCore Runtime（数据分析 Agent，Strands SDK）
 | 组件 | 用途 |
 |------|------|
 | **Runtime** | 托管分析 Agent，按用户 session 隔离 |
-| **Gateway** | 把 Redshift 查询 API（Lambda）转换成 MCP 工具暴露给 Agent |
+| **Gateway** | 把数据查询 Lambda 转换成 MCP 工具暴露给 Agent。Lambda 挂进 Part 1 创建的 Aurora VPC 直连集群——验证 Gateway 侧不使用 VPC egress、由 VPC 内 Lambda 承担私网访问的方案 |
 | **Identity** | 门户用户认证（inbound auth）+ Agent 访问 Gateway 的授权（outbound auth） |
 | **Code Interpreter** | 对查询结果做统计分析、生成图表 |
 

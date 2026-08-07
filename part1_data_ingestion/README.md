@@ -2,7 +2,8 @@
 
 一个部署在 **AgentCore Runtime** 的 Strands Agent，按"选品 SOP" Skill 的规则，
 用 **AgentCore Browser** 爬取 eBay 商品数据（默认站点；亚马逊需配代理，见常见问题）、
-用 **Code Interpreter** 做经济测算，把判定结果写入 **Redshift Serverless**。
+用 **Code Interpreter** 做经济测算，把判定结果经 RDS Data API 写入
+**Aurora Serverless v2（PostgreSQL）**（Agent 无需挂 VPC）。
 
 ## 工作原理
 
@@ -49,11 +50,11 @@ bash scripts/deploy.sh
 
 | 步骤 | 内容 | 说明 |
 |------|------|------|
-| 1 | CloudFormation 部署 Redshift Serverless | namespace + workgroup（8 RPU）+ IAM 策略 |
+| 1 | CloudFormation 部署 Aurora Serverless v2 | 自建 VPC + 私有子网 + Aurora（Data API，Min 0 ACU 自动暂停）+ IAM 策略。VPC 留给 Part 2 的 Lambda 直连验证 |
 | 2 | 建表 | `selection_verdicts`（判定记录）、`product_candidates`（候选档案） |
 | 3 | 创建自定义 Browser 与 Browser Profile | browser 开启 Web Bot Auth（请求签名，减少验证码，预览功能）；profile 跨会话保留 cookies/localStorage。均按名字幂等，重复执行会复用 |
 | 4 | `agentcore configure && agentcore launch` | direct_code_deploy 直接部署代码到 Runtime（无需 Docker），并注入 browser/profile ID 等环境变量 |
-| 5 | 附加数仓/浏览器访问策略到 Runtime 执行角色 | redshift-data 入库权限 + 自定义 browser 与 profile 的会话/保存权限 |
+| 5 | 附加数仓/浏览器访问策略到 Runtime 执行角色 | rds-data 入库权限 + Secret 读取 + 自定义 browser 与 profile 的会话/保存权限 |
 
 > 也可以分步手动执行，每个步骤的命令都在 `deploy.sh` 中有注释。
 
@@ -70,18 +71,21 @@ agentcore invoke '{"prompt": "从 eBay 英国站搜索 desk organizer 选品，�
 
 ```bash
 # 查最近 10 条判定记录
-ID=$(aws redshift-data execute-statement \
-  --workgroup-name agentcore-workshop --database product_hunting \
-  --sql "SELECT verdict, reason, product_title, product_score FROM selection_verdicts ORDER BY created_at DESC LIMIT 10" \
-  --region us-west-2 --query Id --output text)
-sleep 3
-aws redshift-data get-statement-result --id "$ID" --region us-west-2
+# 集群/Secret ARN 从 CloudFormation 输出获取
+CLUSTER_ARN=$(aws cloudformation describe-stacks --stack-name agentcore-workshop-aurora \
+  --region us-west-2 --query "Stacks[0].Outputs[?OutputKey=='ClusterArn'].OutputValue" --output text)
+SECRET_ARN=$(aws cloudformation describe-stacks --stack-name agentcore-workshop-aurora \
+  --region us-west-2 --query "Stacks[0].Outputs[?OutputKey=='SecretArn'].OutputValue" --output text)
+# rds-data 同步返回结果，无需轮询
+aws rds-data execute-statement --resource-arn "$CLUSTER_ARN" --secret-arn "$SECRET_ARN" \
+  --database product_hunting --region us-west-2 \
+  --sql "SELECT verdict, reason, product_title, product_score FROM selection_verdicts ORDER BY created_at DESC LIMIT 10"
 
 # 查候选档案
 # ... --sql "SELECT product_name_cn, product_score, ai_summary FROM product_candidates ORDER BY created_at DESC" ...
 ```
 
-也可以在 Redshift 控制台的 Query Editor v2 里直接查询。
+也可以在 RDS 控制台的 Query Editor（Data API）里直接查询。
 
 ## 本地调试（不部署 Runtime）
 
@@ -90,8 +94,8 @@ cd agent
 python ../scripts/local_test.py "从 eBay 英国站搜索 desk organizer，对第 1 个非广告商品做选品判定并入库"
 ```
 
-Agent 本体跑在本机，但 Browser / Code Interpreter / Redshift 仍是云端服务
-（本机凭证需要 `bedrock-agentcore:*`、`redshift-data:*` 及
+Agent 本体跑在本机，但 Browser / Code Interpreter / Aurora 仍是云端服务
+（本机凭证需要 `bedrock-agentcore:*`、`rds-data:*`、数仓 Secret 读取及
 `bedrock:InvokeModel` 权限；模型调用默认用本机 AWS 凭证自动铸 token，
 也可 `export OPENAI_API_KEY=<Bedrock API key>` 显式指定）。
 
@@ -110,9 +114,9 @@ agentcore invoke -l '{"prompt": "..."}'
 | `agent/main.py` | Runtime 入口：BedrockAgentCoreApp + Strands Agent 组装 |
 | `agent/skills/product-selection-ebay/SKILL.md` | 选品 SOP Skill —— eBay 英国站（默认站点） |
 | `agent/skills/product-selection/SKILL.md` | 选品 SOP Skill —— 亚马逊英国站（需代理） |
-| `agent/tools/redshift_tools.py` | save_verdict / save_candidate 入库工具 |
+| `agent/tools/aurora_tools.py` | save_verdict / save_candidate 入库工具（RDS Data API） |
 | `agent/tools/browser_ext.py` | Browser 扩展：Web Bot Auth 自定义 browser 接入 + profile 恢复/保存 |
-| `infra/redshift-serverless.yaml` | Redshift Serverless CloudFormation 模板 |
+| `infra/aurora-serverless.yaml` | Aurora Serverless v2 + VPC CloudFormation 模板 |
 | `infra/setup_tables.sql` | 两张表的 DDL |
 | `scripts/deploy.sh` | 一键部署 |
 | `scripts/local_test.py` | 本地跑 Agent |

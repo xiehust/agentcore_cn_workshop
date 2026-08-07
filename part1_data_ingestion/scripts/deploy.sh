@@ -2,8 +2,8 @@
 # Part 1 一键部署脚本
 #
 # 步骤：
-#   1. 部署 Redshift Serverless（CloudFormation）
-#   2. 建表（redshift-data API）
+#   1. 部署 Aurora Serverless v2 + VPC（CloudFormation）
+#   2. 建表（RDS Data API）
 #   3. 创建自定义 Browser（开启 Web Bot Auth）与 Browser Profile
 #   4. 部署 Agent 到 AgentCore Runtime（agentcore CLI）
 #   5. 把数仓/浏览器访问策略附加到 Runtime 执行角色
@@ -21,8 +21,7 @@ elif [ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ]; then
 else
   echo "ℹ️  未设置 API key，模型调用将用 Runtime IAM 角色自动铸 token"
 fi
-STACK_NAME="agentcore-workshop-redshift"
-WORKGROUP="agentcore-workshop"
+STACK_NAME="agentcore-workshop-aurora"
 DATABASE="product_hunting"
 AGENT_NAME="product_ingestion_agent"
 BROWSER_NAME="product_hunting_browser"
@@ -32,36 +31,40 @@ BROWSER_ROLE_NAME="agentcore-workshop-browser-role"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PART1_DIR="$(dirname "$SCRIPT_DIR")"
 
-echo "==> [1/5] 部署 Redshift Serverless（首次约需 3~5 分钟）..."
+echo "==> [1/5] 部署 Aurora Serverless v2 + VPC（首次约需 10 分钟）..."
 aws cloudformation deploy \
-  --template-file "$PART1_DIR/infra/redshift-serverless.yaml" \
+  --template-file "$PART1_DIR/infra/aurora-serverless.yaml" \
   --stack-name "$STACK_NAME" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region "$REGION"
 
-POLICY_ARN=$(aws cloudformation describe-stacks \
-  --stack-name "$STACK_NAME" --region "$REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='AgentDataAccessPolicyArn'].OutputValue" \
-  --output text)
+_stack_output() {
+  aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
+    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+}
+POLICY_ARN=$(_stack_output AgentDataAccessPolicyArn)
+CLUSTER_ARN=$(_stack_output ClusterArn)
+SECRET_ARN=$(_stack_output SecretArn)
 echo "    数仓访问策略: $POLICY_ARN"
+echo "    Aurora 集群: $CLUSTER_ARN"
 
 echo "==> [2/5] 创建数据表..."
-STATEMENT_ID=$(aws redshift-data execute-statement \
-  --workgroup-name "$WORKGROUP" \
-  --database "$DATABASE" \
-  --sql "$(cat "$PART1_DIR/infra/setup_tables.sql")" \
-  --region "$REGION" \
-  --query Id --output text)
-# 等待建表语句执行完成
-for i in $(seq 1 30); do
-  STATUS=$(aws redshift-data describe-statement --id "$STATEMENT_ID" \
-    --region "$REGION" --query Status --output text)
-  [ "$STATUS" = "FINISHED" ] && break
-  if [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "ABORTED" ]; then
-    echo "建表失败:"; aws redshift-data describe-statement --id "$STATEMENT_ID" --region "$REGION" --query Error --output text
-    exit 1
-  fi
-  sleep 2
+# rds-data 一次只能执行一条语句：去掉注释后按分号拆分逐条执行。
+# 集群空闲自动暂停（MinCapacity=0），首条语句可能触发冷恢复，带重试。
+mapfile -t STMTS < <(sed 's/--.*//' "$PART1_DIR/infra/setup_tables.sql" | tr '\n' ' ' | tr ';' '\n' | grep -vE '^\s*$')
+for stmt in "${STMTS[@]}"; do
+  for attempt in $(seq 1 24); do
+    if aws rds-data execute-statement --region "$REGION" \
+      --resource-arn "$CLUSTER_ARN" --secret-arn "$SECRET_ARN" \
+      --database "$DATABASE" --sql "$stmt" >/dev/null 2>/tmp/rds_data_err; then
+      break
+    fi
+    if [ "$attempt" -eq 24 ]; then
+      echo "建表失败:"; cat /tmp/rds_data_err; exit 1
+    fi
+    echo "    等待集群恢复后重试（$attempt/24）..."
+    sleep 10
+  done
 done
 echo "    建表完成（selection_verdicts / product_candidates）"
 
@@ -131,14 +134,15 @@ echo "==> [4/5] 部署 Agent 到 AgentCore Runtime..."
 cd "$PART1_DIR/agent"
 # configure：生成 .bedrock_agentcore.yaml（自动创建执行角色 / ECR 仓库）
 # --disable-memory：不自动创建 AgentCore Memory（本 demo 不用自带记忆，
-# Agent 每次调用无状态，历史数据都在 Redshift）
+# Agent 每次调用无状态，历史数据都在 Aurora）
 agentcore configure --entrypoint main.py --name "$AGENT_NAME" --region "$REGION" \
   --requirements-file requirements.txt --non-interactive --disable-memory
 # launch：默认 direct_code_deploy 模式，直接把代码部署到 Runtime（本机无需 Docker）
 #（MODEL_ID / OPENAI_BASE_URL 不设则用 main.py 内置默认值）
 agentcore launch \
-  --env REDSHIFT_WORKGROUP="$WORKGROUP" \
-  --env REDSHIFT_DATABASE="$DATABASE" \
+  --env AURORA_CLUSTER_ARN="$CLUSTER_ARN" \
+  --env AURORA_SECRET_ARN="$SECRET_ARN" \
+  --env AURORA_DATABASE="$DATABASE" \
   ${OPENAI_API_KEY:+--env OPENAI_API_KEY="$OPENAI_API_KEY"} \
   ${AWS_BEARER_TOKEN_BEDROCK:+--env AWS_BEARER_TOKEN_BEDROCK="$AWS_BEARER_TOKEN_BEDROCK"} \
   --env BROWSER_IDENTIFIER="$BROWSER_ID" \
@@ -188,4 +192,4 @@ fi
 
 echo ""
 echo "✅ 部署完成！测试调用:"
-echo "   agentcore invoke '{\"prompt\": \"从亚马逊英国站 Home & Kitchen Best Sellers 选品，处理前 2 个商品\"}'"
+echo "   agentcore invoke '{\"prompt\": \"从 eBay 英国站搜索 desk organizer 选品，处理前 2 个非广告商品\"}'"

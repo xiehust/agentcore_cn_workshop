@@ -1,6 +1,6 @@
 ---
 name: product-selection-ebay
-description: 跨境电商选品数据摄入 SOP（eBay 英国站，默认站点）。当用户要求执行选品、爬取 eBay 商品做选品判定、或未指定站点的选品数据摄入任务时使用本 Skill。按硬性规则对商品做出 采集/排除/补采 三选一判定，并把结果写入 Redshift。
+description: 跨境电商选品数据摄入 SOP（eBay 英国站，默认站点）。当用户要求执行选品、爬取 eBay 商品做选品判定、或未指定站点的选品数据摄入任务时使用本 Skill。按硬性规则对商品做出 采集/排除/补采 三选一判定，并把结果写入 Aurora 数仓。
 ---
 
 # 跨境电商选品 SOP（eBay 英国站 UK）
@@ -34,7 +34,7 @@ description: 跨境电商选品数据摄入 SOP（eBay 英国站，默认站点�
    - 先 `initSession` 创建会话，再 `executeCode` 执行 Python 计算。
    - 用于：月销估算、上架天数计算、经济测算（预估售价/预估月销/产品点）、门槛比较。
    - **不要心算**，公式必须在沙箱里执行，保证计算过程可审计。
-3. **save_verdict / save_candidate（Redshift 入库工具）**：判定结果入库。
+3. **save_verdict / save_candidate（Aurora 入库工具）**：判定结果入库。
    - **每个**商品判定完成后调用 `save_verdict`（含 R1 未过的 PASS），site 填 `UK`。
    - 判定为"采集"的商品，额外调用 `save_candidate` 写入完整候选档案。
 

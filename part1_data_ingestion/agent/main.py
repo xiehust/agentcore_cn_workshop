@@ -12,7 +12,8 @@
 - Skill 插件       : 业务 SOP（选品流程）以 SKILL.md 形式放在 skills/ 目录，
                      通过 Strands 的 AgentSkills 插件加载。新增业务场景只需
                      新增 skill 目录，Agent 代码零改动。
-- 自定义工具       : tools/redshift_tools.py 把判定结果写入 Redshift Serverless。
+- 自定义工具       : tools/aurora_tools.py 通过 RDS Data API 把判定结果写入
+                     Aurora Serverless（PostgreSQL），Runtime 无需挂 VPC。
 
 调用方式（部署后）：
     agentcore invoke '{"prompt": "从 eBay 英国站搜索 desk organizer 选品，处理前 3 个非广告商品"}'
@@ -26,8 +27,8 @@ from strands import Agent
 from strands.models.openai_responses import OpenAIResponsesModel
 from strands_tools.code_interpreter import AgentCoreCodeInterpreter
 
+from tools.aurora_tools import save_candidate, save_verdict
 from tools.browser_ext import ExtendedAgentCoreBrowser
-from tools.redshift_tools import save_candidate, save_verdict
 
 # ---- 配置（可通过环境变量覆盖） ----
 REGION = os.environ.get("AWS_REGION", "us-west-2")
@@ -118,7 +119,7 @@ def create_agent(browser: ExtendedAgentCoreBrowser | None = None) -> Agent:
             "AgentCore Runtime 中。你的通用能力：\n"
             "1. browser 工具：云端浏览器，用于爬取网页数据；\n"
             "2. code_interpreter 工具：安全沙箱，用于执行计算和数据处理；\n"
-            "3. save_verdict / save_candidate 工具：把结果写入 Redshift 数仓。\n\n"
+            "3. save_verdict / save_candidate 工具：把结果写入 Aurora 数仓。\n\n"
             "具体的业务流程（做什么、怎么判定、什么门槛）由已加载的 Skill 定义。"
             "收到任务后，先匹配最相关的 Skill 并严格按其规则执行。"
             "Skill 中的门槛与公式是硬性规则，不得放宽；抓不到的数据如实标注，"

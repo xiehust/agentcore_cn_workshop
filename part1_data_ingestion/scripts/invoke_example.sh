@@ -16,10 +16,12 @@ agentcore invoke '{"prompt": "从 eBay 英国站搜索 desk organizer 选品，�
 # 示例 4：亚马逊站点（需先配置住宅代理，否则会被 503 拦截，见 README 常见问题）
 # agentcore invoke '{"prompt": "从亚马逊英国站搜索 desk organizer，对第 1 个非广告商品做选品判定并入库"}'
 
-# 验证入库结果（redshift-data API 查询）：
-# aws redshift-data execute-statement \
-#   --workgroup-name agentcore-workshop --database product_hunting \
+# 验证入库结果（RDS Data API 查询，同步返回结果）：
+# CLUSTER_ARN/SECRET_ARN 从 CloudFormation 输出获取：
+#   aws cloudformation describe-stacks --stack-name agentcore-workshop-aurora \
+#     --region us-west-2 --query "Stacks[0].Outputs"
+# aws rds-data execute-statement \
+#   --resource-arn <ClusterArn> --secret-arn <SecretArn> \
+#   --database product_hunting \
 #   --sql "SELECT verdict, reason, product_title FROM selection_verdicts ORDER BY created_at DESC LIMIT 10" \
 #   --region us-west-2
-# 然后用返回的 Id 取结果:
-# aws redshift-data get-statement-result --id <Id> --region us-west-2
