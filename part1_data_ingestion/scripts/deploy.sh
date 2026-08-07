@@ -14,6 +14,12 @@
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-west-2}"
+# Bedrock API key 以 ABSK 开头；环境里若残留 OpenAI 官网的 sk- key，
+# 透传进 Runtime 会压过 AWS_BEARER_TOKEN_BEDROCK 导致模型 401，这里直接忽略
+if [ -n "${OPENAI_API_KEY:-}" ] && [[ "${OPENAI_API_KEY}" != ABSK* ]]; then
+  echo "⚠️  OPENAI_API_KEY 不是 Bedrock API key（非 ABSK 前缀），忽略；改用 AWS_BEARER_TOKEN_BEDROCK / IAM"
+  unset OPENAI_API_KEY
+fi
 if [ -n "${OPENAI_API_KEY:-}" ]; then
   echo "ℹ️  使用显式 OPENAI_API_KEY 认证模型（须是 Bedrock API key，不是 OpenAI 官网 sk- key）"
 elif [ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ]; then

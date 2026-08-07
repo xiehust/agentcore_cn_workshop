@@ -1,0 +1,46 @@
+[
+  {
+    "name": "get_selection_funnel",
+    "description": "选品漏斗固定报表：返回指定天数内的判定分布（PASS/排除/补采/采集）、处理总数和候选档案入库数。用户要看选品漏斗、转化情况时优先用这个工具。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "days": {
+          "type": "integer",
+          "description": "统计最近多少天，默认 30，最大 365"
+        }
+      }
+    }
+  },
+  {
+    "name": "get_category_distribution",
+    "description": "类目/赛道分布固定报表：按候选档案的搜索/细分关键词统计数量、均价、平均产品点，并附各站点判定分布。数仓无独立类目字段，以关键词近似赛道（结果中已注明口径）。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "days": {
+          "type": "integer",
+          "description": "统计最近多少天，默认 90，最大 365"
+        }
+      }
+    }
+  },
+  {
+    "name": "run_sql_query",
+    "description": "开放式即席分析：对选品数仓（Aurora PostgreSQL，库 product_hunting）执行单条只读 SELECT/WITH 查询。表：selection_verdicts(verdict_id, site, asin_or_url, product_title, verdict, reason, current_price, monthly_sales, product_score, created_at)；product_candidates(candidate_id, site, asin_or_url, product_name_cn, product_title_en, search_keyword, current_price, monthly_sales, competitor_min_price, competitor_min_price_url, estimated_price, estimated_monthly_sales, product_score, price_flag, main_image_url, variants(JSONB), certification, material_spec, ai_summary, created_at)。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sql": {
+          "type": "string",
+          "description": "单条只读 SQL（SELECT 或 WITH 开头，不带分号）"
+        },
+        "max_rows": {
+          "type": "integer",
+          "description": "返回行数上限，默认 100，最大 500"
+        }
+      },
+      "required": ["sql"]
+    }
+  }
+]

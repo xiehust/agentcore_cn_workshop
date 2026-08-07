@@ -1,0 +1,100 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AgentCore Workshop Part 2 - 分析链路基础设施。
+  数据查询 Lambda 挂进 Part 1 创建的 Aurora VPC，与集群同 VPC 直连 5432，
+  验证「Gateway -> Lambda(VPC) -> Aurora(同 VPC)」方案：Gateway 侧不使用
+  VPC egress，私网访问全部由 VPC 内的 Lambda 承担。
+  本模板只建 IAM 角色和 Secrets Manager VPC 端点；Lambda 函数本体由
+  deploy.sh 打包创建（含 pg8000 依赖）。
+
+Parameters:
+  VpcId:
+    Type: String
+    Description: Part 1 Aurora 栈输出的 VpcId
+  PrivateSubnetIds:
+    Type: CommaDelimitedList
+    Description: Part 1 Aurora 栈输出的 PrivateSubnetIds
+  LambdaClientSecurityGroupId:
+    Type: String
+    Description: Part 1 Aurora 栈输出的 LambdaClientSecurityGroupId（已被授权访问集群 5432）
+  DbSecretArn:
+    Type: String
+    Description: Aurora 主用户凭证 Secret 的 ARN
+  AnalyticsFunctionName:
+    Type: String
+    Default: agentcore-workshop-analytics
+
+Resources:
+  # VPC 无 IGW/NAT，Lambda 取数据库凭证需要 Secrets Manager 的接口端点
+  SecretsEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Secrets Manager VPC endpoint access (workshop part2)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaClientSecurityGroupId
+
+  SecretsManagerVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcEndpointType: Interface
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds: [!Ref SecretsEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # 数据查询 Lambda 的执行角色：VPC ENI 管理 + 读数据库 Secret
+  AnalyticsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agentcore-workshop-analytics-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Ref DbSecretArn
+
+  # Gateway 的执行角色：只需要能调数据查询 Lambda
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agentcore-workshop-gateway-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: invoke-analytics-lambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AnalyticsFunctionName}
+
+Outputs:
+  AnalyticsLambdaRoleArn:
+    Value: !GetAtt AnalyticsLambdaRole.Arn
+  GatewayRoleArn:
+    Value: !GetAtt GatewayRole.Arn
+  AnalyticsFunctionName:
+    Value: !Ref AnalyticsFunctionName
