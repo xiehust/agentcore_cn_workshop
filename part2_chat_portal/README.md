@@ -9,7 +9,8 @@
 用户浏览器（React SPA，本地 dev server）
    │  ① OIDC 登录（Authorization Code + PKCE）
    ▼
-Keycloak（自部署 IdP：自定义镜像 → ECR → App Runner，自带 HTTPS 域名）
+Keycloak（自部署 IdP：自定义镜像 → ECR → ECS Fargate，
+         HTTPS 入口 = API Gateway HTTP API + VPC Link + Cloud Map）
    │  ② access token（audience=analysis-runtime）
    ▼
 AgentCore Runtime（分析 Agent，Strands SDK，SSE 流式）
@@ -70,7 +71,7 @@ export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>   # 或依赖 IAM 自动铸 to
 ./scripts/deploy.sh
 ```
 
-脚本幂等，可重复执行。首次部署约 15 分钟（App Runner 建服务最慢）。部署机密
+脚本幂等，可重复执行。首次部署约 10 分钟。部署机密
 （Keycloak admin 密码、demo 账号密码、M2M client secret）生成后存放在
 `.deploy/secrets.env`（已 gitignore）。
 
@@ -97,9 +98,12 @@ cd web && npm install && npm run dev
   带 `analysis-runtime`，Agent 的 M2M token 带 `analysis-gateway`；Runtime 和
   Gateway 的 JWT authorizer 各自校验（AgentCore 的 `allowedClients` 校验的是
   `client_id` claim，Keycloak 默认不带，所以用 `allowedAudience`）。
-- **Keycloak on App Runner**：start-dev + `--import-realm`（realm 配置烧进镜像，
-  重启自动恢复）；App Runner 自带 HTTPS 域名，若容器收不到 `X-Forwarded-Proto`
-  导致 issuer 变 http，deploy.sh 会自动追加 `KC_HOSTNAME` 强制 https。
+- **Keycloak on Fargate**：App Runner 自 2026-04-30 起不再接受新客户，改用
+  最接近的组合——ECS Fargate（ARM64）跑容器，HTTPS 入口用 API Gateway HTTP API
+  + VPC Link + Cloud Map 服务发现（免域名的 `execute-api` 端点，无需 ALB）；
+  start-dev + `--import-realm`（realm 配置烧进镜像，重启自动恢复）；若容器
+  收不到 `X-Forwarded-Proto` 导致 issuer 变 http，deploy.sh 会自动设置
+  `KC_HOSTNAME` 强制 https。
 - **Aurora 冷恢复**：集群 MinCapacity=0 空闲自动暂停，Lambda 首次连接会触发恢复
   （15 秒~1 分钟），连接层带重试；首个问题偶尔偏慢属正常现象。
 

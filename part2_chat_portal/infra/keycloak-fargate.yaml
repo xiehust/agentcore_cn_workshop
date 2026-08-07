@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AgentCore Workshop Part 2 - 自部署 Keycloak（ECS on Fargate）。
+  App Runner 自 2026-04-30 起不再接受新客户，新项目改用最接近的组合：
+  Fargate 跑容器 + API Gateway HTTP API（免域名的 execute-api HTTPS 端点，
+  满足 AgentCore JWT authorizer 对公网 HTTPS discovery URL 的要求）
+  + VPC Link + Cloud Map 服务发现（无需 ALB，无固定负载均衡成本）。
+  任务跑在自建小 VPC 的公有子网（公网 IP 仅用于拉 ECR 镜像的出向流量；
+  入向 8080 只对 VPC Link 的安全组开放）。
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: Keycloak 镜像（ECR URI:tag，deploy.sh 构建推送）
+  KcAdminPassword:
+    Type: String
+    NoEcho: true
+  KcHostname:
+    Type: String
+    Default: ""
+    Description: 可选。API Gateway 未传 X-Forwarded-Proto 导致 issuer 非 https 时，设为门户完整 URL 强制修正
+
+Conditions:
+  HasHostname: !Not [!Equals [!Ref KcHostname, ""]]
+
+Resources:
+  # ---- 网络：小型公有 VPC（无 NAT；任务公网 IP 负责出向拉镜像） ----
+  KcVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.30.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: agentcore-workshop-keycloak-vpc }]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref KcVpc
+      InternetGatewayId: !Ref Igw
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref KcVpc
+      CidrBlock: 10.30.0.0/26
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref KcVpc
+      CidrBlock: 10.30.0.64/26
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref KcVpc
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+  SubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  SubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+
+  VpcLinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: API Gateway VPC Link ENIs
+      VpcId: !Ref KcVpc
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Keycloak Fargate task (ingress only from VPC Link)
+      VpcId: !Ref KcVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref VpcLinkSecurityGroup
+
+  # ---- Cloud Map 服务发现（API Gateway 经它找到任务私网 IP） ----
+  DiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: agentcore-workshop.local
+      Vpc: !Ref KcVpc
+
+  # SRV 记录：实例注册时带端口（8080）。API Gateway 的 Cloud Map 集成
+  # 按实例属性里的端口转发；A 记录只有 IP 会导致集成 500
+  DiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: keycloak-srv
+      NamespaceId: !Ref DiscoveryNamespace
+      DnsConfig:
+        DnsRecords: [{ Type: SRV, TTL: 10 }]
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+
+  # ---- ECS on Fargate ----
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: agentcore-workshop
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/agentcore-workshop-keycloak
+      RetentionInDays: 7
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: agentcore-workshop-keycloak
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "1024"
+      Memory: "2048"
+      RuntimePlatform:
+        CpuArchitecture: ARM64          # 镜像由 deploy.sh 按 arm64 构建
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: keycloak
+          Image: !Ref ImageUri
+          PortMappings: [{ ContainerPort: 8080, Protocol: tcp }]
+          Environment:
+            - { Name: KC_BOOTSTRAP_ADMIN_USERNAME, Value: admin }
+            - { Name: KC_BOOTSTRAP_ADMIN_PASSWORD, Value: !Ref KcAdminPassword }
+            - !If
+              - HasHostname
+              - { Name: KC_HOSTNAME, Value: !Ref KcHostname }
+              - !Ref AWS::NoValue
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: kc
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: DefaultRoute
+    Properties:
+      # 不固定 ServiceName：服务发现等配置变更会触发替换，固定名会撞名
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: 1
+      TaskDefinition: !Ref TaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED       # 仅出向拉镜像用；入向由 SG 限制
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt DiscoveryService.Arn
+          Port: 8080
+
+  # ---- API Gateway HTTP API：免域名 HTTPS 入口 ----
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: agentcore-workshop-keycloak
+      ProtocolType: HTTP
+
+  VpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: agentcore-workshop-keycloak
+      SubnetIds: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroupIds: [!Ref VpcLinkSecurityGroup]
+
+  ProxyIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      IntegrationUri: !GetAtt DiscoveryService.Arn
+      IntegrationMethod: ANY
+      PayloadFormatVersion: "1.0"
+
+  DefaultRouteApi:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: $default
+      Target: !Sub integrations/${ProxyIntegration}
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+Outputs:
+  KeycloakUrl:
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name

@@ -35,7 +35,7 @@
 └────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────── Part 2: Web Chat 分析门户 ──────────────────────────────┐
-│   浏览器（React SPA）─① OIDC 登录（PKCE）─▶ Keycloak（自部署，App Runner）      │
+│   浏览器（React SPA）─① OIDC 登录（PKCE）─▶ Keycloak（自部署，ECS Fargate）     │
 │        │  ② 用户 token（SSE 流式调用）                                          │
 │        ▼                                                                       │
 │   Runtime（分析 Agent，JWT 入站认证）                                           │

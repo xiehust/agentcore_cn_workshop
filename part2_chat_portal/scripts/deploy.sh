@@ -2,7 +2,7 @@
 # Part 2 一键部署脚本
 #
 # 步骤：
-#   1. 部署 Keycloak（自定义镜像 -> ECR -> App Runner，自带 HTTPS 域名）
+#   1. 部署 Keycloak（自定义镜像 -> ECR -> ECS Fargate + API Gateway HTTPS 入口）
 #   2. 部署分析链路基础设施（CloudFormation：Lambda/Gateway 角色 + Secrets 端点）
 #   3. 打包并部署数据查询 Lambda（挂进 Aurora VPC，pg8000 直连 5432）
 #   4. 创建 Gateway（JWT 认证）+ Lambda target（MCP 工具）
@@ -24,10 +24,9 @@ if [ -n "${OPENAI_API_KEY:-}" ] && [[ "${OPENAI_API_KEY}" != ABSK* ]]; then
 fi
 AURORA_STACK="agentcore-workshop-aurora"
 PART2_STACK="agentcore-workshop-part2"
-KC_SERVICE_NAME="agentcore-workshop-keycloak"
+KC_STACK="agentcore-workshop-keycloak"
 KC_ECR_REPO="agentcore-workshop/keycloak"
 KC_REALM="agentcore-workshop"
-APPRUNNER_ECR_ROLE="agentcore-workshop-apprunner-ecr-role"
 LAMBDA_NAME="agentcore-workshop-analytics"
 GATEWAY_NAME="agentcore-workshop-analytics-gw"
 GATEWAY_TARGET_NAME="analytics"
@@ -67,7 +66,7 @@ if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
   echo "❌ 未找到 Part 1 的 Aurora 栈（$AURORA_STACK），请先部署 Part 1"; exit 1
 fi
 
-echo "==> [1/8] 部署 Keycloak（ECR + App Runner，首次约需 5-8 分钟）..."
+echo "==> [1/8] 部署 Keycloak（ECR + ECS Fargate + API Gateway，首次约需 5-8 分钟）..."
 # 1a. 生成 realm.json（注入机密）并准备构建上下文
 KC_BUILD_DIR="$DEPLOY_DIR/kc-build"
 mkdir -p "$KC_BUILD_DIR"
@@ -82,105 +81,45 @@ aws ecr describe-repositories --repository-names "$KC_ECR_REPO" --region "$REGIO
 ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$KC_ECR_REPO"
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin \
   "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com" >/dev/null
-# App Runner 只支持 amd64；本 Dockerfile 无 RUN 步骤，ARM 机器上也能直接交叉构建
-docker build -q --platform linux/amd64 -t "$ECR_URI:latest" "$KC_BUILD_DIR"
+# Fargate 任务定义按 ARM64 运行（便宜且本机可原生构建）；平台显式声明，
+# 在 x86 机器上部署也能交叉构建（本 Dockerfile 无 RUN 步骤）
+docker build -q --platform linux/arm64 -t "$ECR_URI:latest" "$KC_BUILD_DIR"
 docker push -q "$ECR_URI:latest"
 echo "    镜像已推送: $ECR_URI:latest"
 
-# 1c. App Runner 拉取 ECR 镜像的访问角色
-if ! aws iam get-role --role-name "$APPRUNNER_ECR_ROLE" >/dev/null 2>&1; then
-  aws iam create-role --role-name "$APPRUNNER_ECR_ROLE" \
-    --assume-role-policy-document '{
-      "Version": "2012-10-17",
-      "Statement": [{"Effect": "Allow",
-        "Principal": {"Service": "build.apprunner.amazonaws.com"},
-        "Action": "sts:AssumeRole"}]
-    }' >/dev/null
-  aws iam attach-role-policy --role-name "$APPRUNNER_ECR_ROLE" \
-    --policy-arn arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
-  sleep 10   # 等 IAM 生效
-fi
-APPRUNNER_ECR_ROLE_ARN=$(aws iam get-role --role-name "$APPRUNNER_ECR_ROLE" --query Role.Arn --output text)
+# 1c. 部署 Keycloak 栈（ECS Fargate + Cloud Map + API Gateway HTTP API + VPC Link）
+#     App Runner 自 2026-04-30 起不接受新客户，改用 Fargate；HTTPS 入口由
+#     API Gateway 提供（免域名的 execute-api 端点，无需 ALB）
+aws cloudformation deploy \
+  --template-file "$PART2_DIR/infra/keycloak-fargate.yaml" \
+  --stack-name "$KC_STACK" \
+  --capabilities CAPABILITY_IAM \
+  --region "$REGION" \
+  --parameter-overrides \
+    "ImageUri=$ECR_URI:latest" \
+    "KcAdminPassword=$KC_ADMIN_PASSWORD" \
+  --no-fail-on-empty-changeset
 
-# 1d. 创建 / 更新 App Runner 服务
-_kc_source_config() {  # $1 = 额外环境变量 JSON 片段（可为空），拼进 env map
-  local extra="$1"
-  cat <<EOF
-{
-  "ImageRepository": {
-    "ImageIdentifier": "$ECR_URI:latest",
-    "ImageRepositoryType": "ECR",
-    "ImageConfiguration": {
-      "Port": "8080",
-      "RuntimeEnvironmentVariables": {
-        "KC_BOOTSTRAP_ADMIN_USERNAME": "admin",
-        "KC_BOOTSTRAP_ADMIN_PASSWORD": "$KC_ADMIN_PASSWORD"$extra
-      }
-    }
-  },
-  "AutoDeploymentsEnabled": false,
-  "AuthenticationConfiguration": {"AccessRoleArn": "$APPRUNNER_ECR_ROLE_ARN"}
+_kc_stack_output() {
+  aws cloudformation describe-stacks --stack-name "$KC_STACK" --region "$REGION" \
+    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
 }
-EOF
-}
-
-_kc_wait_running() {
-  for _ in $(seq 1 60); do
-    local status
-    status=$(aws apprunner describe-service --service-arn "$KC_SERVICE_ARN" --region "$REGION" \
-      --query Service.Status --output text)
-    case "$status" in
-      RUNNING) return 0 ;;
-      CREATE_FAILED|DELETE_FAILED) echo "❌ App Runner 服务状态: $status"; exit 1 ;;
-    esac
-    sleep 15
-  done
-  echo "❌ 等待 App Runner 服务就绪超时"; exit 1
-}
-
-KC_SERVICE_ARN=$(aws apprunner list-services --region "$REGION" \
-  --query "ServiceSummaryList[?ServiceName=='$KC_SERVICE_NAME' && Status!='DELETED'] | [0].ServiceArn" --output text)
-# 上次创建失败的服务无法复用，删掉重建
-if [ -n "$KC_SERVICE_ARN" ] && [ "$KC_SERVICE_ARN" != "None" ]; then
-  KC_STATUS=$(aws apprunner describe-service --service-arn "$KC_SERVICE_ARN" --region "$REGION" \
-    --query Service.Status --output text)
-  if [ "$KC_STATUS" = "CREATE_FAILED" ] || [ "$KC_STATUS" = "DELETE_FAILED" ]; then
-    echo "    发现上次失败的服务（$KC_STATUS），删除后重建..."
-    aws apprunner delete-service --service-arn "$KC_SERVICE_ARN" --region "$REGION" >/dev/null
-    for _ in $(seq 1 40); do
-      KC_STATUS=$(aws apprunner describe-service --service-arn "$KC_SERVICE_ARN" --region "$REGION" \
-        --query Service.Status --output text 2>/dev/null || echo DELETED)
-      [ "$KC_STATUS" = "DELETED" ] && break
-      sleep 15
-    done
-    KC_SERVICE_ARN=""
-  fi
-fi
-if [ -z "$KC_SERVICE_ARN" ] || [ "$KC_SERVICE_ARN" = "None" ]; then
-  KC_SERVICE_ARN=$(aws apprunner create-service --region "$REGION" \
-    --service-name "$KC_SERVICE_NAME" \
-    --source-configuration "$(_kc_source_config "")" \
-    --instance-configuration '{"Cpu": "1 vCPU", "Memory": "2 GB"}' \
-    --health-check-configuration '{"Protocol": "TCP", "Interval": 10, "Timeout": 5, "HealthyThreshold": 1, "UnhealthyThreshold": 10}' \
-    --query Service.ServiceArn --output text)
-  echo "    已创建 App Runner 服务，等待就绪..."
-elif [ "${KC_REDEPLOY:-0}" = "1" ]; then
-  echo "    复用已有服务，触发重新部署以拉取最新镜像..."
-  _kc_wait_running
-  aws apprunner start-deployment --service-arn "$KC_SERVICE_ARN" --region "$REGION" >/dev/null
-else
-  # realm/机密没变时无需重发（改过 realm-template 后用 KC_REDEPLOY=1 重跑）
-  echo "    复用已有服务（跳过重新部署，需要更新镜像时 KC_REDEPLOY=1）"
-fi
-_kc_wait_running
-KC_DOMAIN=$(aws apprunner describe-service --service-arn "$KC_SERVICE_ARN" --region "$REGION" \
-  --query Service.ServiceUrl --output text)
-KC_URL="https://$KC_DOMAIN"
+KC_URL=$(_kc_stack_output KeycloakUrl)
+ECS_CLUSTER=$(_kc_stack_output ClusterName)
+ECS_SERVICE=$(_kc_stack_output ServiceName)
 DISCOVERY_URL="$KC_URL/realms/$KC_REALM/.well-known/openid-configuration"
 
-# 1e. 等 Keycloak 完成启动（realm 导入后才开始监听），并确保 issuer 是 https。
-#     App Runner 若没把 X-Forwarded-Proto 传给容器，Keycloak 会以为自己是 http，
-#     此时追加 KC_HOSTNAME 强制 https 并等新版本上线（两阶段处理）。
+# 镜像 tag 固定为 latest，改过 realm-template 后需强制换新任务拉取新镜像
+if [ "${KC_REDEPLOY:-0}" = "1" ]; then
+  echo "    KC_REDEPLOY=1，强制服务重新部署以拉取最新镜像..."
+  aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+    --force-new-deployment --region "$REGION" >/dev/null
+  aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$REGION"
+fi
+
+# 1d. 等 Keycloak 完成启动（realm 导入后才开始监听），并确保 issuer 是 https。
+#     若 API Gateway 未把 X-Forwarded-Proto 传给容器导致 issuer 是 http，
+#     用 KcHostname 参数更新栈强制 https（两阶段处理）。
 echo "    Keycloak 地址: $KC_URL，等待启动完成..."
 for i in $(seq 1 40); do
   if ISSUER=$(curl -sf "$DISCOVERY_URL" | python3 -c "import sys,json;print(json.load(sys.stdin)['issuer'])" 2>/dev/null); then
@@ -190,10 +129,18 @@ for i in $(seq 1 40); do
   sleep 15
 done
 if [[ "$ISSUER" != https://* ]]; then
-  echo "    issuer 为 $ISSUER，追加 KC_HOSTNAME 强制 https 并重新部署..."
-  aws apprunner update-service --service-arn "$KC_SERVICE_ARN" --region "$REGION" \
-    --source-configuration "$(_kc_source_config ", \"KC_HOSTNAME\": \"$KC_URL\"")" >/dev/null
-  _kc_wait_running
+  echo "    issuer 为 $ISSUER，设置 KC_HOSTNAME 强制 https 并更新栈..."
+  aws cloudformation deploy \
+    --template-file "$PART2_DIR/infra/keycloak-fargate.yaml" \
+    --stack-name "$KC_STACK" \
+    --capabilities CAPABILITY_IAM \
+    --region "$REGION" \
+    --parameter-overrides \
+      "ImageUri=$ECR_URI:latest" \
+      "KcAdminPassword=$KC_ADMIN_PASSWORD" \
+      "KcHostname=$KC_URL" \
+    --no-fail-on-empty-changeset
+  aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$REGION"
   for i in $(seq 1 40); do
     ISSUER=$(curl -sf "$DISCOVERY_URL" | python3 -c "import sys,json;print(json.load(sys.stdin)['issuer'])" 2>/dev/null || true)
     [[ "$ISSUER" == https://* ]] && break
