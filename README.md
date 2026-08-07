@@ -56,7 +56,6 @@ Part 1 的核心思路是 **"Agent 框架不变，业务逻辑用 Skill 插拔"*
 ```
 .
 ├── README.md                        # 本文件
-├── 选品SOP-供agent生成系统.md         # 原始业务 SOP（Skill 的来源）
 ├── part1_data_ingestion/            # Part 1：数据摄入 pipeline
 │   ├── README.md                    # Part 1 部署运行指南
 │   ├── agent/                       # Agent 代码（部署到 AgentCore Runtime）
