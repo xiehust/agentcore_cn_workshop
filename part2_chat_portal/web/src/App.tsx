@@ -115,7 +115,7 @@ export default function App() {
           <span className="brand-mark">选</span>
           <div>
             <div className="brand-name">选品分析门户</div>
-            <div className="brand-sub">AGENTCORE WORKSHOP · 台账贰</div>
+            <div className="brand-sub">AGENTCORE WORKSHOP · 贰</div>
           </div>
         </div>
 
