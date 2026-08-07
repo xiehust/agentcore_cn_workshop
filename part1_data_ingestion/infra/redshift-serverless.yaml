@@ -1,0 +1,102 @@
+# Redshift Serverless 基础设施（CloudFormation）
+#
+# 创建内容：
+#   1. Redshift Serverless Namespace（数据库 product_hunting，管理员凭证存 Secrets Manager）
+#   2. Redshift Serverless Workgroup（最小 8 RPU，按用量计费）
+#   3. Agent 访问数仓所需的 IAM 托管策略（附加到 AgentCore Runtime 执行角色即可）
+#
+# 部署：
+#   aws cloudformation deploy \
+#     --template-file redshift-serverless.yaml \
+#     --stack-name agentcore-workshop-redshift \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --region us-west-2
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AgentCore CN Workshop - Part 1 数据摄入 pipeline 的 Redshift Serverless 数仓
+
+Parameters:
+  NamespaceName:
+    Type: String
+    Default: agentcore-workshop
+    Description: Redshift Serverless namespace 名称
+  WorkgroupName:
+    Type: String
+    Default: agentcore-workshop
+    Description: Redshift Serverless workgroup 名称（Agent 环境变量 REDSHIFT_WORKGROUP 需与之一致）
+  DatabaseName:
+    Type: String
+    Default: product_hunting
+    Description: 数据库名（Agent 环境变量 REDSHIFT_DATABASE 需与之一致）
+  BaseCapacity:
+    Type: Number
+    Default: 8
+    Description: 基础容量（RPU），workshop 用最小值 8 即可
+
+Resources:
+  # 管理员密码托管在 Secrets Manager（不出现在模板/日志中）
+  AdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${NamespaceName}-redshift-admin"
+      Description: Redshift Serverless 管理员凭证
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "wsadmin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: "\"'@/\\"
+
+  Namespace:
+    Type: AWS::RedshiftServerless::Namespace
+    Properties:
+      NamespaceName: !Ref NamespaceName
+      DbName: !Ref DatabaseName
+      AdminUsername: !Sub "{{resolve:secretsmanager:${AdminSecret}:SecretString:username}}"
+      AdminUserPassword: !Sub "{{resolve:secretsmanager:${AdminSecret}:SecretString:password}}"
+
+  Workgroup:
+    Type: AWS::RedshiftServerless::Workgroup
+    Properties:
+      WorkgroupName: !Ref WorkgroupName
+      NamespaceName: !Ref Namespace
+      BaseCapacity: !Ref BaseCapacity
+      # workshop 场景无需公网可达：Agent 走 redshift-data API（AWS 内部通道）
+      PubliclyAccessible: false
+
+  # 附加到 AgentCore Runtime 执行角色的策略：
+  # 仅允许 redshift-data 异步执行 + 用临时凭证连接本 workgroup
+  AgentDataAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${WorkgroupName}-agent-data-access"
+      Description: 允许 AgentCore Runtime 中的 Agent 通过 redshift-data API 读写数仓
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RedshiftDataAPI
+            Effect: Allow
+            Action:
+              - redshift-data:ExecuteStatement
+              - redshift-data:DescribeStatement
+              - redshift-data:GetStatementResult
+              - redshift-data:ListStatements
+            Resource: "*"
+          - Sid: ServerlessTempCredentials
+            Effect: Allow
+            Action:
+              - redshift-serverless:GetCredentials
+            Resource: !GetAtt Workgroup.Workgroup.WorkgroupArn
+
+Outputs:
+  WorkgroupName:
+    Description: Agent 环境变量 REDSHIFT_WORKGROUP 的值
+    Value: !Ref WorkgroupName
+  DatabaseName:
+    Description: Agent 环境变量 REDSHIFT_DATABASE 的值
+    Value: !Ref DatabaseName
+  AgentDataAccessPolicyArn:
+    Description: 部署 Agent 后，把该策略附加到 AgentCore Runtime 执行角色
+    Value: !Ref AgentDataAccessPolicy
+  AdminSecretArn:
+    Description: 管理员凭证所在的 Secrets Manager Secret
+    Value: !Ref AdminSecret

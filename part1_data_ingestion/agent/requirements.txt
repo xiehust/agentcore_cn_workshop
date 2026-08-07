@@ -1,0 +1,13 @@
+# AgentCore SDK（Runtime 入口 + 内置工具客户端；
+# tools/browser_ext.py 基于 1.1.x 的 BrowserClient 扩展）
+bedrock-agentcore>=1.1.0
+# Strands Agents 框架（含 Skill / AgentSkills 插件，需要较新版本）
+# openai extra：OpenAIResponsesModel 依赖 openai>=2.0
+#（默认模型 openai.gpt-5.6-terra 走 Bedrock 的 OpenAI 兼容端点 bedrock-mantle）
+strands-agents[openai]>=1.50.0
+# Strands 官方工具集（AgentCoreBrowser / AgentCoreCodeInterpreter）
+# extras 会带上 playwright、nest_asyncio 等浏览器/沙箱工具的底层依赖
+strands-agents-tools[agent_core_browser,agent_core_code_interpreter]>=0.8.0
+# AWS SDK（redshift-data 入库；browser profile / browserSigning
+# 参数需要较新的 botocore API 模型）
+boto3>=1.43.0

@@ -1,0 +1,10 @@
+/.claude/
+/.codegraph/
+/.trellis/
+/.venv/
+__pycache__/
+# agentcore configure 生成的部署配置（含账号信息，各自生成）
+.bedrock_agentcore.yaml
+.agentcore.yaml
+# agentcore launch 生成的部署产物（依赖打包缓存）
+.bedrock_agentcore/

@@ -1,0 +1,165 @@
+"""Part 1 数据摄入 Agent —— 部署到 Amazon Bedrock AgentCore Runtime。
+
+架构说明（对应 AgentCore 各组件）：
+- Runtime          : 本文件通过 BedrockAgentCoreApp 封装为 Runtime 入口，
+                     由 `agentcore configure && agentcore launch` 部署。
+- Browser 内置工具  : 云端托管浏览器，负责爬取电商页面（默认 eBay 英国站；
+                     亚马逊被云端 IP 封锁，需代理，见 README）。启用了两项能力：
+                     Web Bot Auth（请求签名，减少验证码，由自定义 browser 资源
+                     承载）与 Browser Profile（跨会话保留 cookies/localStorage），
+                     见 tools/browser_ext.py。
+- Code Interpreter : AgentCoreCodeInterpreter —— 安全沙箱，负责选品经济测算。
+- Skill 插件       : 业务 SOP（选品流程）以 SKILL.md 形式放在 skills/ 目录，
+                     通过 Strands 的 AgentSkills 插件加载。新增业务场景只需
+                     新增 skill 目录，Agent 代码零改动。
+- 自定义工具       : tools/redshift_tools.py 把判定结果写入 Redshift Serverless。
+
+调用方式（部署后）：
+    agentcore invoke '{"prompt": "从 eBay 英国站搜索 desk organizer 选品，处理前 3 个非广告商品"}'
+"""
+
+import os
+import re
+
+from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from strands import Agent
+from strands.models.openai_responses import OpenAIResponsesModel
+from strands_tools.code_interpreter import AgentCoreCodeInterpreter
+
+from tools.browser_ext import ExtendedAgentCoreBrowser
+from tools.redshift_tools import save_candidate, save_verdict
+
+# ---- 配置（可通过环境变量覆盖） ----
+REGION = os.environ.get("AWS_REGION", "us-west-2")
+MODEL_ID = os.environ.get("MODEL_ID", "openai.gpt-5.6-terra")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://bedrock-mantle.us-east-1.api.aws/openai/v1")
+# 模型认证 key：优先 OPENAI_API_KEY，其次 AWS_BEARER_TOKEN_BEDROCK
+#（Bedrock API key 的标准环境变量）；都未设置则用 IAM 凭证自动铸 token
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or os.environ.get(
+    "AWS_BEARER_TOKEN_BEDROCK"
+)
+# 自定义 browser（开启 Web Bot Auth）的 ID，由 deploy.sh 创建并注入；
+# 不设置则退回默认系统浏览器（无请求签名）
+BROWSER_IDENTIFIER = os.environ.get("BROWSER_IDENTIFIER", "aws.browser.v1")
+# browser profile 的 ID，由 deploy.sh 创建并注入；不设置则不做跨会话状态复用
+BROWSER_PROFILE_ID = os.environ.get("BROWSER_PROFILE_ID","data_default_profile")
+SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+
+# ---- Runtime 入口：HTTP 服务封装（/invocations、/ping 由 SDK 自动提供） ----
+app = BedrockAgentCoreApp()
+
+
+def create_browser() -> ExtendedAgentCoreBrowser:
+    """创建浏览器工具封装（底层是 AgentCore 托管的 Chromium + CDP，会话隔离）。
+
+    identifier 指向开启了 Web Bot Auth 的自定义 browser（请求自动签名，
+    减少验证码）；profile_id 让会话启动时恢复上次保存的 cookies/localStorage，
+    结束时存回，跨会话免重复登录。
+    """
+    return ExtendedAgentCoreBrowser(
+        region=REGION,
+        identifier=BROWSER_IDENTIFIER,
+        profile_id=BROWSER_PROFILE_ID,
+    )
+
+
+def create_agent(browser: ExtendedAgentCoreBrowser | None = None) -> Agent:
+    """组装数据摄入 Agent。
+
+    注意 Agent 本体只有"通用能力"（浏览器/沙箱/入库），业务流程全部来自 Skill。
+    """
+    browser = browser or create_browser()
+
+    # AgentCore Code Interpreter：沙箱代码执行（经济测算用）
+    code_interpreter = AgentCoreCodeInterpreter(region=REGION)
+
+    # GPT-5.6 Terra 只通过 Bedrock 的 OpenAI 兼容端点（bedrock-mantle）提供，
+    # 不走 Converse API。两种认证方式：
+    # - 设置了 OPENAI_API_KEY（须是 Bedrock API key，不是 OpenAI 官网的 sk- key）：
+    #   显式 key + OPENAI_BASE_URL（默认 us-east-1）；
+    # - 未设置：用当前 AWS 凭证（Runtime 的 IAM 角色）为每次请求自动铸造
+    #   bearer token，免 key 管理、不会过期，端点区域从 OPENAI_BASE_URL 解析。
+    if OPENAI_API_KEY:
+        model = OpenAIResponsesModel(
+            model_id=MODEL_ID,
+            client_args={
+                "api_key": OPENAI_API_KEY,
+                "base_url": OPENAI_BASE_URL,
+            },
+        )
+    else:
+        m = re.match(r"https://bedrock-mantle\.([a-z0-9-]+)\.api\.aws", OPENAI_BASE_URL)
+        mantle_region = m.group(1) if m else REGION
+        model = OpenAIResponsesModel(
+            model_id=MODEL_ID,
+            bedrock_mantle_config={"region": mantle_region},
+        )
+
+    # AgentSkills 插件：加载 skills/ 目录下所有含 SKILL.md 的子目录。
+    # 兼容说明：新版 strands 顶层导出 AgentSkills；旧版在 vended_plugins 下。
+    try:
+        from strands import AgentSkills
+    except ImportError:
+        from strands.vended_plugins.skills import AgentSkills
+
+    skills_plugin = AgentSkills(skills=SKILLS_DIR)
+
+    return Agent(
+        model=model,
+        plugins=[skills_plugin],
+        tools=[
+            browser.browser,                      # 浏览器工具
+            code_interpreter.code_interpreter,    # 沙箱代码执行工具
+            save_verdict,                         # 判定入库
+            save_candidate,                       # 候选档案入库
+        ],
+        system_prompt=(
+            "你是一个数据摄入（data ingestion）Agent，运行在 Amazon Bedrock "
+            "AgentCore Runtime 中。你的通用能力：\n"
+            "1. browser 工具：云端浏览器，用于爬取网页数据；\n"
+            "2. code_interpreter 工具：安全沙箱，用于执行计算和数据处理；\n"
+            "3. save_verdict / save_candidate 工具：把结果写入 Redshift 数仓。\n\n"
+            "具体的业务流程（做什么、怎么判定、什么门槛）由已加载的 Skill 定义。"
+            "收到任务后，先匹配最相关的 Skill 并严格按其规则执行。"
+            "Skill 中的门槛与公式是硬性规则，不得放宽；抓不到的数据如实标注，"
+            "绝不编造。全程用中文向用户汇报。"
+        ),
+    )
+
+
+@app.entrypoint
+async def invoke(payload: dict):
+    """Runtime 调用入口。
+
+    payload 约定:
+        prompt: 任务指令，例如
+                "从 eBay 英国站搜索 desk organizer 选品，处理前 3 个非广告商品"
+
+    以流式方式返回 Agent 的执行过程（AgentCore Runtime 支持 SSE 流式响应）。
+    """
+    prompt = payload.get("prompt")
+    if not prompt:
+        yield {"error": "缺少 prompt 字段，请提供任务指令"}
+        return
+
+    # 每次调用新建 Agent 实例，避免跨请求共享会话状态
+    #（Runtime 本身按 session 隔离 microVM，这里再保证进程内无状态）
+    browser = create_browser()
+    agent = create_agent(browser)
+
+    try:
+        stream = agent.stream_async(prompt)
+        async for event in stream:
+            # 只转发文本增量事件，减小响应体积；需要完整事件可直接 yield event
+            if "data" in event:
+                yield event["data"]
+    finally:
+        # 停止云端浏览器会话；配置了 BROWSER_PROFILE_ID 时会先把会话状态
+        # 存回 profile（见 tools/browser_ext.py），不能依赖模型主动 close
+        browser._cleanup()
+
+
+if __name__ == "__main__":
+    # 本地调试：python main.py 后另开终端
+    # curl -X POST http://localhost:8080/invocations -d '{"prompt": "..."}'
+    app.run()
