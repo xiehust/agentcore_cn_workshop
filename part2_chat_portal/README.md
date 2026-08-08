@@ -77,6 +77,18 @@ export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>   # 或依赖 IAM 自动铸 to
 
 ## 使用
 
+### 两个登录入口
+
+| 入口 | 地址 | 账号 | 说明 |
+|------|------|------|------|
+| 选品分析门户 | http://localhost:5173 | `analyst`（密码见 `.deploy/secrets.env` 的 `ANALYST_PASSWORD`） | 属于 `agentcore-workshop` realm，只认门户用户 |
+| Keycloak 管理台 | `https://<api-id>.execute-api.<region>.amazonaws.com/admin/`（deploy.sh 输出的 Keycloak 地址 + `/admin/`） | `admin`（密码见 `KC_ADMIN_PASSWORD`） | master realm 管理员，与门户账号不通用；登录后左上角可切到 `agentcore-workshop` realm 管理用户/client |
+
+> 注意：两个入口的账号体系是分开的，用 admin 登门户或用 analyst 登管理台
+> 都会报 "Invalid username or password"。另外 Keycloak 是内嵌 H2 存储
+> （demo 配置），任务重启后管理台里的运行期改动会丢，realm 基线随镜像恢复；
+> 要持久加用户请改 `infra/keycloak/realm-template.json` 后 `KC_REDEPLOY=1` 重跑。
+
 ```bash
 # 启动前端（deploy.sh 已生成 web/.env.local）
 cd web && npm install && npm run dev
