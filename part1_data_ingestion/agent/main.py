@@ -27,7 +27,7 @@ from strands import Agent
 from strands.models.openai_responses import OpenAIResponsesModel
 from strands_tools.code_interpreter import AgentCoreCodeInterpreter
 
-from tools.aurora_tools import save_candidate, save_verdict
+from tools.aurora_tools import save_candidate, save_verdict, set_current_run_id
 from tools.browser_ext import ExtendedAgentCoreBrowser
 
 # ---- 配置（可通过环境变量覆盖） ----
@@ -128,6 +128,25 @@ def create_agent(browser: ExtendedAgentCoreBrowser | None = None) -> Agent:
     )
 
 
+def _browser_session_event(browser: ExtendedAgentCoreBrowser) -> dict | None:
+    """若云端浏览器会话已建立，返回一条 browser_session 事件，否则返回 None。
+
+    浏览器会话是模型第一次调 browser 工具时才惰性创建的，所以只能在流式循环里
+    轮询检查 _client_dict（见 tools/browser_ext.py 会话入册的说明）。
+    browser_id / session_id 是门户生成 Live View presigned URL 的必要参数。
+    """
+    for client in list(getattr(browser, "_client_dict", {}).values()):
+        browser_id = getattr(client, "identifier", None)
+        session_id = getattr(client, "session_id", None)
+        if browser_id and session_id:
+            return {
+                "event": "browser_session",
+                "browser_id": browser_id,
+                "session_id": session_id,
+            }
+    return None
+
+
 @app.entrypoint
 async def invoke(payload: dict):
     """Runtime 调用入口。
@@ -135,22 +154,55 @@ async def invoke(payload: dict):
     payload 约定:
         prompt: 任务指令，例如
                 "从 eBay 英国站搜索 desk organizer 选品，处理前 3 个非广告商品"
+        run_id: 可选。Part 2 门户任务管理模块传入的运行 ID，用于
+                ① 入库记录打上 run_id（见 tools/aurora_tools.py）；
+                ② 额外输出结构化进度事件供 runner Lambda 落库。
+                命令行调用（agentcore invoke / local_test）不传，行为与原先一致。
 
     以流式方式返回 Agent 的执行过程（AgentCore Runtime 支持 SSE 流式响应）。
+    带 run_id 时流里混有两种结构化事件（dict，Runtime 会序列化为 JSON）：
+        {"event": "tool_use", "name": ..., "tool_use_id": ...}
+        {"event": "browser_session", "browser_id": ..., "session_id": ...}
+    纯文本增量仍是裸字符串，两者的契约与 runner Lambda 约定，不要随意改动。
     """
     prompt = payload.get("prompt")
     if not prompt:
         yield {"error": "缺少 prompt 字段，请提供任务指令"}
         return
 
+    # 运行 ID 写入 contextvar，入库工具据此给记录打标（无则写 NULL）
+    run_id = payload.get("run_id") or None
+    set_current_run_id(run_id)
+
     # 每次调用新建 Agent 实例，避免跨请求共享会话状态
     #（Runtime 本身按 session 隔离 microVM，这里再保证进程内无状态）
     browser = create_browser()
     agent = create_agent(browser)
 
+    seen_tool_use_ids: set[str] = set()
+    browser_session_reported = False
+
     try:
         stream = agent.stream_async(prompt)
         async for event in stream:
+            # 结构化进度事件只在门户任务模式（有 run_id）下发，避免影响 CLI 输出
+            if run_id:
+                tool_use = event.get("current_tool_use") or {}
+                tool_use_id = tool_use.get("toolUseId")
+                # 同一次工具调用会持续推 input 增量，按 toolUseId 去重只发一次
+                if tool_use_id and tool_use_id not in seen_tool_use_ids:
+                    seen_tool_use_ids.add(tool_use_id)
+                    yield {
+                        "event": "tool_use",
+                        "name": tool_use.get("name", ""),
+                        "tool_use_id": tool_use_id,
+                    }
+                if not browser_session_reported:
+                    session_event = _browser_session_event(browser)
+                    if session_event:
+                        browser_session_reported = True
+                        yield session_event
+
             # 只转发文本增量事件，减小响应体积；需要完整事件可直接 yield event
             if "data" in event:
                 yield event["data"]

@@ -11,11 +11,14 @@
   Part 2 的数据查询 Lambda 则计划挂进 Aurora 所在 VPC 直连集群，
   验证 Gateway -> Lambda(VPC) -> Aurora 方案。
 - SQL 一律使用参数化（parameters），避免拼接注入。
+- 两张表都带可空的 run_id 列：Part 2 门户发起的任务会通过 set_current_run_id
+  注入，命令行调用不注入（写 NULL），互不影响。
 - 集群 MinCapacity=0 会空闲自动暂停，首次调用触发冷恢复
   （约 15 秒~1 分钟），_execute 内置重试等待。
 - 表结构见 infra/setup_tables.sql。
 """
 
+import contextvars
 import json
 import os
 import time
@@ -32,6 +35,20 @@ SECRET_ARN = os.environ.get("AURORA_SECRET_ARN", "")
 DATABASE = os.environ.get("AURORA_DATABASE", "product_hunting")
 
 _client = None
+
+# 当前运行 ID：Part 2 门户的任务管理模块调用时由 main.py 注入（payload.run_id），
+# 入库时写进两张业务表的 run_id 列，供门户按 run 过滤本次运行的结果。
+# 命令行调用（agentcore invoke / local_test）不传，保持 None → 列写 NULL。
+# 用 contextvar 而非全局变量：同步工具经 asyncio.to_thread 执行会复制上下文，
+# 值能正确传递，且不会被同进程的其他调用串改。
+CURRENT_RUN_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "current_run_id", default=None
+)
+
+
+def set_current_run_id(run_id: str | None) -> None:
+    """设置当前运行 ID（空字符串按未设置处理）。"""
+    CURRENT_RUN_ID.set(run_id or None)
 
 
 def _rds_client():
@@ -120,12 +137,13 @@ def save_verdict(
     sql = """
         INSERT INTO selection_verdicts
             (verdict_id, site, asin_or_url, product_title, verdict, reason,
-             current_price, monthly_sales, product_score, created_at)
+             current_price, monthly_sales, product_score, run_id, created_at)
         VALUES
             (:verdict_id, :site, :asin_or_url, :product_title, :verdict, :reason,
              NULLIF(:current_price, '')::DECIMAL(10,2),
              NULLIF(:monthly_sales, '')::INT,
              NULLIF(:product_score, '')::DECIMAL(10,4),
+             NULLIF(:run_id, '')::VARCHAR(36),
              NOW())
     """
     result = _execute(
@@ -140,6 +158,7 @@ def save_verdict(
             _p("current_price", current_price),
             _p("monthly_sales", monthly_sales),
             _p("product_score", product_score),
+            _p("run_id", CURRENT_RUN_ID.get()),
         ],
     )
     if result["status"] == "ok":
@@ -196,7 +215,7 @@ def save_candidate(
              competitor_min_price, competitor_min_price_url, estimated_price,
              estimated_monthly_sales, product_score, price_flag,
              main_image_url, variants, certification, material_spec,
-             ai_summary, created_at)
+             ai_summary, run_id, created_at)
         VALUES
             (:candidate_id, :site, :asin_or_url, :product_name_cn, :product_title_en,
              :search_keyword, :current_price::DECIMAL(10,2), :monthly_sales::INT,
@@ -205,7 +224,8 @@ def save_candidate(
              (:monthly_sales::INT / 2),
              :product_score::DECIMAL(10,4), :price_flag,
              :main_image_url, NULLIF(:variants, '')::JSONB, :certification,
-             :material_spec, :ai_summary, NOW())
+             :material_spec, :ai_summary,
+             NULLIF(:run_id, '')::VARCHAR(36), NOW())
     """
     # variants 必须是合法 JSON 才能转 JSONB，先做一次校验，坏数据降级包装
     variants_json = ""
@@ -236,6 +256,7 @@ def save_candidate(
             _p("certification", certification[:1024]),
             _p("material_spec", material_spec[:1024]),
             _p("ai_summary", ai_summary[:4096]),
+            _p("run_id", CURRENT_RUN_ID.get()),
         ],
     )
     if result["status"] == "ok":

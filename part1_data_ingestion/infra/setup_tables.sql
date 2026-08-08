@@ -60,3 +60,76 @@ CREATE TABLE IF NOT EXISTS product_candidates (
 
 CREATE INDEX IF NOT EXISTS idx_candidates_created_at
     ON product_candidates (created_at);
+
+-- ============================================================
+-- 表 3：摄入任务表（Part 2 门户「任务管理」模块）
+-- 一条记录 = 用户在门户创建的一个摄入任务（一次性或定期）。
+-- 定期任务在 EventBridge Scheduler 里有同名 schedule，暂停/恢复同步两边。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS ingestion_tasks (
+    task_id       VARCHAR(36)   NOT NULL,          -- UUID
+    name          VARCHAR(256)  NOT NULL,          -- 任务名（门户列表展示）
+    prompt        VARCHAR(4096) NOT NULL,          -- 传给 Runtime 的选品指令
+    mode          VARCHAR(16)   NOT NULL,          -- one_time / recurring
+    schedule_expr VARCHAR(128),                    -- recurring：rate(...) / cron(...)
+    status        VARCHAR(16)   NOT NULL DEFAULT 'active',  -- active / paused / deleted
+    created_at    TIMESTAMP     NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMP     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (task_id)
+);
+
+-- ============================================================
+-- 表 4：任务运行记录表
+-- 一条记录 = 任务的一次执行（一次性任务通常一条，定期任务每次触发一条）。
+-- browser_* 字段供门户生成 Browser Live View 的 presigned URL。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS ingestion_runs (
+    run_id             VARCHAR(36)   NOT NULL,     -- UUID
+    task_id            VARCHAR(36)   NOT NULL,     -- 所属任务
+    status             VARCHAR(16)   NOT NULL DEFAULT 'queued',  -- queued/running/succeeded/failed
+    runtime_session_id VARCHAR(64),                -- 调 Part 1 Runtime 用的 session id（≥33 字符）
+    browser_id         VARCHAR(128),               -- 云端浏览器 ID（Live View 用）
+    browser_session_id VARCHAR(128),               -- 云端浏览器会话 ID（Live View 用）
+    stats              JSONB,                      -- {candidates, verdicts:{...}, duration_s}
+    error              VARCHAR(2048),              -- 失败原因
+    started_at         TIMESTAMP,
+    finished_at        TIMESTAMP,
+    created_at         TIMESTAMP     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_task
+    ON ingestion_runs (task_id, created_at);
+
+-- ============================================================
+-- 表 5：运行事件表（进度阶段 / 工具调用 / 关键日志）
+-- runner Lambda 消费 Runtime 的 SSE 流后逐条落库，seq 是 run 内自增序号，
+-- 门户按 after_seq 游标增量轮询。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS ingestion_run_events (
+    event_id   BIGSERIAL,
+    run_id     VARCHAR(36)   NOT NULL,
+    seq        INT           NOT NULL,             -- run 内自增，前端增量拉取游标
+    kind       VARCHAR(24)   NOT NULL,             -- phase/tool/log/browser/error/result
+    message    VARCHAR(4096),
+    payload    JSONB,
+    created_at TIMESTAMP     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_run
+    ON ingestion_run_events (run_id, seq);
+
+-- ============================================================
+-- 结果关联：两张业务表加可空 run_id，标记记录由哪次运行写入。
+-- 可空 = 旧数据与命令行调用（无 run_id）不受影响。
+-- ============================================================
+ALTER TABLE selection_verdicts ADD COLUMN IF NOT EXISTS run_id VARCHAR(36);
+
+ALTER TABLE product_candidates ADD COLUMN IF NOT EXISTS run_id VARCHAR(36);
+
+CREATE INDEX IF NOT EXISTS idx_verdicts_run
+    ON selection_verdicts (run_id);
+
+CREATE INDEX IF NOT EXISTS idx_candidates_run
+    ON product_candidates (run_id);

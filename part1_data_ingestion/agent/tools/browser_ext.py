@@ -23,6 +23,10 @@ from strands_tools.browser import AgentCoreBrowser
 
 logger = logging.getLogger(__name__)
 
+# 会话默认分辨率：与门户 Live View 组件的 remoteWidth/remoteHeight 常量对齐，
+# 不一致会导致直播画面被裁切或出现黑边。
+DEFAULT_VIEWPORT: Dict[str, int] = {"width": 1600, "height": 900}
+
 
 class ProfileBrowserClient(BrowserClient):
     """支持 browser profile 的会话客户端。"""
@@ -38,6 +42,9 @@ class ProfileBrowserClient(BrowserClient):
         session_timeout_seconds: Optional[int] = 3600,
         viewport: Optional[Dict[str, int]] = None,
     ) -> str:
+        # 调用方不指定时固定 1600x900，保证 Live View 画面尺寸可预期
+        viewport = viewport or DEFAULT_VIEWPORT
+
         if not self.profile_id:
             return super().start(
                 identifier=identifier,
