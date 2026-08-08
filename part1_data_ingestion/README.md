@@ -32,8 +32,9 @@ aws sts get-caller-identity
 #    bedrock-mantle:CreateInference 权限，deploy.sh 已附加）
 export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>
 
-# 3. 安装部署工具链（Python 版 CLI；官方近期推荐迁移到 npm 版：npm install -g @aws/agentcore，
-#    两者命令基本兼容，本 demo 的脚本用 Python 版验证过）
+# 3. 安装部署工具链（本 demo 的脚本用 Python 版 CLI 验证过。官方另有 npm 版
+#    @aws/agentcore，但子命令不同——它没有 configure，若装在 PATH 前面会遮蔽
+#    Python 版，导致 deploy.sh 报 unknown command 'configure'；见常见问题）
 pip install bedrock-agentcore-starter-toolkit
 
 # 4.（本地测试需要）安装 Agent 依赖
@@ -51,7 +52,7 @@ bash scripts/deploy.sh
 | 步骤 | 内容 | 说明 |
 |------|------|------|
 | 1 | CloudFormation 部署 Aurora Serverless v2 | 自建 VPC + 私有子网 + Aurora（Data API，Min 0 ACU 自动暂停）+ IAM 策略。VPC 留给 Part 2 的 Lambda 直连验证 |
-| 2 | 建表 | `selection_verdicts`（判定记录）、`product_candidates`（候选档案） |
+| 2 | 建表 | 业务表 `selection_verdicts`（判定记录）、`product_candidates`（候选档案），以及 Part 2 任务管理模块用的三张表（见下节）。DDL 逐条幂等执行 |
 | 3 | 创建自定义 Browser 与 Browser Profile | browser 开启 Web Bot Auth（请求签名，减少验证码，预览功能）；profile 跨会话保留 cookies/localStorage。均按名字幂等，重复执行会复用 |
 | 4 | `agentcore configure && agentcore launch` | direct_code_deploy 直接部署代码到 Runtime（无需 Docker），并注入 browser/profile ID 等环境变量 |
 | 5 | 附加数仓/浏览器访问策略到 Runtime 执行角色 | rds-data 入库权限 + Secret 读取 + 自定义 browser 与 profile 的会话/保存权限 |
@@ -66,6 +67,35 @@ agentcore invoke '{"prompt": "从 eBay 英国站搜索 desk organizer 选品，�
 ```
 
 更多调用示例见 `scripts/invoke_example.sh`（类目浏览、指定 URL 判定、亚马逊站点）。
+
+### payload 的 `run_id` 扩展（供 Part 2 门户调用）
+
+Part 2 门户的「数据摄入任务管理」模块也是调这个 Runtime（由它的 runner Lambda
+用 IAM 角色 SigV4 代签，Runtime 的认证方式不变），只是 payload 多带一个可选的
+`run_id`：
+
+```bash
+agentcore invoke '{"prompt": "...", "run_id": "<uuid>"}'
+```
+
+带 `run_id` 时多做两件事：`save_verdict` / `save_candidate` 入库的记录会写上
+`run_id`（门户按它过滤出「本次运行」的结果明细）；输出流里除文本增量外还混有
+两种结构化事件（dict，Runtime 序列化为 JSON），供门户还原进度时间线与
+Browser Live View 入口：
+
+```json
+{"event": "tool_use",        "name": "browser", "tool_use_id": "..."}
+{"event": "browser_session", "browser_id": "...", "session_id": "..."}
+```
+
+不带 `run_id` 时行为与原先完全一致——`agentcore invoke`、`local_test.py`
+的输出和入库结果都不变，`run_id` 列留空。
+
+配套的表结构也在 `infra/setup_tables.sql` 里（随本部分的 deploy.sh 步骤 2 建）：
+任务管理三张表 `ingestion_tasks`（任务定义）、`ingestion_runs`（每次运行）、
+`ingestion_run_events`（进度与日志事件），以及两张业务表新增的可空 `run_id` 列
+（可空 = 旧数据和命令行调用不受影响）。模块本身的部署与用法见
+[Part 2 说明](../part2_chat_portal/README.md#数据摄入任务管理模块)。
 
 ## 验证入库结果
 
@@ -117,7 +147,7 @@ agentcore invoke -l '{"prompt": "..."}'
 | `agent/tools/aurora_tools.py` | save_verdict / save_candidate 入库工具（RDS Data API） |
 | `agent/tools/browser_ext.py` | Browser 扩展：Web Bot Auth 自定义 browser 接入 + profile 恢复/保存 |
 | `infra/aurora-serverless.yaml` | Aurora Serverless v2 + VPC CloudFormation 模板 |
-| `infra/setup_tables.sql` | 两张表的 DDL |
+| `infra/setup_tables.sql` | 表结构 DDL：两张业务表 + Part 2 任务管理的三张表 |
 | `scripts/deploy.sh` | 一键部署 |
 | `scripts/local_test.py` | 本地跑 Agent |
 | `scripts/invoke_example.sh` | 调用示例 |
@@ -136,6 +166,10 @@ agentcore invoke -l '{"prompt": "..."}'
 - **Browser Profile 何时保存**：每次调用结束时（`invoke` 的 finally）自动把
   会话 cookies/localStorage 存回 profile，下次会话启动时恢复。不想复用状态
   就部署时不传 `BROWSER_PROFILE_ID`。
+- **deploy.sh 第 4 步报 `unknown command 'configure'`**：本机装了 npm 版 AgentCore
+  CLI（`@aws/agentcore`），在 `PATH` 里遮蔽了脚本要用的 Python 版 `agentcore`。
+  把 Python 版所在目录前置即可，例如
+  `PATH="<仓库路径>/.venv/bin:$PATH" bash scripts/deploy.sh`。
 - **调用超时**：完整处理一个商品（详情页 + 竞品调研 + 测算 + 入库）约 2~5 分钟，
   建议每次调用处理 1~3 个商品；批量场景用 EventBridge 定时分批触发。
 - **想换模型**：部署前 `export MODEL_ID=<模型ID>` 再跑 deploy.sh（或部署时加
