@@ -12,10 +12,10 @@ interface ChartSpec {
   data?: ChartDatum[];
 }
 
-// 台账配色：朱砂 / 松墨 / 赭石 / 黛青，循环使用
+// 暗色数据可视化色板：青柠主色 + 冷色系列，循环使用
 const PALETTE = [
-  "#b23a22", "#2f6a4c", "#96771f", "#3d4a5c",
-  "#8f2e1a", "#4a7d61", "#b08d2a", "#5a6b80",
+  "#c9f158", "#6cb2f2", "#4fd1b5", "#d9b36c",
+  "#8fa1bd", "#e58fa2", "#a8d13d", "#5a8fd6",
 ];
 
 export function tryParseChart(source: string): ChartSpec | null {
@@ -61,8 +61,8 @@ export function Chart({ spec }: { spec: ChartSpec }) {
               <rect
                 className="chart-bar"
                 style={{ animationDelay: `${i * 0.07}s` }}
-                x={labelW} y={y} width={barW} height={22} rx={2}
-                fill={PALETTE[i % PALETTE.length]} opacity={0.92}
+                x={labelW} y={y} width={barW} height={22} rx={3}
+                fill={PALETTE[i % PALETTE.length]} opacity={0.9}
               />
               <text x={labelW + barW + 8} y={y + 15} className="chart-value">
                 {Intl.NumberFormat("zh-CN").format(d.value)}

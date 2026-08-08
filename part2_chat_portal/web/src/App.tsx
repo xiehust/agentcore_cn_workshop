@@ -1,6 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import {
+  ArrowUpIcon,
+  BrainIcon,
+  ChartDonutIcon,
+  FunnelSimpleIcon,
+  PlusIcon,
+  TerminalIcon,
+} from "@phosphor-icons/react";
 import { streamChat, newSessionId } from "./api";
 import { getToken, displayName, logout } from "./auth";
 import { Chart, tryParseChart } from "./Chart";
@@ -12,22 +20,23 @@ interface Message {
 }
 
 // 固定报表快捷入口 + 即席分析示例
-const QUICK_ACTIONS = [
-  { no: "01", label: "选品漏斗", prompt: "看下最近30天的选品漏斗报表" },
-  { no: "02", label: "类目分布", prompt: "看下候选商品的类目/赛道分布" },
+const QUICK_ACTIONS: { icon: ReactNode; label: string; prompt: string }[] = [
   {
-    no: "03",
+    icon: <FunnelSimpleIcon size={16} />,
+    label: "选品漏斗",
+    prompt: "看下最近30天的选品漏斗报表",
+  },
+  {
+    icon: <ChartDonutIcon size={16} />,
+    label: "类目分布",
+    prompt: "看下候选商品的类目/赛道分布",
+  },
+  {
+    icon: <TerminalIcon size={16} />,
     label: "即席分析示例",
     prompt: "候选池里产品点最高的 5 个商品是什么？给出价格、月销和预估售价",
   },
 ];
-
-const WELCOME = `你好！我是选品数据分析助手，可以帮你分析 Part 1 入库的选品数据。
-
-- **固定报表**：选品漏斗、类目/赛道分布（左侧一键生成）
-- **即席分析**：直接用自然语言提问，我会转成只读 SQL 查询数仓，再做统计分析
-
-试试左侧的快捷报表，或直接输入你的问题。`;
 
 function MarkdownBlock({ content }: { content: string }) {
   return (
@@ -114,20 +123,21 @@ export default function App() {
         <div className="brand">
           <span className="brand-mark">选</span>
           <div>
-            <div className="brand-name">选品分析门户</div>
-            <div className="brand-sub">AGENTCORE WORKSHOP · 贰</div>
+            <div className="brand-name">选品分析台</div>
+            <div className="brand-sub">AGENTCORE WORKSHOP</div>
           </div>
         </div>
 
         <button className="new-chat" onClick={newChat}>
-          ＋ 新对话
+          <PlusIcon size={15} weight="bold" />
+          新对话
         </button>
 
-        <div className="section-title">固定报表 / 快捷分析</div>
+        <div className="section-title">报表与分析</div>
         <div className="quick-actions">
           {QUICK_ACTIONS.map((a) => (
             <button key={a.label} disabled={busy} onClick={() => send(a.prompt)}>
-              <span className="qa-no">{a.no}</span>
+              <span className="qa-icon">{a.icon}</span>
               <span>
                 <span className="qa-label">{a.label}</span>
                 <span className="qa-desc">{a.prompt}</span>
@@ -138,7 +148,8 @@ export default function App() {
 
         <div className="sidebar-footer">
           <div className="memory-note" title="预留：后续接入 AWS 自部署的 mem0 记住分析偏好">
-            🧠 长期记忆（mem0）· 预留未启用
+            <BrainIcon size={14} />
+            长期记忆 mem0 · 预留未启用
           </div>
           <div className="user-row">
             <span className="avatar">{displayName().slice(0, 1)}</span>
@@ -153,9 +164,19 @@ export default function App() {
       <main className="chat">
         <div className="messages" ref={scrollRef}>
           {messages.length === 0 && (
-            <div className="message assistant">
-              <div className="bubble">
-                <MarkdownBlock content={WELCOME} />
+            <div className="empty">
+              <div className="empty-mark">选</div>
+              <h1>问一个关于选品数据的问题</h1>
+              <p>
+                固定报表一键生成；即席问题会转成只读 SQL 查询 Part 1 数仓，再做统计分析。
+              </p>
+              <div className="empty-chips">
+                {QUICK_ACTIONS.map((a) => (
+                  <button key={a.label} disabled={busy} onClick={() => send(a.prompt)}>
+                    {a.icon}
+                    {a.label}
+                  </button>
+                ))}
               </div>
             </div>
           )}
@@ -182,21 +203,29 @@ export default function App() {
         </div>
 
         <div className="composer">
-          <textarea
-            value={input}
-            placeholder="输入分析请求，如：本周入库的候选商品里均价最高的赛道是哪个？（Enter 发送，Shift+Enter 换行）"
-            rows={1}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                send(input);
-              }
-            }}
-          />
-          <button className="send" disabled={busy || !input.trim()} onClick={() => send(input)}>
-            发送
-          </button>
+          <div className="composer-box">
+            <textarea
+              value={input}
+              placeholder="输入分析请求，如：本周入库的候选商品里均价最高的赛道是哪个？"
+              rows={1}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  send(input);
+                }
+              }}
+            />
+            <button
+              className="send"
+              aria-label="发送"
+              disabled={busy || !input.trim()}
+              onClick={() => send(input)}
+            >
+              <ArrowUpIcon size={17} weight="bold" />
+            </button>
+          </div>
+          <div className="composer-hint">Enter 发送 · Shift+Enter 换行 · 查询均为只读</div>
         </div>
       </main>
     </div>
