@@ -91,8 +91,11 @@ Part 1 的核心思路是 **"Agent 框架不变，业务逻辑用 Skill 插拔"*
 
 ## 快速开始
 
-1. 阅读并完成 [Part 1 部署运行指南](part1_data_ingestion/README.md)。
-2. 再部署 [Part 2 Web Chat 分析门户](part2_chat_portal/README.md)（依赖 Part 1 的数仓）。
+推荐从 [实验手册](实验手册.md) 开始：两个实验的部署与上手操作一份文档走完。
+需要更深入的细节再看各部分的 README：
+
+1. [Part 1 部署运行指南](part1_data_ingestion/README.md)
+2. [Part 2 Web Chat 分析门户](part2_chat_portal/README.md)（依赖 Part 1 的数仓）
 
 ## 前置条件
 
