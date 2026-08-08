@@ -9,7 +9,9 @@
 #   5. 创建 Identity OAuth2 credential provider（Agent 访问 Gateway 的 M2M）
 #   6. 部署分析 Agent 到 Runtime（JWT 入站认证 + 流式）
 #   7. 附加 Runtime 执行角色所需策略
-#   8. 生成前端 web/.env.local 并输出使用说明
+#   8. 生成前端 web/.env.local
+#   9. 部署数据摄入任务管理模块（Tasks HTTP API + tasks-api / runner Lambda +
+#      EventBridge Scheduler 调度组），并把 API 地址补进 web/.env.local
 #
 # 前置：Part 1 已部署（依赖其 Aurora 栈输出）；本机有 docker；
 #      模型认证同 Part 1（export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>）
@@ -32,6 +34,12 @@ GATEWAY_NAME="agentcore-workshop-analytics-gw"
 GATEWAY_TARGET_NAME="analytics"
 IDENTITY_PROVIDER_NAME="agentcore-workshop-keycloak"
 AGENT_NAME="analysis_chat_agent"
+# 任务管理模块（步骤 9）
+TASKS_STACK="agentcore-workshop-part2-tasks"
+TASKS_API_NAME="agentcore-workshop-tasks-api"
+RUNNER_NAME="agentcore-workshop-ingestion-runner"
+# 允许跨域访问 Tasks API 的前端来源（Vite dev server；多个用逗号分隔）
+TASKS_ALLOWED_ORIGINS="${TASKS_ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PART2_DIR="$(dirname "$SCRIPT_DIR")"
@@ -66,7 +74,7 @@ if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
   echo "❌ 未找到 Part 1 的 Aurora 栈（$AURORA_STACK），请先部署 Part 1"; exit 1
 fi
 
-echo "==> [1/8] 部署 Keycloak（ECR + ECS Fargate + API Gateway，首次约需 5-8 分钟）..."
+echo "==> [1/9] 部署 Keycloak（ECR + ECS Fargate + API Gateway，首次约需 5-8 分钟）..."
 # 1a. 生成 realm.json（注入机密）并准备构建上下文
 KC_BUILD_DIR="$DEPLOY_DIR/kc-build"
 mkdir -p "$KC_BUILD_DIR"
@@ -150,7 +158,7 @@ if [[ "$ISSUER" != https://* ]]; then
 fi
 echo "    Keycloak 就绪，issuer: $ISSUER"
 
-echo "==> [2/8] 部署分析链路基础设施（CloudFormation）..."
+echo "==> [2/9] 部署分析链路基础设施（CloudFormation）..."
 aws cloudformation deploy \
   --template-file "$PART2_DIR/infra/part2-analytics.yaml" \
   --stack-name "$PART2_STACK" \
@@ -170,7 +178,7 @@ _part2_output() {
 LAMBDA_ROLE_ARN=$(_part2_output AnalyticsLambdaRoleArn)
 GATEWAY_ROLE_ARN=$(_part2_output GatewayRoleArn)
 
-echo "==> [3/8] 打包并部署数据查询 Lambda（VPC 内直连 Aurora）..."
+echo "==> [3/9] 打包并部署数据查询 Lambda（VPC 内直连 Aurora）..."
 LAMBDA_BUILD_DIR="$DEPLOY_DIR/lambda-build"
 rm -rf "$LAMBDA_BUILD_DIR" && mkdir -p "$LAMBDA_BUILD_DIR"
 cp "$PART2_DIR/infra/analytics-lambda/handler.py" "$LAMBDA_BUILD_DIR/"
@@ -208,7 +216,7 @@ fi
 LAMBDA_ARN=$(aws lambda get-function --function-name "$LAMBDA_NAME" --region "$REGION" \
   --query Configuration.FunctionArn --output text)
 
-echo "==> [4/8] 创建 Gateway + Lambda target（MCP 工具）..."
+echo "==> [4/9] 创建 Gateway + Lambda target（MCP 工具）..."
 GW_AUTH_CONFIG="{\"customJWTAuthorizer\": {\"discoveryUrl\": \"$DISCOVERY_URL\", \"allowedAudience\": [\"analysis-gateway\"]}}"
 # 注意：结果多于一页时 CLI 会按页应用 --query、逐页输出（可能出现多行
 # "None"），需过滤后取第一个真实值
@@ -270,7 +278,7 @@ else
   echo "    复用已有 target: $TARGET_ID（已同步工具 schema）"
 fi
 
-echo "==> [5/8] 创建 Identity OAuth2 credential provider（M2M）..."
+echo "==> [5/9] 创建 Identity OAuth2 credential provider（M2M）..."
 PROVIDER_CONFIG="{\"customOauth2ProviderConfig\": {\"oauthDiscovery\": {\"discoveryUrl\": \"$DISCOVERY_URL\"}, \"clientId\": \"analysis-agent\", \"clientSecret\": \"$AGENT_CLIENT_SECRET\"}}"
 if aws bedrock-agentcore-control get-oauth2-credential-provider --region "$REGION" \
     --name "$IDENTITY_PROVIDER_NAME" >/dev/null 2>&1; then
@@ -287,7 +295,7 @@ else
   echo "    已创建 provider: $IDENTITY_PROVIDER_NAME"
 fi
 
-echo "==> [6/8] 部署分析 Agent 到 Runtime（JWT 入站认证 + 流式）..."
+echo "==> [6/9] 部署分析 Agent 到 Runtime（JWT 入站认证 + 流式）..."
 RUNTIME_AUTH_CONFIG="{\"customJWTAuthorizer\": {\"discoveryUrl\": \"$DISCOVERY_URL\", \"allowedAudience\": [\"analysis-runtime\"]}}"
 cd "$PART2_DIR/agent"
 agentcore configure --entrypoint main.py --name "$AGENT_NAME" --region "$REGION" \
@@ -301,7 +309,7 @@ agentcore launch \
   ${MODEL_ID:+--env MODEL_ID="$MODEL_ID"} \
   ${OPENAI_BASE_URL:+--env OPENAI_BASE_URL="$OPENAI_BASE_URL"}
 
-echo "==> [7/8] 附加 Runtime 执行角色所需策略..."
+echo "==> [7/9] 附加 Runtime 执行角色所需策略..."
 ROLE_ARN=$(grep -oE 'arn:aws:iam::[0-9]+:role/[A-Za-z0-9+=,.@_/-]+' .bedrock_agentcore.yaml | head -1 || true)
 ROLE_NAME="${ROLE_ARN##*/}"
 if [ -n "$ROLE_NAME" ]; then
@@ -347,7 +355,7 @@ fi
 AGENT_ARN=$(grep -oE 'arn:aws:bedrock-agentcore:[a-z0-9-]+:[0-9]+:runtime/[A-Za-z0-9_-]+' \
   .bedrock_agentcore.yaml | head -1 || true)
 
-echo "==> [8/8] 生成前端配置 web/.env.local ..."
+echo "==> [8/9] 生成前端配置 web/.env.local ..."
 cat > "$PART2_DIR/web/.env.local" <<EOF
 VITE_KC_URL=$KC_URL
 VITE_KC_REALM=$KC_REALM
@@ -356,6 +364,113 @@ VITE_RUNTIME_ARN=$AGENT_ARN
 VITE_AWS_REGION=$REGION
 EOF
 
+echo "==> [9/9] 部署数据摄入任务管理模块（Tasks API + 两个 Lambda + 调度组）..."
+# 依赖 Part 1 的 Runtime（runner 要调它）与 Aurora 栈输出；Part 1 未部署时
+# 只警告跳过，不让整个 Part 2 部署失败
+PART1_AGENT_CONFIG="$(dirname "$PART2_DIR")/part1_data_ingestion/agent/.bedrock_agentcore.yaml"
+PART1_RUNTIME_ARN=""
+if [ -f "$PART1_AGENT_CONFIG" ]; then
+  PART1_RUNTIME_ARN=$(grep -oE 'arn:aws:bedrock-agentcore:[a-z0-9-]+:[0-9]+:runtime/[A-Za-z0-9_-]+' \
+    "$PART1_AGENT_CONFIG" | head -1 || true)
+fi
+AURORA_CLUSTER_ARN=$(_aurora_output ClusterArn)
+DATA_POLICY_ARN=$(_aurora_output AgentDataAccessPolicyArn)
+
+if [ -z "$PART1_RUNTIME_ARN" ]; then
+  echo "    ⚠️ 未从 $PART1_AGENT_CONFIG 解析到 Part 1 Runtime ARN，跳过任务管理模块"
+  echo "       （先在 part1_data_ingestion 下跑 scripts/deploy.sh，再重跑本脚本）"
+  TASKS_API_URL=""
+else
+  # 首轮部署时两个函数还不存在，而它们的执行角色由本栈创建（鸡生蛋）：
+  # 先用 ApiEnabled=false 只建角色/调度组，建完函数再补建 HTTP API
+  TASKS_API_ENABLED="true"
+  aws lambda get-function --function-name "$TASKS_API_NAME" --region "$REGION" >/dev/null 2>&1 \
+    || TASKS_API_ENABLED="false"
+  aws lambda get-function --function-name "$RUNNER_NAME" --region "$REGION" >/dev/null 2>&1 \
+    || TASKS_API_ENABLED="false"
+
+  _deploy_tasks_stack() {
+    aws cloudformation deploy \
+      --template-file "$PART2_DIR/infra/part2-tasks.yaml" \
+      --stack-name "$TASKS_STACK" \
+      --capabilities CAPABILITY_NAMED_IAM \
+      --region "$REGION" \
+      --parameter-overrides \
+        "KeycloakIssuerUrl=$ISSUER" \
+        "Part1RuntimeArn=$PART1_RUNTIME_ARN" \
+        "AuroraClusterArn=$AURORA_CLUSTER_ARN" \
+        "AuroraSecretArn=$DB_SECRET_ARN" \
+        "AgentDataAccessPolicyArn=$DATA_POLICY_ARN" \
+        "TasksApiFunctionName=$TASKS_API_NAME" \
+        "RunnerFunctionName=$RUNNER_NAME" \
+        "AllowedOrigins=$TASKS_ALLOWED_ORIGINS" \
+        "ApiEnabled=$1" \
+      --no-fail-on-empty-changeset
+  }
+  _tasks_output() {
+    aws cloudformation describe-stacks --stack-name "$TASKS_STACK" --region "$REGION" \
+      --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+  }
+  _deploy_tasks_stack "$TASKS_API_ENABLED"
+
+  TASKS_API_ROLE_ARN=$(_tasks_output TasksApiRoleArn)
+  RUNNER_ROLE_ARN=$(_tasks_output RunnerRoleArn)
+  SCHEDULE_GROUP=$(_tasks_output ScheduleGroupName)
+  SCHEDULER_ROLE_ARN=$(_tasks_output SchedulerInvokeRoleArn)
+  RUNNER_ARN="arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$RUNNER_NAME"
+
+  # 两个函数都只依赖 runtime 自带的 boto3，直接 zip 单文件即可
+  _deploy_tasks_lambda() {
+    local name="$1" src="$2" role="$3" timeout="$4" memory="$5" env="$6"
+    local zip="$DEPLOY_DIR/$name.zip"
+    rm -f "$zip"
+    (cd "$(dirname "$src")" && zip -q "$zip" "$(basename "$src")")
+    if aws lambda get-function --function-name "$name" --region "$REGION" >/dev/null 2>&1; then
+      aws lambda update-function-code --function-name "$name" --region "$REGION" \
+        --zip-file "fileb://$zip" >/dev/null
+      aws lambda wait function-updated --function-name "$name" --region "$REGION"
+      aws lambda update-function-configuration --function-name "$name" --region "$REGION" \
+        --environment "$env" --timeout "$timeout" --memory-size "$memory" >/dev/null
+      aws lambda wait function-updated --function-name "$name" --region "$REGION"
+      echo "    已更新 Lambda: $name"
+    else
+      # 新建 IAM 角色到 Lambda 可见有延迟，带重试
+      for attempt in $(seq 1 10); do
+        if aws lambda create-function --function-name "$name" --region "$REGION" \
+          --runtime python3.12 --handler handler.lambda_handler \
+          --role "$role" --zip-file "fileb://$zip" \
+          --timeout "$timeout" --memory-size "$memory" \
+          --environment "$env" >/dev/null 2>/tmp/create_tasks_lambda_err; then
+          break
+        fi
+        [ "$attempt" -eq 10 ] && { echo "创建 Lambda 失败($name):"; cat /tmp/create_tasks_lambda_err; exit 1; }
+        echo "    等待 IAM 角色生效后重试（$attempt/10）..."
+        sleep 10
+      done
+      aws lambda wait function-active-v2 --function-name "$name" --region "$REGION"
+      echo "    已创建 Lambda: $name"
+    fi
+  }
+
+  AURORA_ENV="AURORA_CLUSTER_ARN=$AURORA_CLUSTER_ARN,AURORA_SECRET_ARN=$DB_SECRET_ARN,AURORA_DATABASE=$DATABASE"
+  # runner 同步消费 SSE，单次运行 2~5 分钟，超时给到 15 分钟上限
+  _deploy_tasks_lambda "$RUNNER_NAME" "$PART2_DIR/infra/runner-lambda/handler.py" \
+    "$RUNNER_ROLE_ARN" 900 512 \
+    "Variables={$AURORA_ENV,PART1_RUNTIME_ARN=$PART1_RUNTIME_ARN}"
+  _deploy_tasks_lambda "$TASKS_API_NAME" "$PART2_DIR/infra/tasks-api-lambda/handler.py" \
+    "$TASKS_API_ROLE_ARN" 60 256 \
+    "Variables={$AURORA_ENV,RUNNER_FUNCTION_NAME=$RUNNER_NAME,RUNNER_FUNCTION_ARN=$RUNNER_ARN,SCHEDULE_GROUP=$SCHEDULE_GROUP,SCHEDULER_ROLE_ARN=$SCHEDULER_ROLE_ARN}"
+
+  # 首轮：函数就绪后补建 HTTP API（路由 + JWT authorizer + 调用许可）
+  if [ "$TASKS_API_ENABLED" != "true" ]; then
+    echo "    函数已就绪，补建 Tasks HTTP API ..."
+    _deploy_tasks_stack "true"
+  fi
+  TASKS_API_URL=$(_tasks_output ApiEndpoint)
+  echo "    Tasks API: $TASKS_API_URL"
+  echo "VITE_TASKS_API_URL=$TASKS_API_URL" >> "$PART2_DIR/web/.env.local"
+fi
+
 echo ""
 echo "✅ Part 2 部署完成！"
 echo ""
@@ -363,6 +478,9 @@ echo "   Keycloak:      $KC_URL（管理台 admin / 密码见 $SECRETS_FILE）"
 echo "   门户测试账号:   analyst / $ANALYST_PASSWORD"
 echo "   Gateway:       $GATEWAY_URL"
 echo "   Runtime Agent: $AGENT_ARN"
+if [ -n "${TASKS_API_URL:-}" ]; then
+  echo "   Tasks API:     $TASKS_API_URL（任务管理模块，需 Keycloak token）"
+fi
 echo ""
 echo "   启动前端: cd $PART2_DIR/web && npm install && npm run dev"
 echo "   然后浏览器打开 http://localhost:5173（用上面的测试账号登录）"

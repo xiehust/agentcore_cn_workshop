@@ -1,0 +1,292 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AgentCore Workshop Part 2 - 数据摄入任务管理模块基础设施。
+  门户 SPA 带 Keycloak 用户 token 直连本栈的 HTTP API（JWT authorizer 校验
+  issuer + aud=analysis-runtime），由 tasks-api Lambda 做任务/运行/事件的
+  CRUD 与 Live View presign；一次性任务异步 Invoke runner Lambda，定期任务
+  交给 EventBridge Scheduler 定时 Invoke runner；runner 用自身 IAM 角色
+  SigV4 调 Part 1 Runtime（Part 1 保持 IAM 认证，CLI 调用方式不变）。
+  两个 Lambda 都不进 VPC，走 RDS Data API 读写 Aurora（与 Part 1 同款）。
+  本模板只建 IAM 角色 / HTTP API / Scheduler 资源；Lambda 函数本体由
+  deploy.sh 打包创建（沿用 analytics Lambda 的做法）。
+
+Parameters:
+  KeycloakIssuerUrl:
+    Type: String
+    Description: >
+      Keycloak realm 的 issuer（形如
+      https://<api-id>.execute-api.<region>.amazonaws.com/realms/agentcore-workshop）
+  Part1RuntimeArn:
+    Type: String
+    Description: Part 1 数据摄入 Agent 的 Runtime ARN（runner 调用目标）
+  AuroraClusterArn:
+    Type: String
+    Description: 共享数仓集群 ARN（Lambda 环境变量由 deploy.sh 注入，这里记录以便排查）
+  AuroraSecretArn:
+    Type: String
+    Description: 数仓主用户 Secret ARN（同上）
+  AgentDataAccessPolicyArn:
+    Type: String
+    Description: Part 1 Aurora 栈输出的托管策略（rds-data + 读 Secret），两个 Lambda 角色都挂它
+  TasksApiFunctionName:
+    Type: String
+    Default: agentcore-workshop-tasks-api
+  RunnerFunctionName:
+    Type: String
+    Default: agentcore-workshop-ingestion-runner
+  AllowedOrigins:
+    Type: CommaDelimitedList
+    Default: http://localhost:5173
+    Description: 允许跨域访问 Tasks API 的前端来源
+  ApiEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      是否创建 HTTP API。首次部署时两个 Lambda 还不存在（它们的执行角色由本栈
+      创建，属于鸡生蛋问题），而 AWS::Lambda::Permission 对不存在的函数会直接
+      报 ResourceNotFound，因此 deploy.sh 首轮先用 false 只建角色，创建完函数
+      后再用 true 补建 API；后续重跑一直是 true，不会反复删建。
+
+Conditions:
+  CreateApi: !Equals [!Ref ApiEnabled, "true"]
+
+Resources:
+  # ---- 任务管理 API 的执行角色 ----
+  TasksApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agentcore-workshop-tasks-api-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref AgentDataAccessPolicyArn
+      Policies:
+        - PolicyName: tasks-api-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # 一次性任务 / 手动重跑：异步触发 runner
+              - Sid: InvokeRunner
+                Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${RunnerFunctionName}
+              # 定期任务：在专属调度组内增删改 schedule
+              - Sid: ManageSchedules
+                Effect: Allow
+                Action:
+                  - scheduler:CreateSchedule
+                  - scheduler:UpdateSchedule
+                  - scheduler:DeleteSchedule
+                  - scheduler:GetSchedule
+                Resource: !Sub arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ScheduleGroup}/*
+              # 建 schedule 时要把 Scheduler 的执行角色交给服务
+              #（只放这一个角色，不加 iam:PassedToService 条件——Scheduler 的
+              #  PassRole 请求不一定带该上下文键，加了会变成难查的 AccessDenied）
+              - Sid: PassSchedulerRole
+                Effect: Allow
+                Action: [iam:PassRole]
+                Resource: !GetAtt SchedulerInvokeRole.Arn
+              # Live View：查会话状态 + presign 直播流（凭证不下发浏览器）
+              - Sid: BrowserLiveView
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetBrowserSession
+                  - bedrock-agentcore:ListBrowserSessions
+                  - bedrock-agentcore:ConnectBrowserLiveViewStream
+                Resource:
+                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:browser/*
+                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:browser-custom/*
+                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:browser-profile/*
+
+  # ---- runner 的执行角色：只多一个「调 Part 1 Runtime」的权限 ----
+  RunnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agentcore-workshop-ingestion-runner-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref AgentDataAccessPolicyArn
+      Policies:
+        - PolicyName: invoke-part1-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [bedrock-agentcore:InvokeAgentRuntime]
+                Resource:
+                  - !Ref Part1RuntimeArn
+                  - !Sub ${Part1RuntimeArn}/runtime-endpoint/*
+
+  # ---- 定期任务调度 ----
+  ScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: agentcore-workshop-ingestion
+
+  SchedulerInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agentcore-workshop-ingestion-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: invoke-runner
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${RunnerFunctionName}
+
+  # ---- 前端入口：HTTP API + Keycloak JWT authorizer ----
+  TasksHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Condition: CreateApi
+    Properties:
+      Name: agentcore-workshop-tasks-api
+      Description: Workshop Part2 数据摄入任务管理 API
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: !Ref AllowedOrigins
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, POST, DELETE, OPTIONS]
+        MaxAge: 3600
+
+  # allowedAudience 而非 client_id：Keycloak 默认不发 client_id claim，
+  # 两个 client 的 audience 由 realm 里的 audience mapper 注入
+  KeycloakAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Condition: CreateApi
+    Properties:
+      ApiId: !Ref TasksHttpApi
+      Name: keycloak-jwt
+      AuthorizerType: JWT
+      IdentitySource: ["$request.header.Authorization"]
+      JwtConfiguration:
+        Issuer: !Ref KeycloakIssuerUrl
+        Audience: ["analysis-runtime"]
+
+  TasksApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: CreateApi
+    Properties:
+      ApiId: !Ref TasksHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TasksApiFunctionName}
+      PayloadFormatVersion: "2.0"
+      IntegrationMethod: POST
+
+  # 逐个方法建路由而不是 ANY：ANY 会把 CORS 预检的 OPTIONS 也吃掉，
+  # 走到 authorizer 上必然 401，前端跨域直接失败
+  ListTasksRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: CreateApi
+    Properties:
+      ApiId: !Ref TasksHttpApi
+      RouteKey: GET /tasks
+      AuthorizationType: JWT
+      AuthorizerId: !Ref KeycloakAuthorizer
+      Target: !Sub integrations/${TasksApiIntegration}
+
+  CreateTaskRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: CreateApi
+    Properties:
+      ApiId: !Ref TasksHttpApi
+      RouteKey: POST /tasks
+      AuthorizationType: JWT
+      AuthorizerId: !Ref KeycloakAuthorizer
+      Target: !Sub integrations/${TasksApiIntegration}
+
+  GetTaskRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: CreateApi
+    Properties:
+      ApiId: !Ref TasksHttpApi
+      RouteKey: GET /tasks/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref KeycloakAuthorizer
+      Target: !Sub integrations/${TasksApiIntegration}
+
+  PostTaskRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: CreateApi
+    Properties:
+      ApiId: !Ref TasksHttpApi
+      RouteKey: POST /tasks/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref KeycloakAuthorizer
+      Target: !Sub integrations/${TasksApiIntegration}
+
+  DeleteTaskRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: CreateApi
+    Properties:
+      ApiId: !Ref TasksHttpApi
+      RouteKey: DELETE /tasks/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref KeycloakAuthorizer
+      Target: !Sub integrations/${TasksApiIntegration}
+
+  GetRunRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: CreateApi
+    Properties:
+      ApiId: !Ref TasksHttpApi
+      RouteKey: GET /runs/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref KeycloakAuthorizer
+      Target: !Sub integrations/${TasksApiIntegration}
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Condition: CreateApi
+    Properties:
+      ApiId: !Ref TasksHttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  TasksApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateApi
+    Properties:
+      FunctionName: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TasksApiFunctionName}
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TasksHttpApi}/*
+
+Outputs:
+  ApiEndpoint:
+    Description: Tasks API 根地址（$default stage，路径无前缀）
+    Value: !If [CreateApi, !GetAtt TasksHttpApi.ApiEndpoint, "pending"]
+  TasksApiRoleArn:
+    Value: !GetAtt TasksApiRole.Arn
+  RunnerRoleArn:
+    Value: !GetAtt RunnerRole.Arn
+  ScheduleGroupName:
+    Value: !Ref ScheduleGroup
+  SchedulerInvokeRoleArn:
+    Value: !GetAtt SchedulerInvokeRole.Arn
+  AuroraClusterArn:
+    Description: 记录本模块连接的数仓集群（Lambda 环境变量由 deploy.sh 注入）
+    Value: !Ref AuroraClusterArn
+  AuroraSecretArn:
+    Value: !Ref AuroraSecretArn
