@@ -109,6 +109,11 @@ cd web && npm install && npm run dev
 
 ## 常见问题
 
+- **登录页报 `Invalid parameter: redirect_uri`**：realm 已放宽为接受任意
+  redirect URI（demo 配置），如仍出现说明跑的还是旧镜像，`KC_REDEPLOY=1`
+  重跑 deploy.sh。注意浏览器端 PKCE 依赖 Web Crypto，只在**安全上下文**
+  可用——请通过 `localhost` 端口转发或 HTTPS 隧道访问门户，不要用
+  `http://<IP>:5173` 直连（页面会卡在空白）。
 - **登录后调用返回 403**：确认前端拿到的 token audience 是 `analysis-runtime`
   （jwt.io 解码看 `aud`），以及 Runtime 的 authorizer discovery URL 与 Keycloak
   地址一致（Keycloak 重建后需重跑 deploy.sh 同步）。

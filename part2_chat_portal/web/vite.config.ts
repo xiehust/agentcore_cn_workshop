@@ -12,6 +12,7 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react()],
     server: {
+      host: true, // 监听所有网卡，支持从转发端口 / 机器 IP 访问
       port: 5173,
       proxy: {
         "/api/invoke": {
