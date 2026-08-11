@@ -2,6 +2,7 @@
 
 通过 Web 聊天界面，用 Agent 分析 Part 1 入库的选品数据。支持**流式输出**、
 **固定报表**（选品漏斗、类目/赛道分布）和**开放式即席分析**（自然语言 → 只读 SQL）。
+对话[**落库持久化**](#分析会话与历史)，侧栏可回看、恢复、重命名、删除历史会话。
 门户还带一个[**数据摄入任务管理**](#数据摄入任务管理模块)模块：在页面上创建、调度、
 观察 Part 1 的摄入任务（含云端浏览器实况），不必回命令行 `agentcore invoke`。
 
@@ -29,7 +30,9 @@ AgentCore Runtime（分析 Agent，Strands SDK，SSE 流式）
    │         ▼
    │    Aurora Serverless v2（PostgreSQL，Part 1 创建）
    │
-   └──▶ Code Interpreter：统计分析、衍生计算
+   ├──▶ Code Interpreter：统计分析、衍生计算
+   │
+   └──▶ RDS Data API ──▶ chat_messages（对话逐轮落库；沙箱回收后回灌恢复上下文）
 ```
 
 **本部分要验证的关键设计**：Gateway 侧**不使用 VPC egress**——私网访问全部由挂在
@@ -42,12 +45,12 @@ Aurora 同 VPC 内的 Lambda 承担（`Gateway → Lambda(VPC) → Aurora(同 VP
 
 | 组件 | 用途 |
 |------|------|
-| **Runtime** | 托管分析 Agent；`--authorizer-config` 配置 JWT 入站认证；SSE 流式响应；按 session 隔离（会话内多轮对话） |
+| **Runtime** | 托管分析 Agent；`--authorizer-config` 配置 JWT 入站认证；SSE 流式响应；按 session 隔离（会话内多轮对话），历史双层——沙箱内存 + 数仓回灌 |
 | **Identity** | 出站认证：OAuth2 credential provider 对接 Keycloak（client credentials / M2M），token 缓存在 token vault |
 | **Gateway** | 把数据查询 Lambda 转成 3 个 MCP 工具；入站同样用 Keycloak JWT 认证（audience 隔离：Runtime 与 Gateway 各收各的 token） |
 | **Code Interpreter** | 对查询结果做统计分析 |
 | **Browser** | 任务管理模块里观看 Part 1 抓取时的云端浏览器实况（Live View，DCV 直播流；presigned URL 由服务端签发） |
-| **Memory** | 本期不启用（部署 `--disable-memory`）。预留：后续接入 AWS 自部署的 **mem0** 记住用户分析偏好，接入点见 `agent/main.py` 标注 |
+| **Memory** | 本期不启用（部署 `--disable-memory`）。[会话历史](#分析会话与历史)是自建的两张 Aurora 表，与 Memory 无关；预留：后续接入 AWS 自部署的 **mem0** 记住用户分析偏好（长期语义记忆），接入点见 `agent/main.py` 标注 |
 
 ## 目录结构
 
@@ -55,21 +58,26 @@ Aurora 同 VPC 内的 Lambda 承担（`Gateway → Lambda(VPC) → Aurora(同 VP
 part2_chat_portal/
 ├── agent/                        # 分析 Agent（部署到 AgentCore Runtime）
 │   ├── main.py                   # 流式入口 + Identity M2M + Gateway MCP 工具
+│   │                             #   + 会话历史落库/回灌（RDS Data API）
 │   └── requirements.txt
 ├── infra/
 │   ├── keycloak/                 # 自部署 Keycloak（Dockerfile + realm 模板）
 │   ├── analytics-lambda/         # 数据查询 Lambda（pg8000 直连 Aurora）
 │   ├── part2-analytics.yaml      # CloudFormation：Lambda/Gateway 角色 + Secrets VPC 端点
 │   ├── tool-schema.json          # Gateway Lambda target 的工具 schema
-│   ├── part2-tasks.yaml          # CloudFormation：Tasks HTTP API + JWT authorizer + 两个 Lambda 角色 + 调度组
-│   ├── tasks-api-lambda/         # 任务 CRUD / 调度管理 / Live View 签名
+│   ├── part2-tasks.yaml          # CloudFormation：Tasks HTTP API（/tasks、/runs、/chat 路由）
+│   │                             #   + JWT authorizer + 两个 Lambda 角色 + 调度组
+│   ├── tasks-api-lambda/         # 任务 CRUD / 调度管理 / Live View 签名 / 会话元数据（/chat）
 │   └── runner-lambda/            # 执行一次运行：SigV4 调 Part 1 Runtime，消费 SSE 落事件
 ├── scripts/
 │   ├── deploy.sh                 # 一键部署（Keycloak + 基础设施 + Gateway + Runtime + 任务管理模块）
 │   ├── get_token.sh              # 测试辅助：demo 账号换取用户 token
 │   └── chat_test.sh              # 命令行冒烟测试（流式打印 Agent 回复）
 └── web/                          # 前端 SPA（Vite + React + TS，本地 dev server）
-    └── src/tasks/                # 任务管理页：列表 + 新建抽屉 + 运行详情 + Live View
+    └── src/
+        ├── chat/                 # 会话历史接口（列表 / 注册 / 消息 / 重命名 / 删除）
+        ├── lib/                  # 共用小工具：http.ts（请求封装）、time.ts
+        └── tasks/                # 任务管理页：列表 + 新建抽屉 + 运行详情 + Live View
 ```
 
 ## 部署
@@ -91,6 +99,20 @@ provider（5）→ 分析 Agent 到 Runtime（6-7）→ 前端配置（8）→ �
 `part1_data_ingestion/agent/.bedrock_agentcore.yaml` 解析）和 Part 1 建的任务表；
 解析不到 ARN 时脚本只打警告跳过该步，其余部署照常完成，补跑 Part 1 的 deploy.sh
 后重跑即可。
+
+会话历史相关的三处部署动作：
+
+- 脚本开头**预检** `chat_sessions` / `chat_messages` 两表（查询带冷恢复重试）。
+  缺表就地失败并提示回 Part 1 重跑 `deploy.sh` 建表——与其部署完再排查
+  `/chat` 接口 500、Runtime 每轮落库报错，不如先失败。
+- 第 6 步 `agentcore launch` 给 Runtime 注入
+  `AURORA_CLUSTER_ARN` / `AURORA_SECRET_ARN` / `AURORA_DATABASE`（值取自 Part 1
+  的 Aurora 栈输出）。
+- 第 7 步给 Runtime 执行角色 attach Part 1 栈输出的数据访问托管策略
+  （`AgentDataAccessPolicyArn`，与任务管理模块的两个 Lambda 同一份权限）。
+
+后两项由脚本无条件执行、天然幂等；本地裸跑 Agent（没有这些环境变量）时对话
+功能不受影响，只是历史退化为纯内存（等同旧行为）。
 
 ## 使用
 
@@ -116,7 +138,71 @@ cd web && npm install && npm run dev
 ./scripts/chat_test.sh '候选池里产品点最高的5个商品' <上一次输出的session id>  # 多轮
 ```
 
-侧栏有两个视图：默认的聊天分析，以及「任务管理」（数据摄入任务，见下节）。
+侧栏有两个视图：默认的聊天分析，以及「任务管理」（数据摄入任务，见下节）；
+中间是[「历史会话」列表](#分析会话与历史)。
+
+## 分析会话与历史
+
+对话不再是一次性的：每轮消息落 Aurora，页面刷新、换标签、Runtime 沙箱被回收
+之后都能回看并接着聊。写和读分两条路——**消息内容归 Runtime，会话元数据归
+tasks-api Lambda**：
+
+```
+写入：SPA ──▶ Runtime（invoke，链路与前面完全一致）
+                 │ ① 沙箱内存里没有该会话时，按 seq 回灌 chat_messages（含工具轮）
+                 │ ② 流结束后把本轮新增的消息增量写回
+                 ▼
+             RDS Data API（Runtime 不挂 VPC）──▶ Aurora
+
+读取 / 管理：SPA ──▶ Tasks HTTP API 的 /chat/* ──▶ tasks-api Lambda ──▶ Aurora
+             （与任务管理模块同一个 API、同一个 Lambda、同一个 JWT authorizer）
+```
+
+几个设计点：
+
+- **归属靠前端注册**。Runtime 侧拿不到用户身份，所以会话在前端发第一条消息时
+  调 `POST /chat/sessions` 注册，`user_name` 由 Lambda 从 JWT claims 的
+  `preferred_username` 取（不信前端传值）。`/chat` 的每条查询都按 `user_name`
+  过滤，取不到该 claim 直接 403。
+- **存全量 Strands message**。`chat_messages.content` 是消息原样 JSON（含
+  `toolUse` / `toolResult`），回灌保真；前端回看用的是另一列 `display_text`
+  （text block 拼接），纯工具轮该列为 NULL，读接口过滤掉。
+- **落库绝不阻断聊天**。任何 DB 异常只打日志，SSE 流照常返回；没有 `AURORA_*`
+  环境变量时（例如本地裸跑）整体降级为纯内存历史，行为等同这个功能上线之前。
+- **回灌会修尾**。库里若存着不完整的轮次（例如上次落库中途失败，工具调用没有
+  对应结果），回灌时把这段尾巴丢掉并顺手从表里删除——留着它们会占住后续消息的
+  `seq`，被唯一索引静默挡掉。这样交给模型的消息序列始终合法。
+- **CLI 会话不进列表**。`chat_test.sh` 没有注册步骤，消息照落库但 `chat_sessions`
+  里没有行，门户列表自然看不到——这是有意为之，不是遗漏。
+
+### 数据表
+
+两张表同样建在 Part 1 的 `infra/setup_tables.sql`（表 6、表 7）：
+`chat_sessions`（`session_id` 主键、归属用户、标题、`active`/`deleted` 软删状态）、
+`chat_messages`（`(session_id, seq)` 唯一索引、`content` 全量 JSONB、`display_text`）。
+会话 id 直接复用 Runtime 的会话隔离 id（前端生成 `web-<uuid>`，满足 ≥33 字符），
+不另建一套映射；服务端按 `^web-[0-9a-f-]{36}$` 校验，别的字符串注册不进来。
+
+### API（/chat 路由组）
+
+与 `/tasks`、`/runs` 共用一个 HTTP API 和同一个 JWT authorizer，请求同样要带
+`Authorization: Bearer <Keycloak token>`。
+
+| 方法 + 路径 | 用途 |
+|------------|------|
+| `POST /chat/sessions` | 注册会话，幂等：已存在则 touch `updated_at` 并把软删状态恢复 `active`（删掉当前会话后又继续聊，应重新可见）。body：`session_id`、`title`；id 已属于别的用户时 409 |
+| `GET /chat/sessions` | 当前用户的会话列表，按最后活动倒序（最多 200 条）；带 `last_message_at`（会话还没消息时为空）和 `message_count`（不含纯工具轮） |
+| `GET /chat/sessions/{id}/messages?after_seq=N` | 消息列表，按 `seq` 升序，单页 200 条 + `has_more`（Data API 单次结果 1MB 上限，长会话靠游标续拉，不做静默截断） |
+| `PATCH /chat/sessions/{id}` | 重命名。body：`title` |
+| `DELETE /chat/sessions/{id}` | 软删会话（列表消失），消息保留 |
+
+### 页面上的使用
+
+侧栏「历史会话」按最后活动时间倒序列出自己的会话，当前会话高亮。点一条即载入
+完整对话回看（Markdown 与图表照常渲染），可以直接接着追问——沙箱还活着就用内存
+历史，被回收了就回灌，前端无感知。鼠标悬停出现重命名和删除按钮；删除的正是当前
+会话时会自动切到新对话。「新对话」语义不变，新会话在第一条消息发出后才进列表，
+标题默认取首条输入截断，之后可以改。
 
 ## 数据摄入任务管理模块
 
@@ -244,7 +330,11 @@ Lambda 调用许可要等函数存在才能建，脚本因此先用 `ApiEnabled=
   `KC_HOSTNAME` 强制 https。
 - **Aurora 冷恢复**：集群 MinCapacity=0 空闲自动暂停，Lambda 首次连接会触发恢复
   （15 秒~1 分钟），连接层带重试；首个问题偶尔偏慢属正常现象。两个任务管理
-  Lambda 走 RDS Data API，同样带 `DatabaseResumingException` 退避重试。
+  Lambda 走 RDS Data API，同样带 `DatabaseResumingException` 退避重试。Runtime
+  侧的会话历史读写把重试上限收紧到 20 秒——回灌等不起一分钟，超时就按空历史继续，
+  宁可丢上下文也不挂住请求。
+- **超大消息裁剪**：单条消息 JSON 超过 300KB（Data API 单参数 512KB 留余量）时
+  降级为只存文本的裁剪版，极端场景丢的是工具明细，回灌链路不会断。
 - **Live View 的前端集成**：`bedrock-agentcore` 包里的 `BrowserLiveView` 写的是
   `import dcv from "dcv"` / `dcv-ui`，这两个裸 specifier 没有对应 npm 包，指的是
   包内 vendored 的 Amazon DCV Web SDK——`vite.config.ts` 用 `resolve.alias` 指过去，
@@ -263,6 +353,31 @@ Lambda 调用许可要等函数存在才能建，脚本因此先用 `ApiEnabled=
   （jwt.io 解码看 `aud`），以及 Runtime 的 authorizer discovery URL 与 Keycloak
   地址一致（Keycloak 重建后需重跑 deploy.sh 同步）。
 - **工具调用报数据库超时**：多为 Aurora 冷恢复中，重问一次即可。
+- **侧栏「历史会话」不显示，或回看旧会话后追问不认前文**：这两个症状对应链路的
+  两端。列表空说明读侧有问题——`GET /chat/sessions` 是不是 401/403（token 过期，
+  或 token 里没有 `preferred_username`），以及会话是否真的注册过（CLI 会话不注册）。
+  追问丢上下文说明写侧没落库，按顺序查：Runtime 有没有
+  `AURORA_CLUSTER_ARN` / `AURORA_SECRET_ARN` 环境变量（`agentcore status` 或控制台
+  看运行时配置）、执行角色有没有挂 Part 1 的数据访问策略、数仓里两张表是否存在
+  （`SELECT COUNT(*) FROM pg_tables WHERE tablename IN ('chat_sessions','chat_messages')`）。
+  落库失败只打日志不影响回答，所以界面上不会报错，日志在 Runtime 的 CloudWatch
+  日志组里。重跑 Part 1 的 deploy.sh 建表、再重跑本脚本可一并修好后两项。
+- **怎么确认回灌真的生效**：不用等沙箱空闲 15 分钟——强制停掉当前的 Runtime
+  会话再用同一个会话追问一句依赖前文的话（如「刚才那个漏斗」）。注意本 Runtime
+  配的是 JWT 入站认证，`agentcore stop-session` 和 `aws bedrock-agentcore
+  stop-runtime-session` 走 SigV4 会报 `Authorization method mismatch`，要带用户
+  token 直调数据面（或者干脆重新部署一次把沙箱顶掉）：
+
+  ```bash
+  TOKEN=$(./scripts/get_token.sh)
+  ARN_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('<Runtime ARN>', safe=''))")
+  curl -X POST "https://bedrock-agentcore.<region>.amazonaws.com/runtimes/$ARN_ENC/stopruntimesession" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -H "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id: <session id>" -d '{}'
+  ```
+
+  回答仍接得上说明历史是从 Aurora 回灌的，此路径已实测通过；Runtime 日志里能
+  看到 `[history] 已回灌 N 条历史消息`。
 - **Keycloak 重启后登录态丢失**：dev 模式内嵌 H2 存储，实例重启丢运行期数据
   （用户重新登录即可；realm 配置来自镜像内的导入文件，不会丢）。
 - **deploy.sh 第 4 步报 `unknown command 'configure'`**：本机装了 npm 版

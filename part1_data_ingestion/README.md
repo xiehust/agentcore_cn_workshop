@@ -52,7 +52,7 @@ bash scripts/deploy.sh
 | 步骤 | 内容 | 说明 |
 |------|------|------|
 | 1 | CloudFormation 部署 Aurora Serverless v2 | 自建 VPC + 私有子网 + Aurora（Data API，Min 0 ACU 自动暂停）+ IAM 策略。VPC 留给 Part 2 的 Lambda 直连验证 |
-| 2 | 建表 | 业务表 `selection_verdicts`（判定记录）、`product_candidates`（候选档案），以及 Part 2 任务管理模块用的三张表（见下节）。DDL 逐条幂等执行 |
+| 2 | 建表 | 业务表 `selection_verdicts`（判定记录）、`product_candidates`（候选档案），以及 Part 2 门户用的五张表：任务管理三表和会话历史两表（见下节）。DDL 逐条幂等执行 |
 | 3 | 创建自定义 Browser 与 Browser Profile | browser 开启 Web Bot Auth（请求签名，减少验证码，预览功能）；profile 跨会话保留 cookies/localStorage。均按名字幂等，重复执行会复用 |
 | 4 | `agentcore configure && agentcore launch` | direct_code_deploy 直接部署代码到 Runtime（无需 Docker），并注入 browser/profile ID 等环境变量 |
 | 5 | 附加数仓/浏览器访问策略到 Runtime 执行角色 | rds-data 入库权限 + Secret 读取 + 自定义 browser 与 profile 的会话/保存权限 |
@@ -96,6 +96,20 @@ Browser Live View 入口：
 `ingestion_run_events`（进度与日志事件），以及两张业务表新增的可空 `run_id` 列
 （可空 = 旧数据和命令行调用不受影响）。模块本身的部署与用法见
 [Part 2 说明](../part2_chat_portal/README.md#数据摄入任务管理模块)。
+
+## Part 2 门户的会话历史两表
+
+`infra/setup_tables.sql` 里还有两张只服务 Part 2 门户的表（表 6、表 7）——建在
+共享数仓，建表动作归本部分的 deploy.sh，Part 1 自身不读写它们：
+
+- `chat_sessions`：门户「分析对话」的会话元数据（标题、归属用户、软删状态），
+  由 Part 2 的 tasks-api Lambda 按 Keycloak 用户名注册与维护；
+- `chat_messages`：会话消息，存完整的 Strands message JSON（含工具轮）加一份
+  给前端回看用的 `display_text`，`(session_id, seq)` 唯一。Part 2 的 Runtime
+  在每轮对话结束后增量落库，会话沙箱被回收后按 `seq` 回灌恢复上下文。
+
+Part 2 的 deploy.sh 开头会预检这两张表，缺表直接失败并提示回来重跑本部分的
+deploy.sh。
 
 ## 验证入库结果
 
@@ -147,7 +161,7 @@ agentcore invoke -l '{"prompt": "..."}'
 | `agent/tools/aurora_tools.py` | save_verdict / save_candidate 入库工具（RDS Data API） |
 | `agent/tools/browser_ext.py` | Browser 扩展：Web Bot Auth 自定义 browser 接入 + profile 恢复/保存 |
 | `infra/aurora-serverless.yaml` | Aurora Serverless v2 + VPC CloudFormation 模板 |
-| `infra/setup_tables.sql` | 表结构 DDL：两张业务表 + Part 2 任务管理的三张表 |
+| `infra/setup_tables.sql` | 表结构 DDL：两张业务表 + Part 2 任务管理三表 + Part 2 会话历史两表 |
 | `scripts/deploy.sh` | 一键部署 |
 | `scripts/local_test.py` | 本地跑 Agent |
 | `scripts/invoke_example.sh` | 调用示例 |

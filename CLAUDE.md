@@ -50,8 +50,11 @@ E2E 浏览器验证用本机 Python 版 Playwright（`playwright` CLI 是 pip �
 ## 架构
 
 两个部分共用一套数仓：Part 1 的 CloudFormation 栈 `agentcore-workshop-aurora` 建
-VPC + Aurora Serverless v2（PostgreSQL，Min 0 ACU 空闲自动暂停），两张表
-`selection_verdicts`（判定记录）、`product_candidates`（候选档案）。
+VPC + Aurora Serverless v2（PostgreSQL，Min 0 ACU 空闲自动暂停）。表全部由
+Part 1 的 `infra/setup_tables.sql` 幂等建出：业务两表 `selection_verdicts`
+（判定记录）、`product_candidates`（候选档案），任务管理三表
+`ingestion_tasks`/`ingestion_runs`/`ingestion_run_events`，会话历史两表
+`chat_sessions`/`chat_messages`（后五张服务 Part 2 门户）。
 
 ### Part 1：数据摄入（part1_data_ingestion/）
 
@@ -92,6 +95,11 @@ Gateway → Lambda（挂 Aurora 同 VPC，pg8000 直连）→ Aurora
   数据面无 CORS 头，浏览器经 Vite dev server 代理（`vite.config.ts` 的
   `/api/invoke` 改写）。会话隔离靠 `X-Amzn-Bedrock-AgentCore-Runtime-Session-Id`
   （≥33 字符），会话内多轮历史存 Runtime microVM 的模块级 dict。
+- **会话持久化**：microVM 内存命中就零 DB 读；miss（回收后 / 换实例）时
+  `agent/main.py` 从 `chat_messages` 回灌完整 Strands 消息（含工具轮），流结束后
+  增量落库。全程 best-effort，DB 异常不阻断 SSE；无 `AURORA_*` 环境变量时降级为
+  纯内存。会话元数据由 tasks-api Lambda 的 `/chat` 路由管（`user_name` 取 JWT 的
+  `preferred_username`），Runtime 拿不到用户身份，故只管消息不管归属。
 - 部署走 `agentcore configure --disable-memory`（Memory 本期不用，预留 mem0）。
 
 ### 文档
