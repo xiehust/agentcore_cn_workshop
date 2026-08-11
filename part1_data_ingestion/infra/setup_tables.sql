@@ -133,3 +133,42 @@ CREATE INDEX IF NOT EXISTS idx_verdicts_run
 
 CREATE INDEX IF NOT EXISTS idx_candidates_run
     ON product_candidates (run_id);
+
+-- ============================================================
+-- 表 6：分析会话表（Part 2 门户「分析对话」历史）
+-- 一条记录 = 门户里的一个对话会话，session_id 与 Runtime 的会话隔离 id 同值。
+-- 由 tasks-api Lambda 在前端首次发送前幂等注册（user_name 取自 JWT claims）；
+-- 命令行调用（chat_test.sh）不注册，消息照落库但不出现在门户列表里。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    session_id VARCHAR(64)  NOT NULL,          -- 前端生成 web-<uuid>（≥33 字符）
+    user_name  VARCHAR(128) NOT NULL,          -- Keycloak preferred_username
+    title      VARCHAR(256) NOT NULL,          -- 默认首条输入截断，可重命名
+    status     VARCHAR(16)  NOT NULL DEFAULT 'active',  -- active / deleted
+    created_at TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP    NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_user
+    ON chat_sessions (user_name, updated_at);
+
+-- ============================================================
+-- 表 7：会话消息表（Strands message 全量 JSON）
+-- Part 2 Runtime 每轮对话结束后把新增消息逐条落库，seq 是会话内序号；
+-- microVM 回收后按 seq 回灌 content 即可恢复上下文（含 toolUse/toolResult）。
+-- display_text 是给门户回看用的降级视图，纯工具轮为 NULL（读接口过滤掉）。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS chat_messages (
+    message_id   BIGSERIAL,
+    session_id   VARCHAR(64) NOT NULL,
+    seq          INT         NOT NULL,         -- 会话内 0 起自增，回灌按 seq 排序
+    role         VARCHAR(16) NOT NULL,         -- user / assistant
+    content      JSONB       NOT NULL,         -- 完整 Strands message（原样，保真回灌）
+    display_text TEXT,                         -- content 里 text block 拼接
+    created_at   TIMESTAMP   NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (message_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_messages_session_seq
+    ON chat_messages (session_id, seq);
