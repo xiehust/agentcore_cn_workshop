@@ -1,11 +1,11 @@
 // 数据摄入任务管理的 REST 客户端。
-// 后端是独立的 Tasks HTTP API（API Gateway HTTP API + Keycloak JWT authorizer），
-// 自带 CORS，浏览器直连即可，不像 Runtime 数据面那样需要 vite dev proxy。
-// 每个请求都带上 Keycloak 用户 token（aud=analysis-runtime）。
+// 请求封装（含 BASE 与 token）在 lib/http.ts，与分析会话 chat/api.ts 共用；
+// ApiError 在这里原样 re-export，调用方 import 路径不变。
 
-import { getToken } from "../auth";
+import { ApiError, request } from "../lib/http";
+import { parseTs } from "../lib/time";
 
-const BASE = (import.meta.env.VITE_TASKS_API_URL || "").replace(/\/+$/, "");
+export { ApiError, parseTs };
 
 /* ================= 类型 ================= */
 
@@ -97,50 +97,6 @@ export interface CreateTaskInput {
   schedule_tz?: string;
 }
 
-/* ================= 请求封装 ================= */
-
-/** 带 HTTP 状态码的异常：Live View 需要区分 409（还没起浏览器）/410（会话已结束）。 */
-export class ApiError extends Error {
-  readonly status: number;
-  constructor(status: number, message: string) {
-    super(message);
-    this.name = "ApiError";
-    this.status = status;
-  }
-}
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  if (!BASE) {
-    throw new ApiError(0, "未配置 VITE_TASKS_API_URL，请先跑 part2 的 deploy.sh 生成 .env.local");
-  }
-  const token = await getToken();
-  const resp = await fetch(BASE + path, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      ...init?.headers,
-    },
-  });
-  const text = await resp.text();
-  let body: unknown = null;
-  if (text) {
-    try {
-      body = JSON.parse(text);
-    } catch {
-      // 非 JSON 响应（如网关的 HTML 错误页），留给下面按状态码报错
-    }
-  }
-  if (!resp.ok) {
-    const err =
-      body && typeof body === "object" && typeof (body as { error?: unknown }).error === "string"
-        ? (body as { error: string }).error
-        : text || `HTTP ${resp.status}`;
-    throw new ApiError(resp.status, err);
-  }
-  return body as T;
-}
-
 /* ================= 任务 ================= */
 
 export function listTasks(): Promise<{ tasks: TaskSummary[] }> {
@@ -224,14 +180,6 @@ export const TASK_STATUS_TEXT: Record<TaskStatus, string> = {
 
 export function isRunActive(status: RunStatus | undefined): boolean {
   return status === "queued" || status === "running";
-}
-
-/** 时间戳后端用 to_char 输出带 Z 的 UTC ISO8601；没带时区标记的值一律按 UTC 兜底解析。 */
-export function parseTs(ts: string | null | undefined): Date | null {
-  if (!ts) return null;
-  const normalized = /[zZ]|[+-]\d\d:?\d\d$/.test(ts) ? ts : ts.replace(" ", "T") + "Z";
-  const d = new Date(normalized);
-  return Number.isNaN(d.getTime()) ? null : d;
 }
 
 export function formatTs(ts: string | null | undefined): string {

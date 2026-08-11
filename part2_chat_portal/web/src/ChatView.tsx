@@ -4,8 +4,9 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ArrowUpIcon, ChartDonutIcon, FunnelSimpleIcon, TerminalIcon } from "@phosphor-icons/react";
-import { streamChat, newSessionId } from "./api";
+import { streamChat } from "./api";
 import { getToken } from "./auth";
+import { getAllMessages, makeTitle, registerSession } from "./chat/api";
 import { Chart, tryParseChart } from "./Chart";
 
 interface Message {
@@ -70,39 +71,69 @@ function MarkdownBlock({ content }: { content: string }) {
 }
 
 interface ChatViewProps {
-  /** 切到任务管理视图时不卸载，仅隐藏，保住会话历史 */
+  /** 切到任务管理视图时不卸载，仅隐藏，保住当前对话 */
   hidden: boolean;
   request: ChatRequest | null;
-  /** 「新对话」自增，换 session 并清空消息 */
-  resetKey: number;
+  /** 当前会话 id，由 App 持有（「新对话」换新 id，点历史项换成那条会话的 id） */
+  sessionId: string;
+  /** sessionId 是否来自历史会话：true 时进来先把库里的消息拉回来，false 从空态开始 */
+  restored: boolean;
   /** 上报忙碌状态，供侧栏禁用快捷入口 */
   onBusyChange: (busy: boolean) => void;
+  /** 本会话有新动静（注册成功 / 一轮问答收尾），让 App 刷新侧栏历史列表 */
+  onSessionsChanged: () => void;
 }
 
-export default function ChatView({ hidden, request, resetKey, onBusyChange }: ChatViewProps) {
+export default function ChatView({
+  hidden,
+  request,
+  sessionId,
+  restored,
+  onBusyChange,
+  onSessionsChanged,
+}: ChatViewProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-  const [sessionId, setSessionId] = useState(newSessionId);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  // 本会话是否还需要注册进历史列表（新会话首条消息发出时注册一次）
+  const needRegisterRef = useRef(!restored);
+  // 当前会话 id 的镜像：abort 之后仍可能有一两个增量回调排在队里，流回调按它
+  // 判断自己是否还属于当前会话，切走后到达的增量丢掉——否则会追加到新会话
+  // （或刚从库里载入的历史）的最后一条消息上
+  const liveSessionRef = useRef(sessionId);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages]);
 
+  // 载入历史期间也算忙：这会儿 send() 是拒绝的，侧栏快捷入口得跟着禁用，
+  // 否则点一下 prompt 被静默丢掉（nonce 已消耗，不会补发）
   useEffect(() => {
-    onBusyChange(busy);
-  }, [busy, onBusyChange]);
+    onBusyChange(busy || loadingHistory);
+  }, [busy, loadingHistory, onBusyChange]);
 
   async function send(prompt: string) {
     const text = prompt.trim();
-    if (!text || busy) return;
+    if (!text || busy || loadingHistory) return;
     setInput("");
     setBusy(true);
     setMessages((m) => [...m, { role: "user", content: text }, { role: "assistant", content: "" }]);
+    // 新会话首条消息：把会话注册到当前用户名下，它才会出现在侧栏历史里。
+    // fire-and-forget，注册失败只记日志——对话本身不受影响（消息由 Runtime 落库）。
+    if (needRegisterRef.current) {
+      needRegisterRef.current = false;
+      void registerSession(sessionId, makeTitle(text))
+        .then(() => onSessionsChanged())
+        .catch((e: Error) => console.warn("会话注册失败，历史列表暂不显示该会话", e));
+    }
+    const sid = sessionId;
     const appendDelta = (delta: string) =>
       setMessages((m) => {
+        if (liveSessionRef.current !== sid || m.length === 0) return m;
         const next = [...m];
         next[next.length - 1] = {
           ...next[next.length - 1],
@@ -113,10 +144,11 @@ export default function ChatView({ hidden, request, resetKey, onBusyChange }: Ch
     try {
       const token = await getToken();
       abortRef.current = new AbortController();
-      await streamChat(text, sessionId, token, appendDelta, abortRef.current.signal);
+      await streamChat(text, sid, token, appendDelta, abortRef.current.signal);
     } catch (e) {
       if ((e as Error).name !== "AbortError") {
         setMessages((m) => {
+          if (liveSessionRef.current !== sid || m.length === 0) return m;
           const next = [...m];
           next[next.length - 1] = {
             role: "assistant",
@@ -129,6 +161,8 @@ export default function ChatView({ hidden, request, resetKey, onBusyChange }: Ch
     } finally {
       setBusy(false);
       abortRef.current = null;
+      // 一轮问答收尾：刷新列表，让排序与消息条数跟上
+      onSessionsChanged();
     }
   }
 
@@ -141,18 +175,54 @@ export default function ChatView({ hidden, request, resetKey, onBusyChange }: Ch
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [request]);
 
-  // 「新对话」：中断当前流、换 session、清空消息
+  // 会话切换：中断在途流、清空消息；恢复历史会话时再把库里的消息拉回来渲染。
+  // 「新对话」在 App 侧表现为换一个新 sessionId（restored=false），走同一条路径。
   useEffect(() => {
-    if (resetKey === 0) return;
+    liveSessionRef.current = sessionId;
     abortRef.current?.abort();
-    setSessionId(newSessionId());
     setMessages([]);
-  }, [resetKey]);
+    setHistoryError(null);
+    needRegisterRef.current = !restored;
+    if (!restored) {
+      setLoadingHistory(false);
+      return;
+    }
+    let cancelled = false;
+    setLoadingHistory(true);
+    getAllMessages(sessionId)
+      .then((history) => {
+        if (cancelled) return;
+        setMessages(history.map((m) => ({ role: m.role, content: m.display_text })));
+      })
+      .catch((e: Error) => {
+        if (!cancelled) setHistoryError(`会话历史加载失败：${e.message}`);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingHistory(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, restored]);
 
   return (
     <main className="chat" hidden={hidden}>
       <div className="messages" ref={scrollRef}>
-        {messages.length === 0 && (
+        {loadingHistory && (
+          <div className="message assistant">
+            <div className="bubble">
+              <span className="thinking">
+                载入会话历史<span className="dots" />
+              </span>
+            </div>
+          </div>
+        )}
+        {historyError && (
+          <div className="message assistant error">
+            <div className="bubble">{historyError}</div>
+          </div>
+        )}
+        {messages.length === 0 && !loadingHistory && !historyError && (
           <div className="empty">
             <div className="empty-mark">选</div>
             <h1>问一个关于选品数据的问题</h1>
@@ -206,7 +276,7 @@ export default function ChatView({ hidden, request, resetKey, onBusyChange }: Ch
           <button
             className="send"
             aria-label="发送"
-            disabled={busy || !input.trim()}
+            disabled={busy || loadingHistory || !input.trim()}
             onClick={() => send(input)}
           >
             <ArrowUpIcon size={17} weight="bold" />
