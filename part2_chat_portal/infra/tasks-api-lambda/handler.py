@@ -1,4 +1,4 @@
-"""Part 2 任务管理 API Lambda —— 门户「数据摄入任务管理」模块的后端。
+"""Part 2 门户后端 API Lambda —— 「数据摄入任务管理」+「分析会话历史」。
 
 链路（见 .trellis/tasks/08-08-ingestion-task-manager/design.md §1）：
 
@@ -7,7 +7,10 @@
       -> 本函数（不进 VPC，RDS Data API 读写任务表）
          ├─ 一次性任务/手动重跑：异步 Invoke runner Lambda
          ├─ 定期任务：EventBridge Scheduler 建/改/删 schedule
-         └─ Live View：GetBrowserSession 确认会话在线 + SigV4 presign 直播流
+         ├─ Live View：GetBrowserSession 确认会话在线 + SigV4 presign 直播流
+         └─ /chat/*：分析会话的元数据（注册/列表/重命名/软删）与消息回看
+            （见 .trellis/tasks/08-11-chat-sessions-history/design.md §4；
+             消息内容由 Part 2 Runtime 落库，本函数只读）
 
 设计说明：
 - 走 RDS Data API（和 Part 1 的 aurora_tools.py 同款），不进 VPC，也就不受
@@ -19,6 +22,7 @@
 
 import json
 import os
+import re
 import time
 import urllib.parse
 import uuid
@@ -141,6 +145,22 @@ def _int_param(params: dict, key: str, default: int, lo: int, hi: int) -> int:
         return max(lo, min(int(params.get(key, default)), hi))
     except (TypeError, ValueError):
         return default
+
+
+def _user_name(event: dict) -> str:
+    """从 JWT claims 取登录用户名（会话归属的唯一依据）。
+
+    authorizer 已经校验过签名/issuer/audience，claims 可信；Keycloak 的
+    preferred_username 就是登录名（门户账号 analyst）。取不到说明路由挂错了
+    authorizer——宁可 403 也不能把会话落到空用户名下。
+    """
+    claims = (
+        event.get("requestContext", {})
+        .get("authorizer", {})
+        .get("jwt", {})
+        .get("claims", {})
+    ) or {}
+    return (claims.get("preferred_username") or "").strip()
 
 
 # ---------------------------------------------------------------- 任务读写 ----
@@ -528,6 +548,189 @@ def get_live_view(run_id: str) -> dict:
     })
 
 
+# -------------------------------------------------------------- 分析会话 ----
+
+# 会话 id 由前端生成（web- + uuid4），同时用作 Runtime 的会话隔离 id。
+# 服务端校验格式：只接受这个前缀，防止把命令行会话或任意字符串注册到自己名下
+SESSION_ID_RE = re.compile(r"^web-[0-9a-f-]{36}$")
+
+# 会话对象形状（与 web/src/chat/api.ts 的 ChatSession 一一对应）：
+# last_message_at 是最后一条消息的时间，注册了还没发过消息时为 null；
+# 排序另用 COALESCE(..., updated_at) 兜底，保证新会话不会掉到列表最后
+CHAT_SESSION_COLUMNS = (
+    "s.session_id, s.title, s.status, "
+    f"to_char(s.created_at, '{TS}') AS created_at, "
+    f"to_char(s.updated_at, '{TS}') AS updated_at, "
+    f"to_char(m.last_at, '{TS}') AS last_message_at, "
+    "COALESCE(m.message_count, 0) AS message_count"
+)
+
+# 消息数只统计有文本的（纯工具轮 display_text 为 NULL，前端也不展示，
+# 计进去会让「2 条消息」的会话显示成 5 条）
+CHAT_SESSION_FROM = (
+    "FROM chat_sessions s "
+    "LEFT JOIN LATERAL ("
+    "  SELECT MAX(created_at) AS last_at, "
+    "         COUNT(*) FILTER (WHERE display_text IS NOT NULL) AS message_count "
+    "  FROM chat_messages WHERE session_id = s.session_id"
+    ") m ON TRUE "
+)
+
+
+def _chat_session_obj(row: dict) -> dict:
+    return {
+        "session_id": row.get("session_id"),
+        "title": row.get("title"),
+        "status": row.get("status"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "last_message_at": row.get("last_message_at"),
+        "message_count": int(row.get("message_count") or 0),
+    }
+
+
+def _get_chat_session(session_id: str, user_name: str) -> dict | None:
+    """按「归属当前用户 + 未软删」取会话；其余情况都当不存在。"""
+    rows = _execute(
+        f"SELECT {CHAT_SESSION_COLUMNS} {CHAT_SESSION_FROM}"
+        "WHERE s.session_id = :session_id AND s.user_name = :user_name "
+        "AND s.status <> 'deleted'",
+        [_p("session_id", session_id), _p("user_name", user_name)],
+    )
+    return rows[0] if rows else None
+
+
+def register_chat_session(body: dict, user_name: str) -> dict:
+    """注册会话（幂等 upsert）：前端在新会话首次发送时调一次。
+
+    ON CONFLICT 上的 user_name 条件是防越权：别人的 session_id 撞进来时
+    UPDATE 被跳过（不报错也不改数据），随后按归属读回拿不到行 -> 409。
+    已软删的会话被重新注册时恢复成 active——用户正在这个会话里继续对话，
+    让它从列表里消失反而更费解。
+    """
+    session_id = (body.get("session_id") or "").strip()
+    title = (body.get("title") or "").strip() or "未命名会话"
+    if not SESSION_ID_RE.match(session_id):
+        return _err(400, "session_id 格式非法（须为 web-<uuid>）")
+
+    _execute(
+        "INSERT INTO chat_sessions (session_id, user_name, title) "
+        "VALUES (:session_id, :user_name, :title) "
+        "ON CONFLICT (session_id) DO UPDATE "
+        "SET updated_at = NOW(), status = 'active' "
+        "WHERE chat_sessions.user_name = :user_name",
+        [
+            _p("session_id", session_id),
+            _p("user_name", user_name),
+            _p("title", title[:256]),
+        ],
+    )
+    session = _get_chat_session(session_id, user_name)
+    if session is None:
+        return _err(409, "该会话 id 已被占用")
+    return _resp(200, {"session": _chat_session_obj(session)})
+
+
+def list_chat_sessions(user_name: str) -> dict:
+    """当前用户的会话列表，按最后活动倒序。"""
+    rows = _execute(
+        f"SELECT {CHAT_SESSION_COLUMNS} {CHAT_SESSION_FROM}"
+        "WHERE s.user_name = :user_name AND s.status <> 'deleted' "
+        "ORDER BY COALESCE(m.last_at, s.updated_at) DESC LIMIT 200",
+        [_p("user_name", user_name)],
+    )
+    return _resp(200, {"sessions": [_chat_session_obj(r) for r in rows]})
+
+
+def get_chat_messages(session_id: str, user_name: str, params: dict) -> dict:
+    """会话回看：只回展示用字段，纯工具轮（display_text IS NULL）过滤掉。
+
+    完整的 Strands message（content 列）只给 Runtime 回灌用，不下发前端。
+    单页 200 条 + after_seq 游标：Data API 单次结果有 1MB 上限，长会话靠
+    has_more 继续拉，避免静默截断。
+    """
+    if _get_chat_session(session_id, user_name) is None:
+        return _err(404, "会话不存在")
+
+    limit = 200
+    after_seq = _int_param(params, "after_seq", -1, -1, 10_000_000)
+    rows = _execute(
+        "SELECT seq, role, display_text, "
+        f"to_char(created_at, '{TS}') AS created_at "
+        "FROM chat_messages WHERE session_id = :session_id "
+        "AND seq > :after_seq::INT AND display_text IS NOT NULL "
+        f"ORDER BY seq LIMIT {limit + 1}",
+        [_p("session_id", session_id), _p("after_seq", after_seq)],
+    )
+    has_more = len(rows) > limit
+    messages = [
+        {
+            "seq": int(r["seq"]),
+            "role": r.get("role"),
+            "display_text": r.get("display_text"),
+            "created_at": r.get("created_at"),
+        }
+        for r in rows[:limit]
+    ]
+    return _resp(200, {"messages": messages, "has_more": has_more})
+
+
+def rename_chat_session(session_id: str, user_name: str, body: dict) -> dict:
+    title = (body.get("title") or "").strip()
+    if not title:
+        return _err(400, "缺少会话标题 title")
+    if _get_chat_session(session_id, user_name) is None:
+        return _err(404, "会话不存在")
+    _execute(
+        "UPDATE chat_sessions SET title = :title, updated_at = NOW() "
+        "WHERE session_id = :session_id AND user_name = :user_name",
+        [
+            _p("title", title[:256]),
+            _p("session_id", session_id),
+            _p("user_name", user_name),
+        ],
+    )
+    return _resp(200, {"session": _chat_session_obj(
+        _get_chat_session(session_id, user_name) or {}
+    )})
+
+
+def delete_chat_session(session_id: str, user_name: str) -> dict:
+    """软删：消息全部保留，只是不再出现在列表里。"""
+    if _get_chat_session(session_id, user_name) is None:
+        return _err(404, "会话不存在")
+    _execute(
+        "UPDATE chat_sessions SET status = 'deleted', updated_at = NOW() "
+        "WHERE session_id = :session_id AND user_name = :user_name",
+        [_p("session_id", session_id), _p("user_name", user_name)],
+    )
+    return _resp(200, {"ok": True})
+
+
+def _dispatch_chat(method: str, segments: list[str], event: dict, params: dict) -> dict:
+    """/chat/... 路由。所有查询都按 JWT 里的用户名过滤（会话不跨用户可见）。"""
+    user_name = _user_name(event)
+    if not user_name:
+        return _err(403, "token 缺少 preferred_username claim，无法确定会话归属")
+
+    if segments[:2] == ["chat", "sessions"]:
+        if len(segments) == 2:
+            if method == "GET":
+                return list_chat_sessions(user_name)
+            if method == "POST":
+                return register_chat_session(_body(event), user_name)
+        elif len(segments) == 3:
+            session_id = segments[2]
+            if method == "PATCH":
+                return rename_chat_session(session_id, user_name, _body(event))
+            if method == "DELETE":
+                return delete_chat_session(session_id, user_name)
+        elif len(segments) == 4 and method == "GET" and segments[3] == "messages":
+            return get_chat_messages(segments[2], user_name, params)
+
+    return _err(404, f"未知路径: {method} /{'/'.join(segments)}")
+
+
 # ------------------------------------------------------------------- 入口 ----
 
 def _dispatch(method: str, segments: list[str], event: dict, params: dict) -> dict:
@@ -563,6 +766,10 @@ def _dispatch(method: str, segments: list[str], event: dict, params: dict) -> di
                 return get_run_results(run_id, params)
             if sub == "live-view":
                 return get_live_view(run_id)
+
+    # /chat ...（分析会话历史）
+    if segments[:1] == ["chat"]:
+        return _dispatch_chat(method, segments, event, params)
 
     return _err(404, f"未知路径: {method} /{'/'.join(segments)}")
 

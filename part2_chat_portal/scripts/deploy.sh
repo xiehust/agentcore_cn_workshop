@@ -67,11 +67,34 @@ _aurora_output() {
 CLUSTER_ENDPOINT=$(_aurora_output ClusterEndpoint)
 DB_SECRET_ARN=$(_aurora_output SecretArn)
 DATABASE=$(_aurora_output DatabaseName)
+# 集群 ARN 与数据访问策略：Runtime（会话历史落库，步骤 6/7）与任务管理模块的
+# 两个 Lambda（步骤 9）都要用，统一在这里取
+AURORA_CLUSTER_ARN=$(_aurora_output ClusterArn)
+DATA_POLICY_ARN=$(_aurora_output AgentDataAccessPolicyArn)
 VPC_ID=$(_aurora_output VpcId)
 PRIVATE_SUBNET_IDS=$(_aurora_output PrivateSubnetIds)
 LAMBDA_SG_ID=$(_aurora_output LambdaClientSecurityGroupId)
 if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
   echo "❌ 未找到 Part 1 的 Aurora 栈（$AURORA_STACK），请先部署 Part 1"; exit 1
+fi
+
+# 预检会话历史两表（建表归 Part 1 deploy.sh 管）：缺表时 /chat 接口会 500、
+# Runtime 落库每轮报错，与其部署完再排查，不如现在快速失败。
+# 集群 Min 0 ACU 空闲自动暂停，首查可能撞冷恢复，重试约 60 秒。
+echo "==> 预检数仓会话历史表（chat_sessions / chat_messages）..."
+CHAT_TABLES=""
+for _ in $(seq 1 12); do
+  CHAT_TABLES=$(aws rds-data execute-statement --region "$REGION" \
+    --resource-arn "$AURORA_CLUSTER_ARN" --secret-arn "$DB_SECRET_ARN" \
+    --database "$DATABASE" \
+    --sql "SELECT COUNT(*) FROM pg_tables WHERE tablename IN ('chat_sessions','chat_messages')" \
+    --query 'records[0][0].longValue' --output text 2>/dev/null) && break
+  sleep 5
+done
+if [ "$CHAT_TABLES" != "2" ]; then
+  echo "❌ 数仓缺少会话历史表（chat_sessions / chat_messages）。"
+  echo "   请先重跑 Part 1 部署脚本建表：cd part1_data_ingestion && bash scripts/deploy.sh"
+  exit 1
 fi
 
 echo "==> [1/9] 部署 Keycloak（ECR + ECS Fargate + API Gateway，首次约需 5-8 分钟）..."
@@ -304,6 +327,9 @@ agentcore configure --entrypoint main.py --name "$AGENT_NAME" --region "$REGION"
 agentcore launch \
   --env GATEWAY_URL="$GATEWAY_URL" \
   --env IDENTITY_PROVIDER_NAME="$IDENTITY_PROVIDER_NAME" \
+  --env AURORA_CLUSTER_ARN="$AURORA_CLUSTER_ARN" \
+  --env AURORA_SECRET_ARN="$DB_SECRET_ARN" \
+  --env AURORA_DATABASE="$DATABASE" \
   ${OPENAI_API_KEY:+--env OPENAI_API_KEY="$OPENAI_API_KEY"} \
   ${AWS_BEARER_TOKEN_BEDROCK:+--env AWS_BEARER_TOKEN_BEDROCK="$AWS_BEARER_TOKEN_BEDROCK"} \
   ${MODEL_ID:+--env MODEL_ID="$MODEL_ID"} \
@@ -348,6 +374,14 @@ if [ -n "$ROLE_NAME" ]; then
         \"Resource\": \"arn:aws:bedrock-mantle:*:$ACCOUNT_ID:project/*\"
       }]
     }"
+  # 会话历史落库要读写 Aurora（RDS Data API + 读集群 Secret）：直接挂 Part 1
+  # 栈输出的托管策略，与任务管理模块的两个 Lambda 同一份权限（attach 幂等）
+  if [ -n "$DATA_POLICY_ARN" ] && [ "$DATA_POLICY_ARN" != "None" ]; then
+    aws iam attach-role-policy --role-name "$ROLE_NAME" \
+      --policy-arn "$DATA_POLICY_ARN"
+  else
+    echo "    ⚠️ 未取到 Aurora 数据访问策略，会话历史将无法落库（Runtime 退化为纯内存历史）"
+  fi
   echo "    已附加到角色: $ROLE_NAME"
 else
   echo "    ⚠️ 未能自动解析执行角色，请手动附加 Identity / Code Interpreter / mantle 权限"
@@ -373,8 +407,6 @@ if [ -f "$PART1_AGENT_CONFIG" ]; then
   PART1_RUNTIME_ARN=$(grep -oE 'arn:aws:bedrock-agentcore:[a-z0-9-]+:[0-9]+:runtime/[A-Za-z0-9_-]+' \
     "$PART1_AGENT_CONFIG" | head -1 || true)
 fi
-AURORA_CLUSTER_ARN=$(_aurora_output ClusterArn)
-DATA_POLICY_ARN=$(_aurora_output AgentDataAccessPolicyArn)
 
 if [ -z "$PART1_RUNTIME_ARN" ]; then
   echo "    ⚠️ 未从 $PART1_AGENT_CONFIG 解析到 Part 1 Runtime ARN，跳过任务管理模块"

@@ -7,6 +7,8 @@ Description: >
   交给 EventBridge Scheduler 定时 Invoke runner；runner 用自身 IAM 角色
   SigV4 调 Part 1 Runtime（Part 1 保持 IAM 认证，CLI 调用方式不变）。
   两个 Lambda 都不进 VPC，走 RDS Data API 读写 Aurora（与 Part 1 同款）。
+  同一个 API 上的 /chat/* 路由由 tasks-api Lambda 兼管分析会话历史的元数据
+  （注册/列表/重命名/软删 + 消息回看），消息内容由 Part 2 Runtime 落库。
   本模板只建 IAM 角色 / HTTP API / Scheduler 资源；Lambda 函数本体由
   deploy.sh 打包创建（沿用 analytics Lambda 的做法）。
 
@@ -167,7 +169,7 @@ Resources:
       CorsConfiguration:
         AllowOrigins: !Ref AllowedOrigins
         AllowHeaders: [authorization, content-type]
-        AllowMethods: [GET, POST, DELETE, OPTIONS]
+        AllowMethods: [GET, POST, PATCH, DELETE, OPTIONS]
         MaxAge: 3600
 
   # allowedAudience 而非 client_id：Keycloak 默认不发 client_id claim，
@@ -252,6 +254,50 @@ Resources:
     Properties:
       ApiId: !Ref TasksHttpApi
       RouteKey: GET /runs/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref KeycloakAuthorizer
+      Target: !Sub integrations/${TasksApiIntegration}
+
+  # ---- 分析会话历史（/chat/*）----
+  # 会话相关路径都在 /chat 下至少还有一段（/chat/sessions、
+  # /chat/sessions/{id}/messages），{proxy+} 贪婪匹配一段及以上即可覆盖，
+  # 不需要再为 /chat 本身建路由
+  GetChatRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: CreateApi
+    Properties:
+      ApiId: !Ref TasksHttpApi
+      RouteKey: GET /chat/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref KeycloakAuthorizer
+      Target: !Sub integrations/${TasksApiIntegration}
+
+  PostChatRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: CreateApi
+    Properties:
+      ApiId: !Ref TasksHttpApi
+      RouteKey: POST /chat/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref KeycloakAuthorizer
+      Target: !Sub integrations/${TasksApiIntegration}
+
+  PatchChatRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: CreateApi
+    Properties:
+      ApiId: !Ref TasksHttpApi
+      RouteKey: PATCH /chat/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref KeycloakAuthorizer
+      Target: !Sub integrations/${TasksApiIntegration}
+
+  DeleteChatRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: CreateApi
+    Properties:
+      ApiId: !Ref TasksHttpApi
+      RouteKey: DELETE /chat/{proxy+}
       AuthorizationType: JWT
       AuthorizerId: !Ref KeycloakAuthorizer
       Target: !Sub integrations/${TasksApiIntegration}

@@ -17,16 +17,21 @@
                      接入点见 invoke() 里的标注。
 
 多轮对话：Runtime 按 session 隔离 microVM，同一 session 的请求落在同一进程，
-用模块级 dict 按 session_id 保存对话历史即可实现会话内多轮。
+用模块级 dict 按 session_id 保存对话历史即可实现会话内多轮；microVM 回收
+（idle 约 15 分钟）后内存历史丢失，因此每轮结束把消息落库 Aurora
+（chat_messages 表），下次命中不到内存历史就从库里回灌（见下方持久化助手）。
 """
 
 import asyncio
 import json
 import os
 import re
+import time
 import urllib.parse
 import urllib.request
 
+import boto3
+from botocore.exceptions import ClientError
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
 from strands.models.openai_responses import OpenAIResponsesModel
@@ -47,6 +52,10 @@ IDENTITY_PROVIDER_NAME = os.environ.get("IDENTITY_PROVIDER_NAME", "")
 KC_TOKEN_URL = os.environ.get("KC_TOKEN_URL", "")
 KC_CLIENT_ID = os.environ.get("KC_CLIENT_ID", "analysis-agent")
 KC_CLIENT_SECRET = os.environ.get("KC_CLIENT_SECRET", "")
+# 会话历史持久化（RDS Data API，不挂 VPC；两个 ARN 缺一就整体降级为纯内存）
+AURORA_CLUSTER_ARN = os.environ.get("AURORA_CLUSTER_ARN", "")
+AURORA_SECRET_ARN = os.environ.get("AURORA_SECRET_ARN", "")
+AURORA_DATABASE = os.environ.get("AURORA_DATABASE", "product_hunting")
 
 app = BedrockAgentCoreApp()
 
@@ -134,10 +143,207 @@ async def _gateway_token() -> str:
     )
 
 
-# 会话内多轮对话历史：session_id -> Strands messages
+# 会话内多轮对话历史：session_id -> Strands messages（microVM 存活期间的快取）
 _HISTORY: dict[str, list] = {}
+# 写游标：session_id -> 已落库的消息条数（= 下一条的 seq）
+_PERSISTED_SEQ: dict[str, int] = {}
 # [Memory 预留] 后续接入 mem0（AWS 自部署）时：invoke 开始前按用户检索
 # 长期记忆注入上下文，结束后把本轮对话写回 mem0。本期不实现。
+
+# ---- 会话历史持久化（chat_messages 表，RDS Data API） ----
+# 全部 best-effort：读失败按空历史继续，写失败只打日志，绝不影响 SSE 流。
+
+# 单条消息 JSON 上限：Data API 单参数 512KB，留余量；超了降级存裁剪版
+_MAX_CONTENT_BYTES = 300 * 1024
+# 冷恢复退避上限：回灌等不起 tasks-api 那样的 50 秒，宁可丢上下文不可挂请求
+_DB_DEADLINE_S = 20
+
+_rds_client_cache = None
+
+
+def _db_enabled() -> bool:
+    """两个 ARN 齐全才落库；本地 python main.py 裸跑时退化为纯内存历史。"""
+    return bool(AURORA_CLUSTER_ARN and AURORA_SECRET_ARN)
+
+
+def _rds_client():
+    global _rds_client_cache
+    if _rds_client_cache is None:
+        _rds_client_cache = boto3.client("rds-data", region_name=REGION)
+    return _rds_client_cache
+
+
+def _p(name: str, value) -> dict:
+    """Data API 参数（统一转字符串，SQL 里按需 cast）。"""
+    return {"name": name, "value": {"stringValue": "" if value is None else str(value)}}
+
+
+def _db_execute(sql: str, parameters: list) -> list[dict]:
+    """执行一条 SQL 并返回行。集群 MinCapacity=0 空闲暂停，冷恢复期退避重试。"""
+    deadline = time.time() + _DB_DEADLINE_S
+    while True:
+        try:
+            resp = _rds_client().execute_statement(
+                resourceArn=AURORA_CLUSTER_ARN,
+                secretArn=AURORA_SECRET_ARN,
+                database=AURORA_DATABASE,
+                sql=sql,
+                parameters=parameters,
+                formatRecordsAs="JSON",
+            )
+            return json.loads(resp.get("formattedRecords") or "[]")
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if (code == "DatabaseResumingException" or "resum" in str(e).lower()) \
+                    and time.time() < deadline:
+                time.sleep(3)
+                continue
+            raise
+
+
+def _display_text(message: dict) -> str | None:
+    """抽取消息里的纯文本（门户回看用）。纯工具轮没有 text block，返回 None。"""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip() or None
+    parts = [
+        block["text"] for block in (content or [])
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    ]
+    return "".join(parts).strip() or None
+
+
+def _shrink(message: dict) -> dict:
+    """超大消息降级：把 toolResult 内容、toolUse 入参、长文本都截断成占位文本，
+    但保留 toolUse/toolResult 的配对结构与 toolUseId——拆掉配对会让回灌后的
+    第一次调用直接被模型拒掉。"""
+    shrunk = json.loads(json.dumps(message, ensure_ascii=False, default=str))
+    for block in shrunk.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        result = block.get("toolResult")
+        if isinstance(result, dict):
+            result["content"] = [
+                {"text": json.dumps(item, ensure_ascii=False, default=str)[:4000]
+                         + " …（原始结果过大，已截断）"}
+                for item in (result.get("content") or [])
+            ]
+        use = block.get("toolUse")
+        if isinstance(use, dict) and "input" in use:
+            raw = json.dumps(use["input"], ensure_ascii=False, default=str)
+            if len(raw) > 4000:
+                use["input"] = {"truncated": raw[:4000] + " …（原始入参过大，已截断）"}
+        if isinstance(block.get("text"), str) and len(block["text"]) > 20000:
+            block["text"] = block["text"][:20000] + " …（内容过大已截断）"
+    return shrunk
+
+
+def _has_tool_use(message: dict) -> bool:
+    """消息里是否有 toolUse 块（配对的 toolResult 在下一条消息里）。"""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(block, dict) and "toolUse" in block for block in content)
+
+
+def _complete_len(messages: list) -> int:
+    """可安全回灌的长度：历史必须停在一轮问答的收尾（assistant 的纯文本回复）处。
+
+    逐条落库中途失败会让库里停在一轮的中间——只写进了 user 提问、或者
+    assistant 发了 toolUse 但配对的 toolResult 没落库。这种序列塞回模型会被判为
+    非法消息序列、整个请求挂掉，那这个会话就再也聊不动了；宁可少回灌一轮上下文。
+    """
+    n = len(messages)
+    while n:
+        last = messages[n - 1]
+        if last.get("role") == "assistant" and not _has_tool_use(last):
+            break
+        n -= 1
+    return n
+
+
+def _load_messages(session_id: str) -> list:
+    """回灌会话历史：按 seq 取回完整 Strands messages（含工具轮）。"""
+    if not _db_enabled():
+        return []
+    try:
+        rows = _db_execute(
+            "SELECT seq, content::text AS content FROM chat_messages "
+            "WHERE session_id = :session_id ORDER BY seq",
+            [_p("session_id", session_id)],
+        )
+        rows = [r for r in rows if r.get("content")]
+        messages = [json.loads(r["content"]) for r in rows]
+        keep = _complete_len(messages)
+        if keep < len(messages):
+            # 把不完整的尾巴一并从库里删掉：写游标是按回灌条数定的，留着这些行
+            # 会让后面新消息的 seq 撞上它们（ON CONFLICT DO NOTHING 静默丢弃）。
+            # 删不掉也不影响这轮对话，只是这个会话后续暂时写不进新消息
+            try:
+                _db_execute(
+                    "DELETE FROM chat_messages "
+                    "WHERE session_id = :session_id AND seq >= :seq::INT",
+                    [_p("session_id", session_id), _p("seq", rows[keep]["seq"])],
+                )
+            except Exception as e:
+                print(f"[history] 清理不完整尾巴失败: {type(e).__name__}: {e}")
+            print(f"[history] 丢弃 {len(messages) - keep} 条不完整的尾部消息: {session_id}")
+            messages = messages[:keep]
+        if messages:
+            print(f"[history] 已回灌 {len(messages)} 条历史消息: {session_id}")
+        return messages
+    except Exception as e:
+        print(f"[history] 回灌失败（按空历史继续）: {type(e).__name__}: {e}")
+        return []
+
+
+def _persist_new(session_id: str, messages: list) -> None:
+    """把游标之后的新消息逐条落库。
+
+    某条写失败就地停下且不推进游标：下一轮从同一位置重试（唯一索引 +
+    DO NOTHING 兜住重复），保证库里始终是一段连续的前缀，不出现 seq 空洞。
+    """
+    if not _db_enabled():
+        return
+    sql = (
+        "INSERT INTO chat_messages (session_id, seq, role, content, display_text) "
+        "VALUES (:session_id, :seq::INT, :role, :content::JSONB, "
+        "        NULLIF(:display_text, '')) "
+        "ON CONFLICT (session_id, seq) DO NOTHING"
+    )
+    for seq in range(_PERSISTED_SEQ.get(session_id, 0), len(messages)):
+        message = messages[seq]
+        try:
+            content = json.dumps(message, ensure_ascii=False, default=str)
+            if len(content.encode("utf-8")) > _MAX_CONTENT_BYTES:
+                content = json.dumps(_shrink(message), ensure_ascii=False, default=str)
+            if len(content.encode("utf-8")) > _MAX_CONTENT_BYTES:
+                # 截断过还是超限（极端情况）。带工具块的消息不能降级成纯文本
+                # ——那会拆散 toolUse/toolResult 配对，回灌时反而把会话搞死；
+                # 这一轮干脆不落库，停在这里由下次回灌的尾部清理收拾
+                if _has_tool_use(message) or any(
+                    isinstance(b, dict) and "toolResult" in b
+                    for b in (message.get("content") or [])
+                ):
+                    print(f"[history] 消息过大且含工具块，跳过本轮落库（seq={seq}）")
+                    return
+                content = json.dumps(
+                    {"role": message.get("role") or "user",
+                     "content": [{"text": (_display_text(message) or "")[:50_000]
+                                          or "（内容过大已省略）"}]},
+                    ensure_ascii=False,
+                )
+            _db_execute(sql, [
+                _p("session_id", session_id),
+                _p("seq", seq),
+                _p("role", (message.get("role") or "user")[:16]),
+                _p("content", content),
+                _p("display_text", _display_text(message)),
+            ])
+            _PERSISTED_SEQ[session_id] = seq + 1
+        except Exception as e:
+            print(f"[history] 落库失败（seq={seq}，下轮重试）: {type(e).__name__}: {e}")
+            return
 
 
 @app.entrypoint
@@ -153,6 +359,13 @@ async def invoke(payload: dict, context=None):
         return
 
     session_id = getattr(context, "session_id", None) or "local"
+
+    # microVM 还活着就用内存历史；被回收（或换了实例）则从库里回灌，
+    # 这样"15 分钟没动的会话继续追问"也能接上上下文
+    if session_id not in _HISTORY:
+        history = await asyncio.to_thread(_load_messages, session_id)
+        _HISTORY[session_id] = history
+        _PERSISTED_SEQ[session_id] = len(history)
 
     token = await _gateway_token()
     mcp_client = MCPClient(lambda: streamablehttp_client(
@@ -173,6 +386,8 @@ async def invoke(payload: dict, context=None):
             if "data" in event:
                 yield event["data"]
         _HISTORY[session_id] = agent.messages
+        # 落库放在流结束之后：本身是 best-effort，慢一点也不占用回答时延
+        await asyncio.to_thread(_persist_new, session_id, agent.messages)
 
 
 if __name__ == "__main__":
