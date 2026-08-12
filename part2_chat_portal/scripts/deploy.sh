@@ -215,8 +215,11 @@ if aws lambda get-function --function-name "$LAMBDA_NAME" --region "$REGION" >/d
   aws lambda update-function-code --function-name "$LAMBDA_NAME" --region "$REGION" \
     --zip-file "fileb://$DEPLOY_DIR/analytics-lambda.zip" >/dev/null
   aws lambda wait function-updated --function-name "$LAMBDA_NAME" --region "$REGION"
+  # vpc-config 一起更新：Aurora 栈重建（VPC/子网/SG 换号）后让函数收敛回来，
+  # 否则会僵在旧网络配置上（与 Part 1 写库 Lambda 的 update 分支同款处理）
   aws lambda update-function-configuration --function-name "$LAMBDA_NAME" --region "$REGION" \
-    --environment "$LAMBDA_ENV" --timeout 60 --memory-size 256 >/dev/null
+    --environment "$LAMBDA_ENV" --timeout 60 --memory-size 256 \
+    --vpc-config "SubnetIds=$PRIVATE_SUBNET_IDS,SecurityGroupIds=$LAMBDA_SG_ID" >/dev/null
   aws lambda wait function-updated --function-name "$LAMBDA_NAME" --region "$REGION"
   echo "    已更新 Lambda: $LAMBDA_NAME"
 else
