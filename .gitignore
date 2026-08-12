@@ -1,6 +1,5 @@
 /.claude/
 /.codegraph/
-/.trellis/
 /.venv/
 __pycache__/
 # agentcore configure 生成的部署配置（含账号信息，各自生成）

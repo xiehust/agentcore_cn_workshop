@@ -1,0 +1,2 @@
+{"file": ".trellis/tasks/08-11-chat-sessions-history/prd.md", "reason": "验收标准 1–7 是 check 的对照基准"}
+{"file": ".trellis/spec/backend/ingestion-tasks-module.md", "reason": "检查 /chat 路由是否偏离门户后端既定契约（错误响应形状、时间戳格式、软删语义）"}

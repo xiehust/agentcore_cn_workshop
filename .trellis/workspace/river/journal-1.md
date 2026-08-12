@@ -1,0 +1,55 @@
+# Journal - river (Part 1)
+
+> AI development session journal
+> Started: 2026-08-07
+
+---
+
+
+
+## Session 1: 门户新增数据摄入任务管理模块（并行/调度/进度日志/Live View/结果明细）
+
+**Date**: 2026-08-08
+**Task**: 门户新增数据摄入任务管理模块（并行/调度/进度日志/Live View/结果明细）
+**Branch**: `main`
+
+### Summary
+
+在 Part 2 门户落地任务管理模块：Aurora 新增任务三表与业务表 run_id 列；Part 1 agent 向后兼容支持 run_id 与结构化进度事件；新增 Tasks HTTP API（Keycloak JWT）+ tasks-api/runner 两个 Lambda + EventBridge Scheduler 定期调度；前端新增任务视图与 DCV Live View（presigned URL 300s 刷新重连）。已真实部署并通过 E2E（并行 run、调度触发/暂停恢复、DCV 握手截图、统计与明细、401、幂等重跑）。质检修复 3 个缺陷（暂停任务手动运行卡排队、Lambda 超时悬挂、500 泄漏）。规范沉淀至 spec/backend/ingestion-tasks-module.md 与 spec/frontend/live-view-and-polling.md。注意：npm 版 agentcore CLI 会遮蔽 .venv 的 Python 版，deploy 需前置 PATH。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b60c2b6` | (see git log) |
+| `311fcef` | (see git log) |
+| `8c86623` | (see git log) |
+| `708c3a2` | (see git log) |
+
+### Status
+
+[OK] **Completed**
+
+
+## Session 2: 门户分析会话与历史功能落地
+
+**Date**: 2026-08-11
+**Task**: 门户分析会话与历史功能落地
+**Branch**: `main`
+
+### Summary
+
+会话持久化全链路：Aurora chat 两表、tasks-api 扩展 /chat 路由组（JWT 用户归属+软删+游标分页）、Runtime 历史回灌与增量落库（best-effort 不阻断 SSE）、门户侧栏历史会话（恢复/重命名/删除）。E2E 实测强停 microVM 后上下文经回灌延续；文档四处同步并新增 chat-sessions-module 后端契约 spec。坑：JWT 认证的 Runtime 停会话须带 bearer 直调数据面，SigV4 报 Authorization method mismatch。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `9f019fa` | (see git log) |
+| `990a77c` | (see git log) |
+| `061c6e1` | (see git log) |
+| `9e03d6d` | (see git log) |
+
+### Status
+
+[OK] **Completed**

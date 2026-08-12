@@ -39,7 +39,8 @@ TASKS_STACK="agentcore-workshop-part2-tasks"
 TASKS_API_NAME="agentcore-workshop-tasks-api"
 RUNNER_NAME="agentcore-workshop-ingestion-runner"
 # 允许跨域访问 Tasks API 的前端来源（Vite dev server；多个用逗号分隔）
-TASKS_ALLOWED_ORIGINS="${TASKS_ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}"
+# 5273 是 5173 被本机其他项目占用时的备用端口（npm run dev -- --port 5273 --strictPort）
+TASKS_ALLOWED_ORIGINS="${TASKS_ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:5273,http://127.0.0.1:5273}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PART2_DIR="$(dirname "$SCRIPT_DIR")"
