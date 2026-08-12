@@ -1,38 +1,38 @@
 """Aurora Serverless（PostgreSQL）入库工具。
 
-通过 RDS Data API（无需数据库连接/驱动/VPC）把选品判定结果写入 Aurora：
+把选品判定结果写入 Aurora：
 - save_verdict     : 每个商品的判定记录（PASS / 排除 / 补采 / 采集）
 - save_candidate   : 判定为"采集"的商品的完整候选档案
 
 设计说明：
-- 使用 boto3 rds-data API（同步返回），Agent 运行角色只需要
-  rds-data:ExecuteStatement 等 + 集群主用户 Secret 的读取权限，
-  无需网络直连数据库（适合托管 Runtime，Runtime 不用挂 VPC）。
-  Part 2 的数据查询 Lambda 则计划挂进 Aurora 所在 VPC 直连集群，
-  验证 Gateway -> Lambda(VPC) -> Aurora 方案。
-- SQL 一律使用参数化（parameters），避免拼接注入。
+- 写路径是 boto3 lambda.invoke -> 写库 Lambda（挂 Aurora 同 VPC）->
+  pg8000 直连集群，本模块只做「组 payload + 调 Lambda + 翻译结果」的薄壳，
+  SQL、参数归一化、冷恢复重试都在 infra/writer-lambda/handler.py 里。
+  Runtime 仍不挂 VPC（计算留在公网），执行角色只需要对写库 Lambda 的
+  lambda:InvokeFunction，不接触数据库凭证。
+- 为什么不用 RDS Data API：中国区没有该服务，本 workshop 后续要整体移植
+  过去，先用等效架构在海外区验证。同一思路已在 Part 2 用
+  Gateway -> Lambda(VPC) -> Aurora 验证过（只读侧）。
+- SQL 一律使用参数化，避免拼接注入（在写库 Lambda 侧）。
 - 两张表都带可空的 run_id 列：Part 2 门户发起的任务会通过 set_current_run_id
   注入，命令行调用不注入（写 NULL），互不影响。
-- 集群 MinCapacity=0 会空闲自动暂停，首次调用触发冷恢复
-  （约 15 秒~1 分钟），_execute 内置重试等待。
+- 集群 MinCapacity=0 会空闲自动暂停，首次写库触发冷恢复（约 15 秒~1 分钟）：
+  等待与重连在写库 Lambda 内完成（上限 240 秒，Lambda timeout 300 秒），
+  本模块只把 boto3 的 read_timeout 放宽到 310 秒并禁用重试，避免两侧都自旋。
 - 表结构见 infra/setup_tables.sql。
 """
 
 import contextvars
 import json
 import os
-import time
-import uuid
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.config import Config
 from strands import tool
 
 # ---- 环境变量配置（deploy.sh 从 CloudFormation 输出注入） ----
 REGION = os.environ.get("AWS_REGION", "us-west-2")
-CLUSTER_ARN = os.environ.get("AURORA_CLUSTER_ARN", "")
-SECRET_ARN = os.environ.get("AURORA_SECRET_ARN", "")
-DATABASE = os.environ.get("AURORA_DATABASE", "product_hunting")
+WRITER_LAMBDA_NAME = os.environ.get("WRITER_LAMBDA_NAME", "agentcore-workshop-writer")
 
 _client = None
 
@@ -51,58 +51,50 @@ def set_current_run_id(run_id: str | None) -> None:
     CURRENT_RUN_ID.set(run_id or None)
 
 
-def _rds_client():
-    """惰性创建 rds-data 客户端（避免 import 阶段就要求凭证）。"""
+def _lambda_client():
+    """惰性创建 lambda 客户端（避免 import 阶段就要求凭证）。
+
+    read_timeout 略大于写库 Lambda 的 300 秒超时：冷恢复等待由 Lambda 承担，
+    这里等它返回就好；关掉 boto3 重试，避免超时后重复写入。
+    """
     global _client
     if _client is None:
-        _client = boto3.client("rds-data", region_name=REGION)
+        _client = boto3.client(
+            "lambda",
+            region_name=REGION,
+            config=Config(
+                connect_timeout=10, read_timeout=310, retries={"max_attempts": 0}
+            ),
+        )
     return _client
 
 
-def _execute(sql: str, parameters: list | None = None) -> dict:
-    """执行一条 SQL，返回执行状态。
+def _invoke_writer(op: str, args: dict) -> dict:
+    """同步调用写库 Lambda，返回它的 {"status": ...} 响应。
 
-    rds-data 是同步 API；集群自动暂停后首次调用会抛 DatabaseResumingException
-    （或提示 resuming 的 BadRequestException），等待重试即可。
+    run_id 从 contextvar 读出放进 payload 顶层（不进工具 schema、模型不感知）。
     """
-    if not CLUSTER_ARN or not SECRET_ARN:
-        return {
-            "status": "error",
-            "error": "缺少 AURORA_CLUSTER_ARN / AURORA_SECRET_ARN 环境变量",
-        }
+    payload = {"op": op, "args": args, "run_id": CURRENT_RUN_ID.get()}
+    try:
+        resp = _lambda_client().invoke(
+            FunctionName=WRITER_LAMBDA_NAME,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        )
+    except Exception as e:
+        return {"status": "error", "error": f"调用写库 Lambda 失败: {type(e).__name__}: {e}"}
 
-    kwargs: dict = {
-        "resourceArn": CLUSTER_ARN,
-        "secretArn": SECRET_ARN,
-        "database": DATABASE,
-        "sql": sql,
-    }
-    if parameters:
-        kwargs["parameters"] = parameters
-
-    last_err = "unknown"
-    for _ in range(36):  # 最长约 3 分钟，覆盖冷恢复
-        try:
-            _rds_client().execute_statement(**kwargs)
-            return {"status": "ok"}
-        except ClientError as e:
-            code = e.response.get("Error", {}).get("Code", "")
-            msg = str(e)
-            # 集群从暂停中恢复：等待后重试；其余错误直接返回
-            if code == "DatabaseResumingException" or "resum" in msg.lower():
-                last_err = msg
-                time.sleep(5)
-                continue
-            return {"status": "error", "error": msg}
-    return {"status": "error", "error": f"集群恢复等待超时: {last_err}"}
-
-
-def _p(name: str, value) -> dict:
-    """构造 rds-data 的参数对象（值统一转字符串，SQL 里按需 cast）。"""
-    return {
-        "name": name,
-        "value": {"stringValue": "" if value is None else str(value)},
-    }
+    body = resp["Payload"].read().decode("utf-8")
+    # 函数内部未捕获的异常（如超时）不会抛给调用方，靠 FunctionError 判别
+    if resp.get("FunctionError"):
+        return {"status": "error", "error": f"写库 Lambda 异常: {body[:512]}"}
+    try:
+        result = json.loads(body)
+    except ValueError:
+        return {"status": "error", "error": f"写库 Lambda 返回非 JSON: {body[:512]}"}
+    if not isinstance(result, dict) or "status" not in result:
+        return {"status": "error", "error": f"写库 Lambda 返回异常: {body[:512]}"}
+    return result
 
 
 @tool
@@ -131,39 +123,26 @@ def save_verdict(
     Returns:
         入库结果说明
     """
+    # 枚举在写库 Lambda 里也校验，这里先挡一道省一次 invoke
     if verdict not in ("PASS", "排除", "补采", "采集"):
         return f"verdict 非法: {verdict}，必须是 PASS/排除/补采/采集，未入库"
 
-    sql = """
-        INSERT INTO selection_verdicts
-            (verdict_id, site, asin_or_url, product_title, verdict, reason,
-             current_price, monthly_sales, product_score, run_id, created_at)
-        VALUES
-            (:verdict_id, :site, :asin_or_url, :product_title, :verdict, :reason,
-             NULLIF(:current_price, '')::DECIMAL(10,2),
-             NULLIF(:monthly_sales, '')::INT,
-             NULLIF(:product_score, '')::DECIMAL(10,4),
-             NULLIF(:run_id, '')::VARCHAR(36),
-             NOW())
-    """
-    result = _execute(
-        sql,
-        [
-            _p("verdict_id", str(uuid.uuid4())),
-            _p("site", site),
-            _p("asin_or_url", asin_or_url[:1024]),
-            _p("product_title", product_title[:2048]),
-            _p("verdict", verdict),
-            _p("reason", reason[:2048]),
-            _p("current_price", current_price),
-            _p("monthly_sales", monthly_sales),
-            _p("product_score", product_score),
-            _p("run_id", CURRENT_RUN_ID.get()),
-        ],
+    result = _invoke_writer(
+        "save_verdict",
+        {
+            "site": site,
+            "asin_or_url": asin_or_url,
+            "product_title": product_title,
+            "verdict": verdict,
+            "reason": reason,
+            "current_price": current_price,
+            "monthly_sales": monthly_sales,
+            "product_score": product_score,
+        },
     )
     if result["status"] == "ok":
         return f"判定已入库: {verdict} - {asin_or_url}"
-    return f"入库失败: {result['error']}"
+    return f"入库失败: {result.get('error', '未知错误')}"
 
 
 @tool
@@ -208,57 +187,28 @@ def save_candidate(
     Returns:
         入库结果说明
     """
-    sql = """
-        INSERT INTO product_candidates
-            (candidate_id, site, asin_or_url, product_name_cn, product_title_en,
-             search_keyword, current_price, monthly_sales,
-             competitor_min_price, competitor_min_price_url, estimated_price,
-             estimated_monthly_sales, product_score, price_flag,
-             main_image_url, variants, certification, material_spec,
-             ai_summary, run_id, created_at)
-        VALUES
-            (:candidate_id, :site, :asin_or_url, :product_name_cn, :product_title_en,
-             :search_keyword, :current_price::DECIMAL(10,2), :monthly_sales::INT,
-             :competitor_min_price::DECIMAL(10,2), :competitor_min_price_url,
-             ROUND(:competitor_min_price::DECIMAL(10,2) * 0.85, 2),
-             (:monthly_sales::INT / 2),
-             :product_score::DECIMAL(10,4), :price_flag,
-             :main_image_url, NULLIF(:variants, '')::JSONB, :certification,
-             :material_spec, :ai_summary,
-             NULLIF(:run_id, '')::VARCHAR(36), NOW())
-    """
-    # variants 必须是合法 JSON 才能转 JSONB，先做一次校验，坏数据降级包装
-    variants_json = ""
-    if variants:
-        try:
-            json.loads(variants)
-            variants_json = variants
-        except (ValueError, TypeError):
-            variants_json = json.dumps({"raw": variants[:4000]}, ensure_ascii=False)
-
-    result = _execute(
-        sql,
-        [
-            _p("candidate_id", str(uuid.uuid4())),
-            _p("site", site),
-            _p("asin_or_url", asin_or_url[:1024]),
-            _p("product_name_cn", product_name_cn[:256]),
-            _p("product_title_en", product_title_en[:2048]),
-            _p("search_keyword", search_keyword[:512]),
-            _p("current_price", current_price),
-            _p("monthly_sales", monthly_sales),
-            _p("competitor_min_price", competitor_min_price),
-            _p("competitor_min_price_url", competitor_min_price_url[:1024]),
-            _p("product_score", product_score),
-            _p("price_flag", price_flag[:128]),
-            _p("main_image_url", main_image_url[:2048]),
-            _p("variants", variants_json),
-            _p("certification", certification[:1024]),
-            _p("material_spec", material_spec[:1024]),
-            _p("ai_summary", ai_summary[:4096]),
-            _p("run_id", CURRENT_RUN_ID.get()),
-        ],
+    # 入参归一化（列长度截断、variants 的 JSON 校验）在写库 Lambda 侧统一做
+    result = _invoke_writer(
+        "save_candidate",
+        {
+            "site": site,
+            "asin_or_url": asin_or_url,
+            "product_name_cn": product_name_cn,
+            "product_title_en": product_title_en,
+            "search_keyword": search_keyword,
+            "current_price": current_price,
+            "monthly_sales": monthly_sales,
+            "competitor_min_price": competitor_min_price,
+            "competitor_min_price_url": competitor_min_price_url,
+            "product_score": product_score,
+            "price_flag": price_flag,
+            "main_image_url": main_image_url,
+            "variants": variants,
+            "certification": certification,
+            "material_spec": material_spec,
+            "ai_summary": ai_summary,
+        },
     )
     if result["status"] == "ok":
         return f"候选档案已入库: {product_name_cn} (产品点 {product_score})"
-    return f"入库失败: {result['error']}"
+    return f"入库失败: {result.get('error', '未知错误')}"

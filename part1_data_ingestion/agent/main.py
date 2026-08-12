@@ -12,8 +12,10 @@
 - Skill 插件       : 业务 SOP（选品流程）以 SKILL.md 形式放在 skills/ 目录，
                      通过 Strands 的 AgentSkills 插件加载。新增业务场景只需
                      新增 skill 目录，Agent 代码零改动。
-- 自定义工具       : tools/aurora_tools.py 通过 RDS Data API 把判定结果写入
-                     Aurora Serverless（PostgreSQL），Runtime 无需挂 VPC。
+- 自定义工具       : tools/aurora_tools.py 调写库 Lambda（挂 Aurora 同 VPC，
+                     pg8000 直连）把判定结果写入 Aurora Serverless
+                     （PostgreSQL）。Runtime 自身无需挂 VPC，也不接触数据库
+                     凭证；不用 RDS Data API 是为了中国区可移植，见该文件。
 
 调用方式（部署后）：
     agentcore invoke '{"prompt": "从 eBay 英国站搜索 desk organizer 选品，处理前 3 个非广告商品"}'

@@ -3,6 +3,9 @@
 用途：验证 Skill 加载、工具编排、浏览器/沙箱调用是否正常。
 注意：AgentCore Browser 与 Code Interpreter 是云端服务，本地运行也会调用
       AWS（需要凭证与相应 IAM 权限），只是 Agent 本体跑在本机。
+      入库同理走云端的写库 Lambda（本机凭证需 lambda:InvokeFunction）；
+      函数名默认 agentcore-workshop-writer，与 deploy.sh 一致，改名了就
+      export WRITER_LAMBDA_NAME=<函数名>。
 
 运行:
     cd part1_data_ingestion/agent
