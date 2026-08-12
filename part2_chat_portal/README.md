@@ -26,7 +26,8 @@ AgentCore Runtime（分析 Agent，Strands SDK，SSE 流式）
    │         │  ④ 调用工具（选品漏斗 / 类目分布 / 即席 SQL）
    │         ▼
    │    数据查询 Lambda（挂进 Part 1 的 Aurora VPC）
-   │         │  ⑤ pg8000 直连 5432（同 VPC；凭证走 Secrets Manager VPC 端点）
+   │         │  ⑤ pg8000 直连 5432（同 VPC；凭证走 Secrets Manager VPC 端点，
+   │         │     端点建在 Part 1 的 Aurora 栈里，与它的写库 Lambda 共用）
    │         ▼
    │    Aurora Serverless v2（PostgreSQL，Part 1 创建）
    │
@@ -63,7 +64,8 @@ part2_chat_portal/
 ├── infra/
 │   ├── keycloak/                 # 自部署 Keycloak（Dockerfile + realm 模板）
 │   ├── analytics-lambda/         # 数据查询 Lambda（pg8000 直连 Aurora）
-│   ├── part2-analytics.yaml      # CloudFormation：Lambda/Gateway 角色 + Secrets VPC 端点
+│   ├── part2-analytics.yaml      # CloudFormation：Lambda/Gateway 角色
+│   │                             #   （Secrets VPC 端点归 Part 1 的 Aurora 栈）
 │   ├── tool-schema.json          # Gateway Lambda target 的工具 schema
 │   ├── part2-tasks.yaml          # CloudFormation：Tasks HTTP API（/tasks、/runs、/chat 路由）
 │   │                             #   + JWT authorizer + 两个 Lambda 角色 + 调度组
@@ -94,6 +96,13 @@ export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>   # 或依赖 IAM 自动铸 to
 provider（5）→ 分析 Agent 到 Runtime（6-7）→ 前端配置（8）→ 数据摄入任务管理
 模块（9）。部署机密（Keycloak admin 密码、demo 账号密码、M2M client secret）
 生成后存放在 `.deploy/secrets.env`（已 gitignore）。
+
+> **已有环境升级注意**：数据查询 Lambda 取凭证用的 Secrets Manager 接口端点已
+> 从本部分的 analytics 栈挪到 Part 1 的 Aurora 栈（端点随 VPC 归属，且同一 VPC
+> 对同一服务只允许一个 Private DNS 端点）。因此升级顺序是**先跑本部分的
+> `deploy.sh`**（栈更新删掉旧端点），**再跑 Part 1 的 `deploy.sh`**（建新端点）；
+> 顺序反了 Part 1 的脚本会预检报错。两次之间的窗口期里本部分的 Lambda 冷启动
+> 取不到凭证，跑完 Part 1 即恢复。代码与运行时配置零改动。
 
 第 9 步额外依赖 Part 1 的 Runtime（runner 要调它，ARN 从
 `part1_data_ingestion/agent/.bedrock_agentcore.yaml` 解析）和 Part 1 建的任务表；

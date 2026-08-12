@@ -20,7 +20,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 会导致模型 401（deploy.sh 会检测并忽略非 ABSK 前缀的值）。
 
 ```bash
-# Part 1：部署（Aurora + 建表 + Browser/Profile + Runtime），幂等可重跑
+# Part 1：部署（Aurora + 写库 Lambda + 建表 + Browser/Profile + Runtime），幂等可重跑
 cd part1_data_ingestion && bash scripts/deploy.sh
 # Part 1：调用（单商品 2~5 分钟）
 cd part1_data_ingestion/agent && agentcore invoke '{"prompt": "..."}'
@@ -39,7 +39,7 @@ npm run build                                            # tsc -b && vite build�
 # Part 2：命令行冒烟（token → 流式调用 Runtime；第二个参数传 session id 做多轮）
 ./scripts/chat_test.sh '看下最近30天的选品漏斗' [session-id]
 
-# 查数仓（ARN 从 agentcore-workshop-aurora 栈输出取）
+# 查数仓（Data API 只剩「查」和 Part 2 在用；ARN 从 agentcore-workshop-aurora 栈输出取）
 aws rds-data execute-statement --resource-arn "$CLUSTER_ARN" --secret-arn "$SECRET_ARN" \
   --database product_hunting --region us-west-2 --sql "SELECT ..."
 ```
@@ -50,7 +50,10 @@ E2E 浏览器验证用本机 Python 版 Playwright（`playwright` CLI 是 pip �
 ## 架构
 
 两个部分共用一套数仓：Part 1 的 CloudFormation 栈 `agentcore-workshop-aurora` 建
-VPC + Aurora Serverless v2（PostgreSQL，Min 0 ACU 空闲自动暂停）。表全部由
+VPC + Aurora Serverless v2（PostgreSQL，Min 0 ACU 空闲自动暂停）+ Secrets Manager
+接口端点（端点随 VPC 归本栈，Part 1 写库 Lambda 与 Part 2 分析 Lambda 共用；同一
+VPC 同一服务只能有一个 Private DNS 端点，已有环境升级要先跑 Part 2 deploy 删旧
+端点、再跑 Part 1 deploy 建新的，Part 1 脚本有预检）。表全部由
 Part 1 的 `infra/setup_tables.sql` 幂等建出：业务两表 `selection_verdicts`
 （判定记录）、`product_candidates`（候选档案），任务管理三表
 `ingestion_tasks`/`ingestion_runs`/`ingestion_run_events`，会话历史两表
@@ -59,8 +62,20 @@ Part 1 的 `infra/setup_tables.sql` 幂等建出：业务两表 `selection_verdi
 ### Part 1：数据摄入（part1_data_ingestion/）
 
 调用方 → Runtime（Strands Agent）→ Browser 爬 eBay / Code Interpreter 测算 →
-RDS Data API 入库（Agent 不挂 VPC）。
+`lambda.invoke` 写库 Lambda（挂 Aurora 同 VPC，pg8000 直连）入库（Agent 不挂 VPC）。
 
+- **写库不走 RDS Data API**：中国区没有 Data API，本 workshop 后续要整体移植，
+  数据面提前换成两边都可用的形态（与 Part 2 的 Gateway → Lambda(VPC) → Aurora
+  同一哲学：计算留公网，私网访问全交 VPC 内 Lambda）。写库 Lambda
+  （`infra/writer-lambda/handler.py`）实现 `save_verdict` / `save_candidate` /
+  `setup_tables` 三个 op，`aurora_tools.py` 只剩薄壳；建表也是 deploy.sh
+  `aws lambda invoke op=setup_tables`（`setup_tables.sql` 打进 zip，按分号拆句，
+  **不得引入 dollar-quoted 块**）。超时链：handler 重连上限 240s < Lambda
+  timeout 300s < Agent boto3 read_timeout 310s（Agent 侧禁用 boto3 重试）。
+  Runtime 执行角色只有对写库 Lambda 的 `lambda:InvokeFunction`
+  （栈输出 `AgentWriterInvokePolicyArn`）；集群 `EnableHttpEndpoint` 保留，
+  `AgentDataAccessPolicy`（rds-data）如今只服务 Part 2 的 Runtime 与两个
+  tasks Lambda，Part 2 迁完才能删。
 - **业务 SOP 用 Skill 插拔**：Agent 本体（`agent/main.py`）只有通用能力；选品规则
   全在 `agent/skills/*/SKILL.md`。新增场景 = 新增 Skill 目录，不改 Agent 代码。
 - **模型**：`OpenAIResponsesModel` 走 bedrock-mantle 的 OpenAI 兼容端点

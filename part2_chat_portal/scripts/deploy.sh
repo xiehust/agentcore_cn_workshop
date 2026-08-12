@@ -3,7 +3,8 @@
 #
 # 步骤：
 #   1. 部署 Keycloak（自定义镜像 -> ECR -> ECS Fargate + API Gateway HTTPS 入口）
-#   2. 部署分析链路基础设施（CloudFormation：Lambda/Gateway 角色 + Secrets 端点）
+#   2. 部署分析链路基础设施（CloudFormation：Lambda/Gateway 角色；
+#      取凭证用的 Secrets Manager VPC 端点归 Part 1 的 Aurora 栈）
 #   3. 打包并部署数据查询 Lambda（挂进 Aurora VPC，pg8000 直连 5432）
 #   4. 创建 Gateway（JWT 认证）+ Lambda target（MCP 工具）
 #   5. 创建 Identity OAuth2 credential provider（Agent 访问 Gateway 的 M2M）

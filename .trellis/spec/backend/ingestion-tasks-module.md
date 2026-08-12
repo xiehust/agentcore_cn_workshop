@@ -88,8 +88,10 @@ if task["status"] != "active" and not portal_run_id:
 
 ## 既有约定（本模块沿用，新代码也应沿用）
 
-- **写 Aurora 一律走 RDS Data API**（Lambda 不进 VPC）；analytics Lambda 是
+- **本模块的两个 Lambda 走 RDS Data API**（不进 VPC）；analytics Lambda 是
   read-only 会话（`default_transaction_read_only=on`），不要借它写任务表。
+  新增数仓访问点看 [数据库访问约定](./database-guidelines.md) 选路径——Part 1
+  已改走 VPC 内写库 Lambda（中国区没有 Data API），本模块的迁移是后续任务。
 - **Aurora Min 0 ACU 冷恢复**：所有 Data API 调用包退避重试
   （`DatabaseResumingException` 或消息含 `resum`，deadline ≈50s）。
 - **Runtime session id ≥33 字符**：`"ingest-run-" + uuid4` = 47 字符。

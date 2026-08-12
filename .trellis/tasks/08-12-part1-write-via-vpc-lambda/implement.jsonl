@@ -1,0 +1,4 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "数据库访问约定（如已填写则须遵循；写库 Lambda 的 SQL 与连接管理相关）"}
+{"file": "part2_chat_portal/infra/analytics-lambda/handler.py", "reason": "写库 Lambda 的参照实现：pg8000 连接复用/凭证获取/冷恢复重连模式，新 handler 照此风格"}
+{"file": "CLAUDE.md", "reason": "项目约定：全中文、文档占位符规则、架构背景（两条数据访问路径的定位）"}
