@@ -80,7 +80,10 @@ Part 1 的 `infra/setup_tables.sql` 幂等建出：业务两表 `selection_verdi
   全在 `agent/skills/*/SKILL.md`。新增场景 = 新增 Skill 目录，不改 Agent 代码。
 - **模型**：`OpenAIResponsesModel` 走 bedrock-mantle 的 OpenAI 兼容端点
   （默认 `openai.gpt-5.6-terra`，端点在 us-east-1）。换 Converse 系模型需改回
-  `BedrockModel`。
+  `BedrockModel`。中国区移植时区内无 Bedrock：改用 OpenAI 兼容 Chat
+  Completions 服务（模型类换 Strands 的 `OpenAIModel`，
+  `OPENAI_BASE_URL`/`MODEL_ID`/`OPENAI_API_KEY` 指区内端点）；
+  完整差异清单见根 README「中国区移植说明」。
 - **Browser**：自定义 browser 开 Web Bot Auth（请求签名过 Cloudflare/Akamai 反爬），
   Profile 跨会话保留 cookies。亚马逊对数据中心 IP 硬封锁，默认站点是 eBay。
 
