@@ -27,7 +27,11 @@
 │   │  │  + Aurora 入库工具      │  │      └─────────────────────┘               │
 │   │  └────────────────────────┘  │                                            │
 │   └──────────────┬───────────────┘                                            │
-│                  │  RDS Data API（无需 VPC）                                    │
+│                  │  lambda.invoke（Runtime 不挂 VPC）                           │
+│                  ▼                                                            │
+│   ┌──────────────────────────────┐                                            │
+│   │  写库 Lambda（Aurora 同 VPC）  │  pg8000 直连 5432；不用 RDS Data API        │
+│   └──────────────┬───────────────┘ （中国区没有该服务，为移植提前换形态）        │
 │                  ▼                                                            │
 │   ┌──────────────────────────────┐                                            │
 │   │  Aurora Serverless v2 (PG)   │  候选档案表 + 判定记录表（自建 VPC 内）       │
@@ -72,11 +76,13 @@ Part 1 的核心思路是 **"Agent 框架不变，业务逻辑用 Skill 插拔"*
 │   │   │   └── product-selection/   # 选品 Skill —— 亚马逊（需代理）
 │   │   │       └── SKILL.md
 │   │   └── tools/                   # 自定义工具
-│   │       ├── aurora_tools.py      # Aurora 入库工具（RDS Data API）
+│   │       ├── aurora_tools.py      # Aurora 入库工具（invoke 写库 Lambda）
 │   │       └── browser_ext.py       # Browser 扩展（Web Bot Auth / Profile）
 │   ├── infra/                       # 基础设施
 │   │   ├── aurora-serverless.yaml   # CloudFormation：Aurora Serverless v2 + VPC
-│   │   └── setup_tables.sql         # 建表 DDL
+│   │   ├── writer-lambda/           # 写库 Lambda（VPC 内 pg8000 直连，含建表 op）
+│   │   │   └── handler.py
+│   │   └── setup_tables.sql         # 建表 DDL（打包进写库 Lambda 执行）
 │   └── scripts/                     # 部署与测试脚本
 │       ├── deploy.sh                # 一键部署（infra + agent）
 │       ├── local_test.py            # 本地测试 Agent
