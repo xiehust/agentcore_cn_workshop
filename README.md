@@ -60,6 +60,31 @@ Part 1 的核心思路是 **"Agent 框架不变，业务逻辑用 Skill 插拔"*
 - 以后要新增其他场景的数据摄入 pipeline（如竞品监控、价格追踪），
   只需要新写一个 `SKILL.md` 放进 `skills/` 目录，无需改动 Agent 代码。
 
+## 中国区移植说明
+
+AgentCore 在中国区（`cn-north-1` / `cn-northwest-1`）尚未上线。本 workshop
+先在海外区（`us-west-2`）用等效架构验证，**架构层面已提前对齐中国区可用的形态**，
+上线后按下面的清单移植即可。
+
+**已就绪、无需改动的设计**：
+
+- **数据面不依赖 RDS Data API**（中国区没有该服务）：Part 1 的 Agent 写库与
+  建表都走「lambda.invoke → VPC 内写库 Lambda → pg8000 直连」，两边通用。
+- **Gateway 零 VPC egress**：私网访问全部由 VPC 内 Lambda 承担，不依赖
+  Gateway 的 VPC 出口能力。
+- **认证自部署 Keycloak**（中国区没有 Cognito）：OIDC 全链路不依赖海外托管服务。
+
+**移植时需要处理的差异**（AgentCore 中国区上线后）：
+
+| 差异点 | 说明 |
+|--------|------|
+| Part 2 残留的 Data API 调用 | 会话历史落库/回灌（`part2_chat_portal/agent/main.py`）、tasks-api / runner 两个 Lambda、部署脚本的建表预检，共 5 个文件。按 Part 1 写库 Lambda 的同款模式迁移；迁完可关集群 `EnableHttpEndpoint`、删 `AgentDataAccessPolicy` |
+| ARN 分区前缀 | 模板与脚本里约 30 处硬编码 `arn:aws:`，中国区是 `arn:aws-cn:`。CloudFormation 内建议统一改 `${AWS::Partition}`（含 `AWSLambdaVPCAccessExecutionRole` 这类 AWS 托管策略 ARN），脚本内拼接同理 |
+| 区域与域名 | 默认区域 `us-west-2` 散在两个 deploy.sh 与 agent 代码默认值里；API Gateway 等服务域名后缀变为 `.amazonaws.com.cn` |
+| VPC 接口端点服务名 | `com.amazonaws.<region>.secretsmanager` → 中国区前缀不同：`cn.com.amazonaws.<region>.secretsmanager` |
+| 模型 | 默认模型 `openai.gpt-5.6-terra` 走 bedrock-mantle 的 OpenAI 兼容端点（us-east-1），中国区不可用。需换成中国区 Bedrock 支持的模型，并把 `OpenAIResponsesModel` 改回 `BedrockModel`（Converse）；`ABSK` 前缀的 Bedrock API key 认证方式是否可用也需确认 |
+| 镜像与外网可达性 | Keycloak 基础镜像来自 `quay.io`，中国区构建前先转存到区内 ECR；Browser 出网爬 eBay 等境外站点的网络可达性需实测 |
+
 ## 目录结构
 
 ```
