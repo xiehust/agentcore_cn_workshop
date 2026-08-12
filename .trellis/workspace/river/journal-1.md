@@ -53,3 +53,26 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: Part 1 写库路径改造：Data API 换 VPC 写库 Lambda
+
+**Date**: 2026-08-12
+**Task**: Part 1 写库路径改造：Data API 换 VPC 写库 Lambda
+**Branch**: `main`
+
+### Summary
+
+为中国区移植做准备（cn 区无 RDS Data API），Part 1 的 Agent 写库与建表全部改经 VPC 内写库 Lambda（pg8000 直连），模型与 Skill 零感知。Secrets Manager 端点归属从 Part 2 栈挪到 Part 1 栈（VPC 拥有者），deploy.sh 带归属预检；AgentDataAccessPolicy 因被 Part 2 共享而原样保留，新增独立 invoke 策略换挂。线上验收七项全过：冷库首写 17s、端到端 eBay 实测入库、Part 2 回归通过、两侧 deploy 重跑幂等。注意事项：跑 deploy 脚本须把仓库根 .venv/bin 前置 PATH（npm 同名 agentcore 遮蔽）。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `76fe25c` | (see git log) |
+| `14e1321` | (see git log) |
+| `17977b3` | (see git log) |
+
+### Status
+
+[OK] **Completed**
