@@ -212,7 +212,8 @@ agentcore invoke -l '{"prompt": "..."}'
   变成只有对写库 Lambda 的 `lambda:InvokeFunction`，Agent 不再接触数据库凭证。
   移植到中国区时要改的已知差异：接口端点服务名前缀变
   `cn.com.amazonaws.<region>.secretsmanager`，ARN 分区变 `arn:aws-cn:`。
-  Part 2 各处的 Data API 调用是后续独立任务。
+  Part 2 各处的 Data API 调用是后续独立任务。完整差异清单（含模型、镜像、
+  区域域名）见根 README 的「中国区移植说明」。
 - **建表为什么也走 Lambda**：`setup_tables.sql` 随部署包打进写库 Lambda，
   deploy.sh 用 `aws lambda invoke '{"op": "setup_tables"}'` 建表，本地无需
   数据库客户端也无需 Data API，部署链路同样零 Data API 依赖。DDL 全是
@@ -235,4 +236,7 @@ agentcore invoke -l '{"prompt": "..."}'
   `--env MODEL_ID=<模型ID>`），仅限 bedrock-mantle（OpenAI 兼容）端点上的模型；
   换端点区域用 `OPENAI_BASE_URL` 覆盖（默认 us-east-1）。换用 Converse API
   模型（如 Claude）需把 `agent/main.py` 里的 `OpenAIResponsesModel` 换回
-  `BedrockModel`。
+  `BedrockModel`。中国区移植时：区内没有 Bedrock（也没有 bedrock-mantle），
+  改用任意 OpenAI 兼容的 Chat Completions 模型服务——模型类换成 Strands 的
+  `OpenAIModel`，`OPENAI_BASE_URL` / `MODEL_ID` / `OPENAI_API_KEY` 指向区内
+  服务商的兼容端点即可。
