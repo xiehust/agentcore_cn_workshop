@@ -44,6 +44,23 @@ PART1_DIR="$(dirname "$SCRIPT_DIR")"
 DEPLOY_DIR="$PART1_DIR/.deploy"
 mkdir -p "$DEPLOY_DIR"
 
+# agentcore CLI 防遮蔽：npm 也有个同名命令，环境里若被它压住，自动改用仓库根
+# .venv 里的 Python 版（bedrock-agentcore-starter-toolkit）。识别依据：只有
+# Python 版的帮助里列出 configure 子命令（npm 版对任意 --help 都返回 0，
+# 不能拿退出码判断）。
+_agentcore_ok() { "$1" --help 2>/dev/null | grep -qE '\bconfigure\b'; }
+if ! _agentcore_ok agentcore; then
+  REPO_VENV_BIN="$(dirname "$PART1_DIR")/.venv/bin"
+  if [ -x "$REPO_VENV_BIN/agentcore" ] && _agentcore_ok "$REPO_VENV_BIN/agentcore"; then
+    export PATH="$REPO_VENV_BIN:$PATH"
+    echo "ℹ️  agentcore 被同名命令遮蔽或未在 PATH，已改用 $REPO_VENV_BIN/agentcore"
+  else
+    echo "❌ 找不到可用的 agentcore CLI（当前 PATH 里的没有 configure 子命令，可能是 npm 的同名命令）。"
+    echo "   请 pip install bedrock-agentcore-starter-toolkit，或激活装了它的 venv 后重跑。"
+    exit 1
+  fi
+fi
+
 _stack_output() {
   aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
     --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
