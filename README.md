@@ -82,7 +82,7 @@ AgentCore 在中国区（`cn-north-1` / `cn-northwest-1`）尚未上线。本 wo
 | ARN 分区前缀 | 模板与脚本里约 30 处硬编码 `arn:aws:`，中国区是 `arn:aws-cn:`。CloudFormation 内建议统一改 `${AWS::Partition}`（含 `AWSLambdaVPCAccessExecutionRole` 这类 AWS 托管策略 ARN），脚本内拼接同理 |
 | 区域与域名 | 默认区域 `us-west-2` 散在两个 deploy.sh 与 agent 代码默认值里；API Gateway 等服务域名后缀变为 `.amazonaws.com.cn` |
 | VPC 接口端点服务名 | `com.amazonaws.<region>.secretsmanager` → 中国区前缀不同：`cn.com.amazonaws.<region>.secretsmanager` |
-| 模型 | 默认模型 `openai.gpt-5.6-terra` 走 bedrock-mantle 的 OpenAI 兼容端点（us-east-1），中国区不可用。需换成中国区 Bedrock 支持的模型，并把 `OpenAIResponsesModel` 改回 `BedrockModel`（Converse）；`ABSK` 前缀的 Bedrock API key 认证方式是否可用也需确认 |
+| 模型 | 中国区没有 Bedrock。改用任意 OpenAI 兼容的 Chat Completions 模型服务即可：模型类从 `OpenAIResponsesModel` 换成 Strands 的 `OpenAIModel`（Chat Completions），`OPENAI_BASE_URL` / `MODEL_ID` / `OPENAI_API_KEY` 本来就走环境变量，指向区内模型服务商的兼容端点即可 |
 | 镜像与外网可达性 | Keycloak 基础镜像来自 `quay.io`，中国区构建前先转存到区内 ECR；Browser 出网爬 eBay 等境外站点的网络可达性需实测 |
 
 ## 目录结构
