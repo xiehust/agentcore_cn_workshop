@@ -7,7 +7,8 @@ __pycache__/
 .agentcore.yaml
 # agentcore launch 生成的部署产物（依赖打包缓存）
 .bedrock_agentcore/
-# Part 2 部署机密与构建产物（各自生成，勿提交）
+# 部署机密与构建产物（各自生成，勿提交）
+part1_data_ingestion/.deploy/
 part2_chat_portal/.deploy/
 # 前端
 node_modules/

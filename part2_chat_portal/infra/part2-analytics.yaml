@@ -4,10 +4,13 @@ Description: >
   数据查询 Lambda 挂进 Part 1 创建的 Aurora VPC，与集群同 VPC 直连 5432，
   验证「Gateway -> Lambda(VPC) -> Aurora(同 VPC)」方案：Gateway 侧不使用
   VPC egress，私网访问全部由 VPC 内的 Lambda 承担。
-  本模板只建 IAM 角色和 Secrets Manager VPC 端点；Lambda 函数本体由
-  deploy.sh 打包创建（含 pg8000 依赖）。
+  本模板只建 IAM 角色；Lambda 函数本体由 deploy.sh 打包创建（含 pg8000 依赖）。
+  Lambda 取数据库凭证用的 Secrets Manager VPC 端点由 Part 1 的 Aurora 栈提供
+  （端点随 VPC 归属，且同一 VPC 对同一服务只允许一个 Private DNS 端点）。
 
 Parameters:
+  # 下面三个网络参数本模板已不再建资源使用（Secrets 端点迁到 Part 1 栈后），
+  # 但 deploy.sh 仍会传入、Lambda 的 --vpc-config 直接用它们，保留以记录接线
   VpcId:
     Type: String
     Description: Part 1 Aurora 栈输出的 VpcId
@@ -16,7 +19,7 @@ Parameters:
     Description: Part 1 Aurora 栈输出的 PrivateSubnetIds
   LambdaClientSecurityGroupId:
     Type: String
-    Description: Part 1 Aurora 栈输出的 LambdaClientSecurityGroupId（已被授权访问集群 5432）
+    Description: Part 1 Aurora 栈输出的 LambdaClientSecurityGroupId（已被授权访问集群 5432 与 Secrets 端点 443）
   DbSecretArn:
     Type: String
     Description: Aurora 主用户凭证 Secret 的 ARN
@@ -25,28 +28,6 @@ Parameters:
     Default: agentcore-workshop-analytics
 
 Resources:
-  # VPC 无 IGW/NAT，Lambda 取数据库凭证需要 Secrets Manager 的接口端点
-  SecretsEndpointSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Secrets Manager VPC endpoint access (workshop part2)
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          SourceSecurityGroupId: !Ref LambdaClientSecurityGroupId
-
-  SecretsManagerVpcEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Properties:
-      VpcId: !Ref VpcId
-      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
-      VpcEndpointType: Interface
-      SubnetIds: !Ref PrivateSubnetIds
-      SecurityGroupIds: [!Ref SecretsEndpointSecurityGroup]
-      PrivateDnsEnabled: true
-
   # 数据查询 Lambda 的执行角色：VPC ENI 管理 + 读数据库 Secret
   AnalyticsLambdaRole:
     Type: AWS::IAM::Role

@@ -1,12 +1,16 @@
 -- Part 1 数据摄入 pipeline 建表 DDL（Aurora PostgreSQL）
 -- 数据库: product_hunting（由 CloudFormation 创建）
 --
--- 执行方式（RDS Data API，无需客户端；rds-data 一次只能执行一条语句，
--- deploy.sh 会按分号拆分逐条执行）：
---   aws rds-data execute-statement \
---     --resource-arn <ClusterArn> --secret-arn <SecretArn> \
---     --database product_hunting --sql "<单条语句>" --region us-west-2
+-- 执行方式：本文件随部署包打进写库 Lambda（infra/writer-lambda/），
+-- deploy.sh 触发它的 setup_tables 操作，由 handler 去掉 -- 注释后按分号
+-- 拆句逐条执行（连接与凭证都在 VPC 内的 Lambda 里，本机无需数据库客户端）：
+--   aws lambda invoke --function-name agentcore-workshop-writer \
+--     --cli-binary-format raw-in-base64-out \
+--     --payload '{"op": "setup_tables"}' /tmp/out.json --region us-west-2
 -- 认证走集群主用户 Secret，无需额外 GRANT。
+--
+-- 约束：语句必须幂等（IF NOT EXISTS 系），且不得出现 dollar-quoted 块
+-- （$$ ... $$）——按分号拆句会把函数体切碎。
 
 -- ============================================================
 -- 表 1：选品判定记录表
