@@ -1,7 +1,8 @@
 # Part 1：选品数据摄入 Pipeline
 
 一个部署在 **AgentCore Runtime** 的 Strands Agent，按"选品 SOP" Skill 的规则，
-用 **AgentCore Browser** 爬取 eBay 商品数据（默认站点；亚马逊需配代理，见常见问题）、
+用 **AgentCore Browser** 爬取 eBay 商品数据（英国站为默认站点，明确指定美国站时
+使用 ebay.com；亚马逊需配代理，见常见问题）、
 用 **Code Interpreter** 做经济测算，把判定结果经**写库 Lambda**（挂在 Aurora 同一
 VPC 内）写入 **Aurora Serverless v2（PostgreSQL）**（Agent 自身无需挂 VPC）。
 
@@ -18,8 +19,10 @@ AgentCore Runtime（公网，不挂 VPC）── Strands Agent + 选品 SOP Skil
 ## 工作原理
 
 1. 调用方发送任务指令（如"从 eBay 搜索 desk organizer 选品，处理前 2 个商品"）。
-2. Runtime 中的 Agent 按站点匹配 Skill（默认 `product-selection-ebay`；
-   明确指定亚马逊时用 `product-selection`），加载选品 SOP 规则。
+2. Runtime 中的 Agent 按站点匹配 Skill：未指定站点时默认
+   `product-selection-ebay`（eBay 英国站）；明确指定 eBay 美国站、eBay US、
+   United States 或 `ebay.com` 时使用 `product-selection-ebay-us`；明确指定
+   亚马逊时使用 `product-selection`。
 3. Agent 用 browser 工具打开商品页面，提取价格、销量、品牌卖家等数据
    （eBay 无月销字段，按 Skill 定义的口径从购买记录推估）。
 4. 通过 R1 硬门槛、市场结构、黑名单逐层过滤；经济测算在 code_interpreter 沙箱中执行。
@@ -83,9 +86,13 @@ bash scripts/deploy.sh
 ```bash
 cd agent
 agentcore invoke '{"prompt": "从 eBay 英国站搜索 desk organizer 选品，处理前 2 个非广告商品，按选品 SOP 完成判定并入库"}'
+
+# 明确指定 eBay US / ebay.com 时使用美国站 Skill
+agentcore invoke '{"prompt": "从 eBay US（ebay.com）搜索 desk organizer 选品，处理前 2 个非广告一口价商品，按选品 SOP 完成判定并入库"}'
 ```
 
-更多调用示例见 `scripts/invoke_example.sh`（类目浏览、指定 URL 判定、亚马逊站点）。
+更多调用示例见 `scripts/invoke_example.sh`（eBay 美国站、类目浏览、指定 URL
+判定、亚马逊站点）。
 
 ### payload 的 `run_id` 扩展（供 Part 2 门户调用）
 
@@ -180,6 +187,7 @@ agentcore invoke -l '{"prompt": "..."}'
 |------|------|
 | `agent/main.py` | Runtime 入口：BedrockAgentCoreApp + Strands Agent 组装 |
 | `agent/skills/product-selection-ebay/SKILL.md` | 选品 SOP Skill —— eBay 英国站（默认站点） |
+| `agent/skills/product-selection-ebay-us/SKILL.md` | 选品 SOP Skill —— eBay 美国站（明确指定 US / United States / ebay.com 时使用） |
 | `agent/skills/product-selection/SKILL.md` | 选品 SOP Skill —— 亚马逊英国站（需代理） |
 | `agent/tools/aurora_tools.py` | save_verdict / save_candidate 入库工具（薄壳，调写库 Lambda） |
 | `agent/tools/browser_ext.py` | Browser 扩展：Web Bot Auth 自定义 browser 接入 + profile 恢复/保存 |
