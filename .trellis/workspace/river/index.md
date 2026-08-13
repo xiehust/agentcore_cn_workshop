@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 4
+- **Total Sessions**: 5
 - **Last Active**: 2026-08-13
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~99 | Active |
+| `journal-1.md` | ~120 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 5 | 2026-08-13 | Add extensible country selection to ingestion tasks | `ec5184e` | `main` |
 | 4 | 2026-08-13 | Add eBay US ingestion skill | `bb8295a` | `main` |
 | 3 | 2026-08-12 | Part 1 写库路径改造：Data API 换 VPC 写库 Lambda | `76fe25c`, `14e1321`, `17977b3` | `main` |
 | 2 | 2026-08-11 | 门户分析会话与历史功能落地 | `9f019fa`, `990a77c`, `061c6e1`, `9e03d6d` | `main` |

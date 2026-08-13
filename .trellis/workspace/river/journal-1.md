@@ -97,3 +97,24 @@ Added a dedicated eBay US Part 1 selection skill using ebay.com, USD, site=US, f
 ### Status
 
 [OK] **Completed**
+
+
+## Session 5: Add extensible country selection to ingestion tasks
+
+**Date**: 2026-08-13
+**Task**: Add extensible country selection to ingestion tasks
+**Branch**: `main`
+
+### Summary
+
+Added a UK-defaulted editable country/marketplace combobox with UK/US suggestions and custom values; persisted country on ingestion_tasks with an idempotent compatibility migration; propagated country through task API responses; added generic Skill-routing instructions in runner without country mappings; added 9 backend tests, docs, and spec updates. Unit tests, Python checks, frontend build, static extensibility assertions, and desktop/mobile browser QA passed. Aurora migration and live AgentCore E2E were not run.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ec5184e` | (see git log) |
+
+### Status
+
+[OK] **Completed**
