@@ -51,7 +51,7 @@ Aurora 同 VPC 内的 Lambda 承担（`Gateway → Lambda(VPC) → Aurora(同 VP
 | **Gateway** | 把数据查询 Lambda 转成 3 个 MCP 工具；入站同样用 Keycloak JWT 认证（audience 隔离：Runtime 与 Gateway 各收各的 token） |
 | **Code Interpreter** | 对查询结果做统计分析 |
 | **Browser** | 任务管理模块里观看 Part 1 抓取时的云端浏览器实况（Live View，DCV 直播流；presigned URL 由服务端签发） |
-| **Memory** | 本期不启用（部署 `--disable-memory`）。[会话历史](#分析会话与历史)是自建的两张 Aurora 表，与 Memory 无关；预留：后续接入 AWS 自部署的 **mem0** 记住用户分析偏好（长期语义记忆），接入点见 `agent/main.py` 标注 |
+| **Memory** | 托管 Memory 不启用（部署 `--disable-memory`）；长期记忆用 **AWS 自部署 mem0** 实现，跨会话记住用户分析偏好，见[长期记忆（mem0 自部署）](#长期记忆mem0-自部署)。[会话历史](#分析会话与历史)是自建的两张 Aurora 表，与两者都无关 |
 
 ## 目录结构
 
@@ -60,10 +60,13 @@ part2_chat_portal/
 ├── agent/                        # 分析 Agent（部署到 AgentCore Runtime）
 │   ├── main.py                   # 流式入口 + Identity M2M + Gateway MCP 工具
 │   │                             #   + 会话历史落库/回灌（RDS Data API）
+│   ├── memory_backend.py         # 长期记忆：mem0 封装 + 自定义向量后端
+│   │                             #   （向量操作 RPC 到 VPC 内记忆 Lambda）
 │   └── requirements.txt
 ├── infra/
 │   ├── keycloak/                 # 自部署 Keycloak（Dockerfile + realm 模板）
 │   ├── analytics-lambda/         # 数据查询 Lambda（pg8000 直连 Aurora）
+│   ├── memory-lambda/            # 记忆向量 Lambda（mem0 pgvector 数据面）
 │   ├── part2-analytics.yaml      # CloudFormation：Lambda/Gateway 角色
 │   │                             #   （Secrets VPC 端点归 Part 1 的 Aurora 栈）
 │   ├── tool-schema.json          # Gateway Lambda target 的工具 schema
@@ -74,7 +77,8 @@ part2_chat_portal/
 ├── scripts/
 │   ├── deploy.sh                 # 一键部署（Keycloak + 基础设施 + Gateway + Runtime + 任务管理模块）
 │   ├── get_token.sh              # 测试辅助：demo 账号换取用户 token
-│   └── chat_test.sh              # 命令行冒烟测试（流式打印 Agent 回复）
+│   ├── chat_test.sh              # 命令行冒烟测试（流式打印 Agent 回复）
+│   └── memory_test.sh            # 长期记忆冒烟（向量 Lambda 生命周期 + 跨会话回忆）
 └── web/                          # 前端 SPA（Vite + React + TS，本地 dev server）
     └── src/
         ├── chat/                 # 会话历史接口（列表 / 注册 / 消息 / 重命名 / 删除）
@@ -91,11 +95,23 @@ export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>   # 或依赖 IAM 自动铸 to
 ./scripts/deploy.sh
 ```
 
-脚本幂等，可重复执行。首次部署约 10 分钟，共 9 步：Keycloak（1）→ 分析链路基础
-设施与数据查询 Lambda（2-3）→ Gateway 与工具注册（4）→ Identity credential
-provider（5）→ 分析 Agent 到 Runtime（6-7）→ 前端配置（8）→ 数据摄入任务管理
-模块（9）。部署机密（Keycloak admin 密码、demo 账号密码、M2M client secret）
-生成后存放在 `.deploy/secrets.env`（已 gitignore）。
+脚本幂等，可重复执行。首次部署约 10 分钟，共 10 步：Keycloak（1）→ 分析链路
+基础设施与数据查询 Lambda（2-3）→ 记忆向量 Lambda 与 pgvector 初始化（4）→
+Gateway 与工具注册（5）→ Identity credential provider（6）→ 分析 Agent 到
+Runtime（7-8）→ 前端配置（9）→ 数据摄入任务管理模块（10）。部署机密
+（Keycloak admin 密码、demo 账号密码、M2M client secret）生成后存放在
+`.deploy/secrets.env`（已 gitignore）。
+
+长期记忆（mem0）需要一个 OpenAI 兼容端点做事实提取与 embedding，部署前
+export（不 export 也能部署，记忆功能整体禁用、对话不受影响）：
+
+```bash
+export MEM0_LLM_MODEL=<提取模型名>                  # 需稳定输出 JSON
+export MEM0_LLM_BASE_URL=<OpenAI 兼容端点>/v1
+export MEM0_LLM_API_KEY=<key>
+export MEM0_EMBEDDER_MODEL=<embedding 模型名>
+export MEM0_EMBEDDER_DIMS=1024                      # 维度决定 pgvector 表结构
+```
 
 > **已有环境升级注意**：数据查询 Lambda 取凭证用的 Secrets Manager 接口端点已
 > 从本部分的 analytics 栈挪到 Part 1 的 Aurora 栈（端点随 VPC 归属，且同一 VPC
@@ -212,6 +228,67 @@ tasks-api Lambda**：
 历史，被回收了就回灌，前端无感知。鼠标悬停出现重命名和删除按钮；删除的正是当前
 会话时会自动切到新对话。「新对话」语义不变，新会话在第一条消息发出后才进列表，
 标题默认取首条输入截断，之后可以改。
+
+## 长期记忆（mem0 自部署）
+
+会话历史解决"同一个会话接着聊"；长期记忆解决"**换个会话还记得你**"——用户在
+任何会话里表达过的分析偏好（"金额换算成人民币"、"我只看英国站"），下次新开会话
+时 Agent 自动带着这些偏好工作。用 [mem0](https://github.com/mem0ai/mem0) OSS
+自部署实现，不用 AgentCore 托管 Memory（部署仍是 `--disable-memory`，两者无关），
+全链路无区域锁定、中国区可原样移植。
+
+### 链路
+
+```
+Runtime（分析 Agent + mem0，公网）                VPC 内
+┌──────────────────────────────────┐             ┌─────────────────────┐
+│ 会话首轮: recall ──────────────────┼─────────────▶ 记忆向量 Lambda      │
+│   → 记忆注入 system_prompt（缓存整会话）          │  pg8000 → Aurora    │
+│ 每轮结束: memorize（LLM 事实提取） ─┼─────────────▶  pgvector           │
+│   LLM/embedding → OpenAI 兼容端点  │  lambda.invoke └─────────────────────┘
+└──────────────────────────────────┘
+```
+
+- **计算面留公网**：mem0 的 LLM 事实提取与 embedding 都走 OpenAI 兼容端点
+  （`MEM0_*` 环境变量注入，端点与 key 不落仓库）；
+- **数据面下沉 VPC**：向量读写经 `lambda.invoke` 走记忆向量 Lambda
+  （`infra/memory-lambda/`，pg8000 直连 Aurora pgvector）——Aurora VPC 无
+  IGW/NAT、Runtime 又不挂 VPC，这是两侧网络约束下的自然拆法，且与数据查询
+  Lambda 同构；
+- **记忆归属**：按 `chat_sessions.user_name` 隔离（session 反查，身份来自
+  已验证的 Keycloak JWT，不信前端）；CLI 冒烟会话（`smoke-*`）未注册归属，
+  自动跳过记忆。
+
+### 行为约定
+
+- **会话首轮检索一次，整会话缓存**：记忆注入 system prompt 后本会话内不再
+  变化——保证主模型 prompt cache 前缀稳定（每轮检索会把缓存全部打穿）。
+  本会话新学到的偏好下个新会话生效。
+- **每轮结束自动沉淀**：流结束后本轮问答交 mem0 做 LLM 事实提取（与既有
+  记忆去重/合并），SSE 流关闭因此变晚——典型几秒，最坏 `MEM0_ADD_TIMEOUT`
+  （默认 20s，正文已送达，仅输入框解锁变晚；连续失败自动熔断）。
+- **永不阻断对话**：mem0 未配置/Lambda 不可达/集群冷恢复/提取失败，只降级为
+  "本轮或本进程无记忆"，日志（CloudWatch，前缀 `[mem0]`）可查原因。
+
+完整契约（RPC 协议、表结构、降级矩阵、mem0 版本锁定原因）见
+`.trellis/spec/backend/mem0-long-term-memory.md`。
+
+### 验证
+
+```bash
+./scripts/memory_test.sh          # 向量 Lambda 数据面全生命周期冒烟（无 LLM 成本）
+./scripts/memory_test.sh --e2e    # 同一用户两个新会话，验证跨会话回忆
+```
+
+或者直接在门户里体验：会话 A 告诉它"以后金额都换算成人民币，我只关注英国站"，
+新建会话 B 问"看下最近 30 天的选品漏斗"——回答应默认按人民币与英国站口径。
+直查记忆库：
+
+```bash
+aws rds-data execute-statement --resource-arn "$CLUSTER_ARN" --secret-arn "$SECRET_ARN" \
+  --database product_hunting --region us-west-2 \
+  --sql "SELECT payload->>'data' AS memory, payload->>'user_id' AS user_name FROM mem0_ltm"
+```
 
 ## 数据摄入任务管理模块
 
@@ -362,6 +439,20 @@ Lambda 调用许可要等函数存在才能建，脚本因此先用 `ApiEnabled=
   （jwt.io 解码看 `aud`），以及 Runtime 的 authorizer discovery URL 与 Keycloak
   地址一致（Keycloak 重建后需重跑 deploy.sh 同步）。
 - **工具调用报数据库超时**：多为 Aurora 冷恢复中，重问一次即可。
+- **长期记忆不生效（换会话后不记得偏好）**：按顺序查 Runtime 的 CloudWatch
+  日志里 `[mem0]` 前缀的行——`长期记忆禁用` 说明 `MEM0_LLM_MODEL` /
+  `MEM0_LLM_BASE_URL` / `MEM0_LLM_API_KEY` / `MEM0_EMBEDDER_MODEL` 没配齐
+  （export 后重跑 deploy.sh）；`recall 超时` 多为 Aurora 冷恢复（0 ACU 唤醒
+  要几十秒），该会话检索被放弃且不重试，新开会话即可；`memorize 失败` 看
+  具体报错——embedding 维度与表不符（`MEM0_EMBEDDER_DIMS` 和建表时不一致，
+  换 `MEM0_COLLECTION` 重建）、提取模型输出非法 JSON（换个模型）都在此列。
+  记忆链路任何故障都不影响正常对话。
+- **每轮回答完输入框要多等几秒才解锁**：正常——流结束后 mem0 在做本轮的
+  记忆提取（LLM 调用），必须等它写完 Runtime 才能安全冻结沙箱。典型几秒、
+  最坏 `MEM0_ADD_TIMEOUT`（默认 20s）；提取连续失败 3 次会自动熔断停付。
+- **想清空某用户的长期记忆**：直接删行即可
+  `DELETE FROM mem0_ltm WHERE payload->>'user_id' = '<用户名>'`
+  （rds-data execute-statement，库表见上文「长期记忆」节）。
 - **侧栏「历史会话」不显示，或回看旧会话后追问不认前文**：这两个症状对应链路的
   两端。列表空说明读侧有问题——`GET /chat/sessions` 是不是 401/403（token 过期，
   或 token 里没有 `preferred_username`），以及会话是否真的注册过（CLI 会话不注册）。

@@ -46,7 +46,8 @@
 │        ├─▶ Identity ─③ M2M token─▶ Gateway（MCP 工具，JWT 认证）               │
 │        │                              └─▶ Lambda(VPC) ─▶ Aurora(同 VPC 直连)   │
 │        │                                  （Gateway 侧零 VPC egress）           │
-│        └─▶ Code Interpreter（统计分析）      Memory：预留 mem0（暂不实现）      │
+│        └─▶ Code Interpreter（统计分析）                                        │
+│        └─▶ mem0 长期记忆（自部署）─▶ 记忆 Lambda(VPC) ─▶ Aurora pgvector       │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -73,6 +74,11 @@ AgentCore 在中国区（`cn-north-1` / `cn-northwest-1`）尚未上线。本 wo
 - **Gateway 零 VPC egress**：私网访问全部由 VPC 内 Lambda 承担，不依赖
   Gateway 的 VPC 出口能力。
 - **认证自部署 Keycloak**（中国区没有 Cognito）：OIDC 全链路不依赖海外托管服务。
+- **长期记忆自部署 mem0**（不用 AgentCore 托管 Memory）：向量存 Aurora
+  pgvector、经 VPC 内 Lambda 读写（与写库/分析 Lambda 同构）；mem0 的事实
+  提取 LLM 与 embedding 本来就走 OpenAI 兼容端点（`MEM0_*` 环境变量），
+  中国区只需把端点指向区内模型服务商，向量面零改动。唯一注意点：换
+  embedding 模型时若维度变化，需换 `MEM0_COLLECTION` 重建向量表。
 
 **移植时需要处理的差异**（AgentCore 中国区上线后）：
 

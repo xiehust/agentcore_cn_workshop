@@ -32,6 +32,10 @@ interface Session {
   restored: boolean;
 }
 
+/** 长期记忆（mem0）部署期开关：deploy.sh 按 MEM0_* 是否配齐写入 .env.local。
+ * 只反映部署配置，运行期降级（如端点故障熔断）不在此显示。 */
+const mem0Enabled = import.meta.env.VITE_MEM0_ENABLED === "true";
+
 export default function App() {
   const [view, setView] = useState<View>("chat");
   const [chatBusy, setChatBusy] = useState(false);
@@ -211,9 +215,16 @@ export default function App() {
         </div>
 
         <div className="sidebar-footer">
-          <div className="memory-note" title="预留：后续接入 AWS 自部署的 mem0 记住分析偏好">
+          <div
+            className={mem0Enabled ? "memory-note on" : "memory-note"}
+            title={
+              mem0Enabled
+                ? "基于 AWS 自部署 mem0：跨会话记住你的分析偏好（新会话首轮自动带入，本轮对话结束后自动沉淀）"
+                : "部署时未配置 MEM0_* 环境变量；export 后重跑 deploy.sh 即可启用"
+            }
+          >
             <BrainIcon size={14} />
-            长期记忆 mem0 · 预留未启用
+            长期记忆 mem0 · {mem0Enabled ? "已启用" : "未启用"}
           </div>
           <div className="user-row">
             <span className="avatar">{displayName().slice(0, 1)}</span>
