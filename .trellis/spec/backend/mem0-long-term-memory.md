@@ -91,6 +91,10 @@
   `OPENAI_BASE_URL`（已被主模型 bedrock-mantle 占用）——mem0 配置必须
   显式传 `api_key`+`openai_base_url`（`MEM0_*` 系环境变量，deploy.sh
   透传，端点/key 不落仓库）。
+- **采样参数**：缺省 `is_reasoning_model=True`（`MEM0_LLM_REASONING`），
+  不向提取 LLM 发送 temperature/top_p/max_tokens——推理系模型（Claude
+  Opus 4.x 等）只接受默认采样值，发低温会被端点 400 拒掉（实测教训）；
+  设 `MEM0_LLM_REASONING=false` 才发 `MEM0_LLM_TEMPERATURE`。
 - **维度绑定**：`MEM0_EMBEDDER_DIMS`（默认 1024）决定 pgvector 表结构，
   换 embedding 模型/维度必须同时换 `MEM0_COLLECTION` 重建表。
   `MEM0_EMBEDDER_PASS_DIMS=true` 才把 `dimensions` 参数发给 embedding

@@ -22,6 +22,12 @@ REGION="${AWS_REGION:-us-west-2}"
 # 透传进 Runtime 会压过 AWS_BEARER_TOKEN_BEDROCK 导致模型 401，这里直接忽略
 if [ -n "${OPENAI_API_KEY:-}" ] && [[ "${OPENAI_API_KEY}" != ABSK* ]]; then
   echo "⚠️  OPENAI_API_KEY 不是 Bedrock API key（非 ABSK 前缀），忽略；改用 AWS_BEARER_TOKEN_BEDROCK / IAM"
+  # 成对残留成对忽略：非 ABSK 的 key 多半来自其他项目的环境（本地 LLM 代理等），
+  # 配套的 OPENAI_BASE_URL 往往指向 Runtime 根本不可达的私网地址，一并丢弃
+  if [ -n "${OPENAI_BASE_URL:-}" ]; then
+    echo "⚠️  同时忽略残留的 OPENAI_BASE_URL（$OPENAI_BASE_URL）——如需自定义端点请配 ABSK key 后重跑"
+    unset OPENAI_BASE_URL
+  fi
   unset OPENAI_API_KEY
 fi
 if [ -n "${OPENAI_API_KEY:-}" ]; then
@@ -48,7 +54,9 @@ mkdir -p "$DEPLOY_DIR"
 # .venv 里的 Python 版（bedrock-agentcore-starter-toolkit）。识别依据：只有
 # Python 版的帮助里列出 configure 子命令（npm 版对任意 --help 都返回 0，
 # 不能拿退出码判断）。
-_agentcore_ok() { "$1" --help 2>/dev/null | grep -qE '\bconfigure\b'; }
+# 注意不能用 grep -q：-q 命中即退出会给还在写帮助文本的 agentcore 发 SIGPIPE，
+# 在 set -o pipefail 下整个管道被判失败（时序相关，间歇性发作）。先落盘再 grep。
+_agentcore_ok() { "$1" --help >/tmp/.agentcore_help 2>/dev/null && grep -qE '\bconfigure\b' /tmp/.agentcore_help; }
 if ! _agentcore_ok agentcore; then
   REPO_VENV_BIN="$(dirname "$PART1_DIR")/.venv/bin"
   if [ -x "$REPO_VENV_BIN/agentcore" ] && _agentcore_ok "$REPO_VENV_BIN/agentcore"; then

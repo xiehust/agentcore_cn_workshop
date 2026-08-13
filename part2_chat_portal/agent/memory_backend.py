@@ -33,6 +33,9 @@ Lambda RPC，SQL 语义由 Lambda 侧忠实复刻 mem0 自带 pgvector 实现。
     MEM0_EMBEDDER_DIMS        向量维度（缺省 1024，须与表结构一致）
     MEM0_EMBEDDER_PASS_DIMS   =true 时把 dimensions 参数发给 embedding API
                               （仅 matryoshka 系模型支持，缺省不发）
+    MEM0_LLM_REASONING        缺省 true：按推理模型对待，不发采样参数
+                              （Claude Opus 4.x 等只接受默认采样值）；
+                              =false 时发 MEM0_LLM_TEMPERATURE（缺省 1.0）
     MEM0_SEARCH_TIMEOUT / MEM0_ADD_TIMEOUT   检索/写回预算秒数（缺省 3 / 20）
 
 注意：mem0 的 openai provider 会 fallback 读 OPENAI_API_KEY / OPENAI_BASE_URL
@@ -324,7 +327,13 @@ def _build_config() -> dict:
                 "model": MEM0_LLM_MODEL,
                 "openai_base_url": MEM0_LLM_BASE_URL,
                 "api_key": MEM0_LLM_API_KEY,
-                "temperature": 0.2,
+                # 默认按推理模型对待：mem0 会丢弃 temperature/top_p/max_tokens
+                # 采样参数——推理系模型（Claude Opus 4.x、o 系等）只接受默认
+                # 采样值，传低温/低 top_p 会被端点 400 拒掉；提取任务对采样
+                # 参数不敏感，不发最普适。需要温度控制时设
+                # MEM0_LLM_REASONING=false 并配 MEM0_LLM_TEMPERATURE
+                "is_reasoning_model": os.getenv("MEM0_LLM_REASONING", "true").lower() != "false",
+                "temperature": _env_num("MEM0_LLM_TEMPERATURE", 1.0, float),
                 "max_tokens": 2000,
             },
         },
