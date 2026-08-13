@@ -1,9 +1,11 @@
 // 数据摄入任务管理视图：任务列表 → 任务详情（运行历史）→ 运行详情。
 // 不用 router，靠本组件内的 route state 切子视图。
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type FocusEvent, type KeyboardEvent } from "react";
 import {
   ArrowLeftIcon,
   ArrowsClockwiseIcon,
+  CaretDownIcon,
+  CheckIcon,
   ListChecksIcon,
   PauseIcon,
   PlayIcon,
@@ -258,6 +260,8 @@ function TaskList({
 /* ================= 新建任务面板 ================= */
 
 type SchedulePreset = "hours" | "daily" | "custom";
+const COUNTRY_OPTIONS = ["UK", "US"] as const;
+const COUNTRY_LISTBOX_ID = "task-country-options";
 
 /** 把周期预设翻成 EventBridge Scheduler 表达式。 */
 function buildScheduleExpr(
@@ -289,8 +293,57 @@ function NewTaskPanel({ onClose, onCreated }: { onClose: () => void; onCreated: 
   const [tz, setTz] = useState("Asia/Shanghai");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [countryMenuOpen, setCountryMenuOpen] = useState(false);
+  const [countryActiveIndex, setCountryActiveIndex] = useState(-1);
+  const countryInputRef = useRef<HTMLInputElement>(null);
 
   const expr = buildScheduleExpr(preset, hours, time, custom);
+
+  function openCountryMenu() {
+    setCountryMenuOpen(true);
+    setCountryActiveIndex(COUNTRY_OPTIONS.findIndex((option) => option === country));
+  }
+
+  function closeCountryMenu() {
+    setCountryMenuOpen(false);
+    setCountryActiveIndex(-1);
+  }
+
+  function selectCountry(option: (typeof COUNTRY_OPTIONS)[number]) {
+    setCountry(option);
+    closeCountryMenu();
+    countryInputRef.current?.focus();
+  }
+
+  function handleCountryKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const direction = event.key === "ArrowDown" ? 1 : -1;
+      setCountryMenuOpen(true);
+      setCountryActiveIndex((current) => {
+        if (current < 0) return direction > 0 ? 0 : COUNTRY_OPTIONS.length - 1;
+        return (current + direction + COUNTRY_OPTIONS.length) % COUNTRY_OPTIONS.length;
+      });
+      return;
+    }
+
+    if (event.key === "Enter" && countryMenuOpen && countryActiveIndex >= 0) {
+      event.preventDefault();
+      selectCountry(COUNTRY_OPTIONS[countryActiveIndex]);
+      return;
+    }
+
+    if (event.key === "Escape" && countryMenuOpen) {
+      event.preventDefault();
+      closeCountryMenu();
+    }
+  }
+
+  function handleCountryBlur(event: FocusEvent<HTMLDivElement>) {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      closeCountryMenu();
+    }
+  }
 
   async function submit() {
     const normalizedCountry = country.trim();
@@ -343,24 +396,90 @@ function NewTaskPanel({ onClose, onCreated }: { onClose: () => void; onCreated: 
             />
           </label>
 
-          <label className="field">
-            <span className="field-label">国家 / 站点</span>
-            <input
-              list="task-country-options"
-              value={country}
-              maxLength={64}
-              autoComplete="off"
-              aria-describedby="task-country-hint"
-              onChange={(e) => setCountry(e.target.value)}
-            />
-            <datalist id="task-country-options">
-              <option value="UK" />
-              <option value="US" />
-            </datalist>
+          <div className="field">
+            <label className="field-label" htmlFor="task-country-input">
+              国家 / 站点
+            </label>
+            <div className="country-combobox" onBlur={handleCountryBlur}>
+              <div className="country-combobox-input">
+                <input
+                  ref={countryInputRef}
+                  id="task-country-input"
+                  role="combobox"
+                  value={country}
+                  maxLength={64}
+                  autoComplete="off"
+                  aria-autocomplete="list"
+                  aria-expanded={countryMenuOpen}
+                  aria-controls={COUNTRY_LISTBOX_ID}
+                  aria-activedescendant={
+                    countryMenuOpen && countryActiveIndex >= 0
+                      ? `${COUNTRY_LISTBOX_ID}-${countryActiveIndex}`
+                      : undefined
+                  }
+                  aria-describedby="task-country-hint"
+                  onFocus={openCountryMenu}
+                  onClick={openCountryMenu}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    setCountry(value);
+                    setCountryMenuOpen(true);
+                    setCountryActiveIndex(COUNTRY_OPTIONS.findIndex((option) => option === value));
+                  }}
+                  onKeyDown={handleCountryKeyDown}
+                />
+                <button
+                  type="button"
+                  className={countryMenuOpen ? "country-combobox-toggle open" : "country-combobox-toggle"}
+                  aria-label="展开国家 / 站点选项"
+                  aria-controls={COUNTRY_LISTBOX_ID}
+                  aria-expanded={countryMenuOpen}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => {
+                    openCountryMenu();
+                    countryInputRef.current?.focus();
+                  }}
+                >
+                  <CaretDownIcon size={16} />
+                </button>
+              </div>
+              {countryMenuOpen && (
+                <div id={COUNTRY_LISTBOX_ID} className="country-combobox-menu" role="listbox">
+                  {COUNTRY_OPTIONS.map((option, index) => {
+                    const selected = option === country;
+                    return (
+                      <button
+                        key={option}
+                        id={`${COUNTRY_LISTBOX_ID}-${index}`}
+                        type="button"
+                        role="option"
+                        tabIndex={-1}
+                        aria-selected={selected}
+                        className={[
+                          "country-combobox-option",
+                          index === countryActiveIndex ? "active" : "",
+                          selected ? "selected" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" ")}
+                        onMouseDown={(e) => e.preventDefault()}
+                        onMouseEnter={() => setCountryActiveIndex(index)}
+                        onClick={() => selectCountry(option)}
+                      >
+                        <span>{option}</span>
+                        <span className="country-combobox-check" aria-hidden="true">
+                          {selected && <CheckIcon size={15} weight="bold" />}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
             <span id="task-country-hint" className="field-hint">
               可输入其他国家；运行前需有支持该值的 Part 1 Skill。
             </span>
-          </label>
+          </div>
 
           <label className="field">
             <span className="field-label">摄入指令</span>
