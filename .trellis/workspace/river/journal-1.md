@@ -76,3 +76,24 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 4: Add eBay US ingestion skill
+
+**Date**: 2026-08-13
+**Task**: Add eBay US ingestion skill
+**Branch**: `main`
+
+### Summary
+
+Added a dedicated eBay US Part 1 selection skill using ebay.com, USD, site=US, fixed demo exchange rate 7, US compliance guidance, and documented invocation examples. Static validation passed; live AgentCore Browser-to-Aurora E2E was not run because the local environment lacks strands and deployed runtime verification was outside this task.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `bb8295a` | (see git log) |
+
+### Status
+
+[OK] **Completed**
