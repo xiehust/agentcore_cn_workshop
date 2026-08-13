@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/ingestion-tasks-module.md", "reason": "Verify the cross-layer ingestion-task contract remains synchronized"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Verify schema migration and Data API behavior"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "Verify frontend changes follow package conventions"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "Review frontend quality and responsive behavior"}
+{"file": ".trellis/spec/frontend/type-safety.md", "reason": "Verify TypeScript contract completeness"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Check end-to-end propagation and compatibility"}

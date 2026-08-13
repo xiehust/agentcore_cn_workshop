@@ -177,7 +177,10 @@ function TaskList({
                       <button className="link-cell" onClick={() => onOpenTask(t.task_id)}>
                         {t.name}
                       </button>
-                      <span className="cell-sub">{t.prompt}</span>
+                      <span className="cell-sub">
+                        <span className="country-tag">{t.country}</span>
+                        {t.prompt}
+                      </span>
                     </td>
                     <td>
                       {t.mode === "one_time" ? "一次性" : "定期"}
@@ -276,6 +279,7 @@ function buildScheduleExpr(
 
 function NewTaskPanel({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const [name, setName] = useState("");
+  const [country, setCountry] = useState("UK");
   const [prompt, setPrompt] = useState("");
   const [mode, setMode] = useState<TaskMode>("one_time");
   const [preset, setPreset] = useState<SchedulePreset>("daily");
@@ -289,8 +293,9 @@ function NewTaskPanel({ onClose, onCreated }: { onClose: () => void; onCreated: 
   const expr = buildScheduleExpr(preset, hours, time, custom);
 
   async function submit() {
-    if (!name.trim() || !prompt.trim()) {
-      setError("任务名称和摄入指令都要填。");
+    const normalizedCountry = country.trim();
+    if (!name.trim() || !normalizedCountry || !prompt.trim()) {
+      setError("任务名称、国家/站点和摄入指令都要填。");
       return;
     }
     if (mode === "recurring" && !expr) {
@@ -302,6 +307,7 @@ function NewTaskPanel({ onClose, onCreated }: { onClose: () => void; onCreated: 
     try {
       await createTask({
         name: name.trim(),
+        country: normalizedCountry,
         prompt: prompt.trim(),
         mode,
         // rate(...) 不看时区，只有 cron / 自定义才带上
@@ -335,6 +341,25 @@ function NewTaskPanel({ onClose, onCreated }: { onClose: () => void; onCreated: 
               placeholder="如：家居收纳选品扫描"
               onChange={(e) => setName(e.target.value)}
             />
+          </label>
+
+          <label className="field">
+            <span className="field-label">国家 / 站点</span>
+            <input
+              list="task-country-options"
+              value={country}
+              maxLength={64}
+              autoComplete="off"
+              aria-describedby="task-country-hint"
+              onChange={(e) => setCountry(e.target.value)}
+            />
+            <datalist id="task-country-options">
+              <option value="UK" />
+              <option value="US" />
+            </datalist>
+            <span id="task-country-hint" className="field-hint">
+              可输入其他国家；运行前需有支持该值的 Part 1 Skill。
+            </span>
           </label>
 
           <label className="field">
@@ -505,7 +530,10 @@ function TaskDetail({
             <ArrowLeftIcon size={14} />
             任务列表
           </button>
-          <h1>{data?.task.name ?? "任务详情"}</h1>
+          <h1>
+            {data?.task.name ?? "任务详情"}
+            {data && <span className="country-tag detail-country">{data.task.country}</span>}
+          </h1>
           {data && (
             <p className="mono">
               {data.task.mode === "one_time"

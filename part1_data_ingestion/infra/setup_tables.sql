@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS ingestion_tasks (
     task_id       VARCHAR(36)   NOT NULL,          -- UUID
     name          VARCHAR(256)  NOT NULL,          -- 任务名（门户列表展示）
     prompt        VARCHAR(4096) NOT NULL,          -- 传给 Runtime 的选品指令
+    country       VARCHAR(64)   NOT NULL DEFAULT 'UK',  -- 国家/站点；由对应 Skill 解释
     mode          VARCHAR(16)   NOT NULL,          -- one_time / recurring
     schedule_expr VARCHAR(128),                    -- recurring：rate(...) / cron(...)
     status        VARCHAR(16)   NOT NULL DEFAULT 'active',  -- active / paused / deleted
@@ -81,6 +82,9 @@ CREATE TABLE IF NOT EXISTS ingestion_tasks (
     updated_at    TIMESTAMP     NOT NULL DEFAULT NOW(),
     PRIMARY KEY (task_id)
 );
+
+-- 已有表升级保持可空，兼容绕过 tasks-api 的旧写入方；默认值让历史任务按 UK 执行。
+ALTER TABLE ingestion_tasks ADD COLUMN IF NOT EXISTS country VARCHAR(64) DEFAULT 'UK';
 
 -- ============================================================
 -- 表 4：任务运行记录表

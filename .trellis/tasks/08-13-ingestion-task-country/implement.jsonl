@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/ingestion-tasks-module.md", "reason": "Cross-layer task API, runner, schema, and frontend contract"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Aurora schema ownership, idempotent DDL, and Data API conventions"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "Frontend package conventions and referenced layer guidance"}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "Existing component and form composition guidance"}
+{"file": ".trellis/spec/frontend/type-safety.md", "reason": "Frontend REST contract type changes"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Coordinate database, Lambda API, runner, and React changes"}

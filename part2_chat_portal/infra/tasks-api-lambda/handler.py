@@ -147,6 +147,14 @@ def _int_param(params: dict, key: str, default: int, lo: int, hi: int) -> int:
         return default
 
 
+def _normalize_country(value) -> str:
+    """国家/站点是自由文本：压缩空白，旧调用未传或传空时按 UK 处理。"""
+    if value is None:
+        return "UK"
+    normalized = " ".join(str(value).split())
+    return normalized or "UK"
+
+
 def _user_name(event: dict) -> str:
     """从 JWT claims 取登录用户名（会话归属的唯一依据）。
 
@@ -167,7 +175,8 @@ def _user_name(event: dict) -> str:
 
 # 列名统一带 t. 前缀：列表查询里 join 了最近一次 run，status/created_at 会重名
 TASK_COLUMNS = (
-    "t.task_id, t.name, t.prompt, t.mode, t.schedule_expr, t.status, "
+    "t.task_id, t.name, t.prompt, COALESCE(t.country, 'UK') AS country, "
+    "t.mode, t.schedule_expr, t.status, "
     f"to_char(t.created_at, '{TS}') AS created_at, "
     f"to_char(t.updated_at, '{TS}') AS updated_at"
 )
@@ -291,6 +300,7 @@ def _delete_schedule(task_id: str) -> None:
 def create_task(body: dict) -> dict:
     name = (body.get("name") or "").strip()
     prompt = (body.get("prompt") or "").strip()
+    country = _normalize_country(body.get("country"))
     mode = body.get("mode") or "one_time"
     schedule_expr = (body.get("schedule_expr") or "").strip()
     schedule_tz = (body.get("schedule_tz") or "").strip() or None
@@ -299,6 +309,8 @@ def create_task(body: dict) -> dict:
         return _err(400, "缺少任务名称 name")
     if not prompt:
         return _err(400, "缺少任务指令 prompt")
+    if len(country) > 64:
+        return _err(400, "国家/站点 country 不能超过 64 个字符")
     if mode not in ("one_time", "recurring"):
         return _err(400, "mode 只能是 one_time 或 recurring")
     if mode == "recurring" and not schedule_expr.startswith(("rate(", "cron(")):
@@ -306,12 +318,15 @@ def create_task(body: dict) -> dict:
 
     task_id = str(uuid.uuid4())
     _execute(
-        "INSERT INTO ingestion_tasks (task_id, name, prompt, mode, schedule_expr, status) "
-        "VALUES (:task_id, :name, :prompt, :mode, NULLIF(:schedule_expr, ''), 'active')",
+        "INSERT INTO ingestion_tasks "
+        "(task_id, name, prompt, country, mode, schedule_expr, status) "
+        "VALUES (:task_id, :name, :prompt, :country, :mode, "
+        "NULLIF(:schedule_expr, ''), 'active')",
         [
             _p("task_id", task_id),
             _p("name", name[:256]),
             _p("prompt", prompt[:4096]),
+            _p("country", country),
             _p("mode", mode),
             _p("schedule_expr", schedule_expr),
         ],

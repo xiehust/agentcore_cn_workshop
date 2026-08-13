@@ -15,7 +15,8 @@
 
 ### 2. Signatures
 
-- 表：`ingestion_tasks(task_id PK, name, prompt, mode one_time|recurring,
+- 表：`ingestion_tasks(task_id PK, name, prompt, country free-form string,
+  mode one_time|recurring,
   schedule_expr, status active|paused|deleted, created_at, updated_at)`；
   `ingestion_runs(run_id PK, task_id, status queued|running|succeeded|failed,
   runtime_session_id, browser_id, browser_session_id, stats JSONB, error,
@@ -31,6 +32,13 @@
 - REST 全部路由挂 Keycloak JWT authorizer（issuer=Keycloak realm，
   aud=`analysis-runtime`），响应形状见 `web/src/tasks/api.ts` 的类型定义
   （那是契约的唯一镜像，改后端必须同步改它）。
+- `country` 是最长 64 字符的自由文本，不是枚举。tasks-api 压缩首尾及重复空白，
+  省略或空值兼容为 `UK`；后端不得维护国家白名单或国家到域名/币种/`site` 的映射。
+- runner 把数据库中保存的 `country` 原值置于原始 prompt 前，要求 Part 1 选择明确
+  支持该值的 Skill。任务字段优先于 prompt 内冲突描述；域名、币种、筛选和入库
+  `site` 由 Skill 定义；没有匹配 Skill 时必须报错，不得回退其他国家。
+- 新国家的扩展边界是新增识别该保存值的 Part 1 Skill，不修改 tasks-api、runner、
+  schema 或前端国家目录。前端 `UK` / `US` 只是可编辑输入框的建议项。
 - SSE 结构化事件只有两种 dict（其余为裸文本增量）：
   `{"event":"tool_use","name","tool_use_id"}`、
   `{"event":"browser_session","browser_id","session_id"}`。
@@ -51,6 +59,8 @@
 | GetBrowserSession 非 READY / NotFound | 410 |
 | 一次性任务 pause/resume | 400 |
 | recurring 的 schedule_expr 不以 `rate(`/`cron(` 开头 | 400 |
+| country 省略、仅空白 | 归一化为 `UK` |
+| country 超过 64 字符 | 400，不写任务 |
 | Scheduler 触发但任务非 active | 丢弃（保证「暂停后不再触发」） |
 | 门户手动 run 暂停中的任务 | **放行**（暂停语义只拦自动调度）；任务已删则把预建 queued 记录收尾成 failed |
 | runner 任何异常/Lambda 将超时（剩余 <40s） | run 必须收尾成 failed，**绝不留 running/queued 悬挂** |
@@ -68,6 +78,8 @@
 
 - 桩件级：tasks-api 全路由状态码+形状；runner 五场景（Scheduler+暂停丢弃 /
   门户+暂停放行 / 门户+已删收尾 failed / 任务不存在丢弃 / deadline 超时收尾）。
+- country 扩展：省略/空白默认 UK、重复空白归一化、自定义值原样入库、超长 400；
+  runner prompt 保留原指令并包含通用 Skill 路由约束，不得出现国家到域名的映射。
 - 云上冒烟：无 token 401；建任务→轮询到 succeeded；live-view 409/410/200 三分支；
   `aws scheduler get-schedule` 验证 pause=DISABLED。
 

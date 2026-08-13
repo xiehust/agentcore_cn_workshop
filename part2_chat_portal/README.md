@@ -261,10 +261,13 @@ tasks-api Lambda（python3.12，无 VPC）
 ### 数据表
 
 三张表建在 Part 1 的 `infra/setup_tables.sql` 里（随 Part 1 的 deploy.sh 幂等执行）：
-`ingestion_tasks`（任务定义：prompt、模式、调度表达式、启停状态）、
+`ingestion_tasks`（任务定义：prompt、自由文本国家/站点、模式、调度表达式、启停状态）、
 `ingestion_runs`（每次运行：状态、session id、浏览器会话、统计 JSONB、起止时间）、
 `ingestion_run_events`（事件流：`seq` 自增游标 + `kind` 分类 phase/tool/browser/log/result/error）。
 两张业务表新增可空 `run_id` 列，明细表就是按它过滤出「本次运行写入的记录」。
+
+已有环境升级国家字段时，先运行 Part 1 的 `scripts/deploy.sh`，让幂等 DDL 添加
+`ingestion_tasks.country`，再运行 Part 2 部署更新 tasks-api、runner 与前端。
 
 ### 部署产物
 
@@ -289,7 +292,7 @@ Lambda 调用许可要等函数存在才能建，脚本因此先用 `ApiEnabled=
 
 | 方法 + 路径 | 用途 |
 |------------|------|
-| `POST /tasks` | 建任务。body：`name`、`prompt`、`mode`（`one_time` / `recurring`），定期任务另带 `schedule_expr`（`rate(...)` 或 `cron(...)`）与可选 `schedule_tz`。一次性任务立即建 run 并异步触发 runner |
+| `POST /tasks` | 建任务。body：`name`、`prompt`、自由文本 `country`、`mode`（`one_time` / `recurring`），定期任务另带 `schedule_expr`（`rate(...)` 或 `cron(...)`）与可选 `schedule_tz`。`country` 省略或留空时兼容为 `UK`，最长 64 字符；一次性任务立即建 run 并异步触发 runner |
 | `GET /tasks` | 任务列表，每条附最近一次运行的摘要 |
 | `GET /tasks/{task_id}` | 任务详情 + 运行历史 |
 | `POST /tasks/{task_id}/run` | 手动再跑一次（与在跑的运行并行） |
@@ -302,8 +305,12 @@ Lambda 调用许可要等函数存在才能建，脚本因此先用 `ApiEnabled=
 
 ### 页面上的使用
 
-侧栏「任务管理」→「新建任务」：任务名 + 指令（就是 `agentcore invoke` 的 prompt）
-+ 模式。定期任务的周期有两个预设——「每 N 小时」（转成 `rate(N hours)`）和
+侧栏「任务管理」→「新建任务」：任务名 + 国家/站点 + 指令（就是
+`agentcore invoke` 的 prompt）+ 模式。国家控件默认 `UK`，建议 `UK` / `US`，
+也允许输入任意自定义值。runner 只把保存值作为 Skill 路由约束；域名、币种、
+筛选规则和入库 `site` 由匹配的 Part 1 Skill 决定，找不到时不得回退其他站点。
+因此扩展新国家只需增加能识别该保存值的 Skill，无需修改 Part 2 后端。
+定期任务的周期有两个预设——「每 N 小时」（转成 `rate(N hours)`）和
 「每天定时」（转成 `cron(m H * * ? *)`，带时区，透传给 EventBridge Scheduler），
 也可以选「自定义」直接写表达式。任务卡片上的操作：「立即运行一次」（与在跑的运行
 并行）、「暂停调度」／「恢复调度」、「删除任务」。验证调度是否生效时用
@@ -413,7 +420,7 @@ Lambda 调用许可要等函数存在才能建，脚本因此先用 `ApiEnabled=
   # 建一个一次性任务（返回 task 与 run_id）
   curl -s -X POST "$TASKS_API/tasks" \
     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-    -d '{"name":"smoke","prompt":"从 eBay 英国站搜索 desk organizer 选品，处理第 1 个非广告商品","mode":"one_time"}'
+    -d '{"name":"smoke","country":"UK","prompt":"搜索 desk organizer 选品，处理第 1 个非广告商品","mode":"one_time"}'
   # 轮询运行状态直到 succeeded / failed（单商品约 1.5~2 分钟）
   curl -s "$TASKS_API/runs/<run_id>" -H "Authorization: Bearer $TOKEN"
   # 进度事件与结果明细

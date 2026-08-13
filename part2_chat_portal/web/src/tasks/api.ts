@@ -23,6 +23,7 @@ export interface Task {
   task_id: string;
   name: string;
   prompt: string;
+  country: string;
   mode: TaskMode;
   schedule_expr: string | null;
   status: TaskStatus;
@@ -92,6 +93,7 @@ export interface LiveViewInfo {
 export interface CreateTaskInput {
   name: string;
   prompt: string;
+  country: string;
   mode: TaskMode;
   schedule_expr?: string;
   schedule_tz?: string;

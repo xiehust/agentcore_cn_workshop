@@ -116,6 +116,18 @@ class EventWriter:
 
 # -------------------------------------------------------- 调 Part 1 Runtime ----
 
+def _build_runtime_prompt(country: str | None, prompt: str) -> str:
+    """把任务国家作为通用 Skill 路由约束置于原始任务指令之前。"""
+    stored_country = " ".join(str(country or "").split()) or "UK"
+    directive = (
+        f"任务国家/站点：{stored_country}。\n"
+        "请选择明确支持该国家/站点的 Skill 执行；该任务配置优先于原始任务文本中的冲突描述。\n"
+        "域名、币种、筛选规则和入库 site 值均由匹配到的 Skill 定义。\n"
+        "如果没有匹配的 Skill，必须停止并明确报错，不得回退到其他国家/站点或写入错误数据。"
+    )
+    return f"{directive}\n\n{prompt}"
+
+
 def _invoke_runtime_stream(session_id: str, payload: dict):
     """调 Part 1 Runtime 并返回 SSE 的按行迭代器。
 
@@ -178,7 +190,8 @@ def _sse_chunks(lines):
 
 def _load_task(task_id: str) -> dict | None:
     rows = _execute(
-        "SELECT task_id, prompt, status FROM ingestion_tasks WHERE task_id = :task_id",
+        "SELECT task_id, prompt, COALESCE(country, 'UK') AS country, status "
+        "FROM ingestion_tasks WHERE task_id = :task_id",
         [_p("task_id", task_id)],
     )
     return rows[0] if rows else None
@@ -350,7 +363,10 @@ def lambda_handler(event, context):
 
     try:
         lines = _invoke_runtime_stream(session_id, {
-            "prompt": task.get("prompt") or "",
+            "prompt": _build_runtime_prompt(
+                task.get("country"),
+                task.get("prompt") or "",
+            ),
             "run_id": run_id,
         })
         _consume(events, run_id, lines, deadline)
