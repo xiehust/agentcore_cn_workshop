@@ -118,3 +118,24 @@ Added a UK-defaulted editable country/marketplace combobox with UK/US suggestion
 ### Status
 
 [OK] **Completed**
+
+
+## Session 6: Fix Chrome country combobox dropdown
+
+**Date**: 2026-08-13
+**Task**: Fix Chrome country combobox dropdown
+**Branch**: `main`
+
+### Summary
+
+Replaced the browser-dependent country datalist with a controlled accessible editable combobox. The caret and input always open UK/US options while custom values remain supported; keyboard navigation, Enter, Escape, focus-out close, desktop/mobile layout, and frontend production build were verified against the live 5273 portal.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `84d5f3e` | (see git log) |
+
+### Status
+
+[OK] **Completed**
