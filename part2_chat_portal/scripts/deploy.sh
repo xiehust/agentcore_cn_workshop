@@ -6,16 +6,24 @@
 #   2. 部署分析链路基础设施（CloudFormation：Lambda/Gateway 角色；
 #      取凭证用的 Secrets Manager VPC 端点归 Part 1 的 Aurora 栈）
 #   3. 打包并部署数据查询 Lambda（挂进 Aurora VPC，pg8000 直连 5432）
-#   4. 创建 Gateway（JWT 认证）+ Lambda target（MCP 工具）
-#   5. 创建 Identity OAuth2 credential provider（Agent 访问 Gateway 的 M2M）
-#   6. 部署分析 Agent 到 Runtime（JWT 入站认证 + 流式）
-#   7. 附加 Runtime 执行角色所需策略
-#   8. 生成前端 web/.env.local
-#   9. 部署数据摄入任务管理模块（Tasks HTTP API + tasks-api / runner Lambda +
+#   4. 打包并部署记忆向量 Lambda（mem0 长期记忆的 pgvector 数据面，同 VPC），
+#      并初始化 pgvector 扩展与记忆表
+#   5. 创建 Gateway（JWT 认证）+ Lambda target（MCP 工具）
+#   6. 创建 Identity OAuth2 credential provider（Agent 访问 Gateway 的 M2M）
+#   7. 部署分析 Agent 到 Runtime（JWT 入站认证 + 流式）
+#   8. 附加 Runtime 执行角色所需策略
+#   9. 生成前端 web/.env.local
+#  10. 部署数据摄入任务管理模块（Tasks HTTP API + tasks-api / runner Lambda +
 #      EventBridge Scheduler 调度组），并把 API 地址补进 web/.env.local
 #
 # 前置：Part 1 已部署（依赖其 Aurora 栈输出）；本机有 docker；
 #      模型认证同 Part 1（export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>）
+#      长期记忆（mem0）需要 OpenAI 兼容端点，部署前 export（缺省则记忆功能禁用，
+#      对话不受影响）：
+#        MEM0_LLM_MODEL / MEM0_LLM_BASE_URL / MEM0_LLM_API_KEY          事实提取 LLM
+#        MEM0_EMBEDDER_MODEL / MEM0_EMBEDDER_BASE_URL / MEM0_EMBEDDER_API_KEY
+#        MEM0_EMBEDDER_DIMS（默认 1024；embedding 维度决定 pgvector 表结构，
+#        建表后更换需换 MEM0_COLLECTION 重建）
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-west-2}"
@@ -23,6 +31,12 @@ REGION="${AWS_REGION:-us-west-2}"
 # 透传进 Runtime 会压过 AWS_BEARER_TOKEN_BEDROCK 导致模型 401，这里直接忽略
 if [ -n "${OPENAI_API_KEY:-}" ] && [[ "${OPENAI_API_KEY}" != ABSK* ]]; then
   echo "⚠️  OPENAI_API_KEY 不是 Bedrock API key（非 ABSK 前缀），忽略；改用 AWS_BEARER_TOKEN_BEDROCK / IAM"
+  # 成对残留成对忽略：非 ABSK 的 key 多半来自其他项目的环境（本地 LLM 代理等），
+  # 配套的 OPENAI_BASE_URL 往往指向 Runtime 根本不可达的私网地址，一并丢弃
+  if [ -n "${OPENAI_BASE_URL:-}" ]; then
+    echo "⚠️  同时忽略残留的 OPENAI_BASE_URL（$OPENAI_BASE_URL）——如需自定义端点请配 ABSK key 后重跑"
+    unset OPENAI_BASE_URL
+  fi
   unset OPENAI_API_KEY
 fi
 AURORA_STACK="agentcore-workshop-aurora"
@@ -31,11 +45,16 @@ KC_STACK="agentcore-workshop-keycloak"
 KC_ECR_REPO="agentcore-workshop/keycloak"
 KC_REALM="agentcore-workshop"
 LAMBDA_NAME="agentcore-workshop-analytics"
+# 长期记忆（mem0）：向量 Lambda 与 pgvector collection（表名）；embedding 维度
+# 与 embedding 模型绑定，换模型必须同时换 collection（表按维度建，不能就地改）
+MEMORY_LAMBDA_NAME="agentcore-workshop-memory"
+MEM0_COLLECTION="${MEM0_COLLECTION:-mem0_ltm}"
+MEM0_EMBEDDER_DIMS="${MEM0_EMBEDDER_DIMS:-1024}"
 GATEWAY_NAME="agentcore-workshop-analytics-gw"
 GATEWAY_TARGET_NAME="analytics"
 IDENTITY_PROVIDER_NAME="agentcore-workshop-keycloak"
 AGENT_NAME="analysis_chat_agent"
-# 任务管理模块（步骤 9）
+# 任务管理模块（步骤 10）
 TASKS_STACK="agentcore-workshop-part2-tasks"
 TASKS_API_NAME="agentcore-workshop-tasks-api"
 RUNNER_NAME="agentcore-workshop-ingestion-runner"
@@ -51,7 +70,9 @@ DEPLOY_DIR="$PART2_DIR/.deploy"
 # .venv 里的 Python 版（bedrock-agentcore-starter-toolkit）。识别依据：只有
 # Python 版的帮助里列出 configure 子命令（npm 版对任意 --help 都返回 0，
 # 不能拿退出码判断）。
-_agentcore_ok() { "$1" --help 2>/dev/null | grep -qE '\bconfigure\b'; }
+# 注意不能用 grep -q：-q 命中即退出会给还在写帮助文本的 agentcore 发 SIGPIPE，
+# 在 set -o pipefail 下整个管道被判失败（时序相关，间歇性发作）。先落盘再 grep。
+_agentcore_ok() { "$1" --help >/tmp/.agentcore_help 2>/dev/null && grep -qE '\bconfigure\b' /tmp/.agentcore_help; }
 if ! _agentcore_ok agentcore; then
   REPO_VENV_BIN="$(dirname "$PART2_DIR")/.venv/bin"
   if [ -x "$REPO_VENV_BIN/agentcore" ] && _agentcore_ok "$REPO_VENV_BIN/agentcore"; then
@@ -76,6 +97,12 @@ ANALYST_PASSWORD=$(openssl rand -hex 8)
 EOF
   echo "ℹ️  已生成部署机密: $SECRETS_FILE"
 fi
+# 增量迁移：老部署的 secrets.env 里没有后加的 key，缺哪个补哪个
+# （set -u 下缺 key 会让后面的 sed 注入直接炸掉）
+for demo_user in VIVIAN MARCO; do
+  grep -q "^${demo_user}_PASSWORD=" "$SECRETS_FILE" \
+    || echo "${demo_user}_PASSWORD=$(openssl rand -hex 8)" >> "$SECRETS_FILE"
+done
 # shellcheck disable=SC1090
 source "$SECRETS_FILE"
 
@@ -86,8 +113,8 @@ _aurora_output() {
 CLUSTER_ENDPOINT=$(_aurora_output ClusterEndpoint)
 DB_SECRET_ARN=$(_aurora_output SecretArn)
 DATABASE=$(_aurora_output DatabaseName)
-# 集群 ARN 与数据访问策略：Runtime（会话历史落库，步骤 6/7）与任务管理模块的
-# 两个 Lambda（步骤 9）都要用，统一在这里取
+# 集群 ARN 与数据访问策略：Runtime（会话历史落库，步骤 7/8）与任务管理模块的
+# 两个 Lambda（步骤 10）都要用，统一在这里取
 AURORA_CLUSTER_ARN=$(_aurora_output ClusterArn)
 DATA_POLICY_ARN=$(_aurora_output AgentDataAccessPolicyArn)
 VPC_ID=$(_aurora_output VpcId)
@@ -116,13 +143,15 @@ if [ "$CHAT_TABLES" != "2" ]; then
   exit 1
 fi
 
-echo "==> [1/9] 部署 Keycloak（ECR + ECS Fargate + API Gateway，首次约需 5-8 分钟）..."
+echo "==> [1/10] 部署 Keycloak（ECR + ECS Fargate + API Gateway，首次约需 5-8 分钟）..."
 # 1a. 生成 realm.json（注入机密）并准备构建上下文
 KC_BUILD_DIR="$DEPLOY_DIR/kc-build"
 mkdir -p "$KC_BUILD_DIR"
 cp "$PART2_DIR/infra/keycloak/Dockerfile" "$KC_BUILD_DIR/"
 sed -e "s/__AGENT_CLIENT_SECRET__/$AGENT_CLIENT_SECRET/" \
     -e "s/__ANALYST_PASSWORD__/$ANALYST_PASSWORD/" \
+    -e "s/__VIVIAN_PASSWORD__/$VIVIAN_PASSWORD/" \
+    -e "s/__MARCO_PASSWORD__/$MARCO_PASSWORD/" \
     "$PART2_DIR/infra/keycloak/realm-template.json" > "$KC_BUILD_DIR/realm.json"
 
 # 1b. ECR 仓库 + 构建推送
@@ -200,7 +229,7 @@ if [[ "$ISSUER" != https://* ]]; then
 fi
 echo "    Keycloak 就绪，issuer: $ISSUER"
 
-echo "==> [2/9] 部署分析链路基础设施（CloudFormation）..."
+echo "==> [2/10] 部署分析链路基础设施（CloudFormation）..."
 aws cloudformation deploy \
   --template-file "$PART2_DIR/infra/part2-analytics.yaml" \
   --stack-name "$PART2_STACK" \
@@ -211,16 +240,18 @@ aws cloudformation deploy \
     "PrivateSubnetIds=$PRIVATE_SUBNET_IDS" \
     "LambdaClientSecurityGroupId=$LAMBDA_SG_ID" \
     "DbSecretArn=$DB_SECRET_ARN" \
-    "AnalyticsFunctionName=$LAMBDA_NAME"
+    "AnalyticsFunctionName=$LAMBDA_NAME" \
+    "MemoryFunctionName=$MEMORY_LAMBDA_NAME"
 
 _part2_output() {
   aws cloudformation describe-stacks --stack-name "$PART2_STACK" --region "$REGION" \
     --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
 }
 LAMBDA_ROLE_ARN=$(_part2_output AnalyticsLambdaRoleArn)
+MEMORY_LAMBDA_ROLE_ARN=$(_part2_output MemoryLambdaRoleArn)
 GATEWAY_ROLE_ARN=$(_part2_output GatewayRoleArn)
 
-echo "==> [3/9] 打包并部署数据查询 Lambda（VPC 内直连 Aurora）..."
+echo "==> [3/10] 打包并部署数据查询 Lambda（VPC 内直连 Aurora）..."
 LAMBDA_BUILD_DIR="$DEPLOY_DIR/lambda-build"
 rm -rf "$LAMBDA_BUILD_DIR" && mkdir -p "$LAMBDA_BUILD_DIR"
 cp "$PART2_DIR/infra/analytics-lambda/handler.py" "$LAMBDA_BUILD_DIR/"
@@ -261,7 +292,59 @@ fi
 LAMBDA_ARN=$(aws lambda get-function --function-name "$LAMBDA_NAME" --region "$REGION" \
   --query Configuration.FunctionArn --output text)
 
-echo "==> [4/9] 创建 Gateway + Lambda target（MCP 工具）..."
+echo "==> [4/10] 打包并部署记忆向量 Lambda（mem0 pgvector 数据面）..."
+MEMORY_BUILD_DIR="$DEPLOY_DIR/memory-lambda-build"
+rm -rf "$MEMORY_BUILD_DIR" && mkdir -p "$MEMORY_BUILD_DIR"
+cp "$PART2_DIR/infra/memory-lambda/handler.py" "$MEMORY_BUILD_DIR/"
+pip install -q pg8000 -t "$MEMORY_BUILD_DIR" >/dev/null
+(cd "$MEMORY_BUILD_DIR" && zip -qr "$DEPLOY_DIR/memory-lambda.zip" .)
+
+MEMORY_LAMBDA_ENV="Variables={DB_HOST=$CLUSTER_ENDPOINT,DB_NAME=$DATABASE,DB_SECRET_ARN=$DB_SECRET_ARN}"
+if aws lambda get-function --function-name "$MEMORY_LAMBDA_NAME" --region "$REGION" >/dev/null 2>&1; then
+  aws lambda update-function-code --function-name "$MEMORY_LAMBDA_NAME" --region "$REGION" \
+    --zip-file "fileb://$DEPLOY_DIR/memory-lambda.zip" >/dev/null
+  aws lambda wait function-updated --function-name "$MEMORY_LAMBDA_NAME" --region "$REGION"
+  # vpc-config 一起更新：Aurora 栈重建后让函数收敛回来（与数据查询 Lambda 同款）
+  aws lambda update-function-configuration --function-name "$MEMORY_LAMBDA_NAME" --region "$REGION" \
+    --environment "$MEMORY_LAMBDA_ENV" --timeout 300 --memory-size 512 \
+    --vpc-config "SubnetIds=$PRIVATE_SUBNET_IDS,SecurityGroupIds=$LAMBDA_SG_ID" >/dev/null
+  aws lambda wait function-updated --function-name "$MEMORY_LAMBDA_NAME" --region "$REGION"
+  echo "    已更新 Lambda: $MEMORY_LAMBDA_NAME"
+else
+  # 新建 IAM 角色到 Lambda 可见有延迟，带重试
+  for attempt in $(seq 1 10); do
+    if aws lambda create-function --function-name "$MEMORY_LAMBDA_NAME" --region "$REGION" \
+      --runtime python3.12 --handler handler.lambda_handler \
+      --role "$MEMORY_LAMBDA_ROLE_ARN" \
+      --zip-file "fileb://$DEPLOY_DIR/memory-lambda.zip" \
+      --timeout 300 --memory-size 512 \
+      --vpc-config "SubnetIds=$PRIVATE_SUBNET_IDS,SecurityGroupIds=$LAMBDA_SG_ID" \
+      --environment "$MEMORY_LAMBDA_ENV" >/dev/null 2>/tmp/create_memory_lambda_err; then
+      break
+    fi
+    [ "$attempt" -eq 10 ] && { echo "创建 Lambda 失败:"; cat /tmp/create_memory_lambda_err; exit 1; }
+    echo "    等待 IAM 角色生效后重试（$attempt/10）..."
+    sleep 10
+  done
+  aws lambda wait function-active-v2 --function-name "$MEMORY_LAMBDA_NAME" --region "$REGION"
+  echo "    已创建 Lambda: $MEMORY_LAMBDA_NAME"
+fi
+
+# 初始化 pgvector 扩展并预建记忆表（集群冷恢复最长约 4 分钟，读超时给足；
+# 记忆是增强功能，初始化失败只警告不阻断——create_col 会在首次使用时兜底建表）
+echo "    初始化 pgvector 扩展与记忆表（$MEM0_COLLECTION, vector($MEM0_EMBEDDER_DIMS)）..."
+SETUP_PAYLOAD="{\"op\": \"setup\", \"args\": {\"collection\": \"$MEM0_COLLECTION\", \"dims\": $MEM0_EMBEDDER_DIMS}}"
+if aws lambda invoke --function-name "$MEMORY_LAMBDA_NAME" --region "$REGION" \
+    --cli-binary-format raw-in-base64-out --cli-read-timeout 310 \
+    --payload "$SETUP_PAYLOAD" /tmp/memory_setup_out.json >/dev/null 2>&1 \
+    && grep -q '"status": *"ok"' /tmp/memory_setup_out.json; then
+  echo "    记忆表就绪: $(cat /tmp/memory_setup_out.json)"
+else
+  echo "    ⚠️ 记忆表初始化未成功（$(cat /tmp/memory_setup_out.json 2>/dev/null || echo '无响应')），"
+  echo "       不阻断部署；Agent 首次使用记忆时会自动建表，或稍后手动重试 op=setup"
+fi
+
+echo "==> [5/10] 创建 Gateway + Lambda target（MCP 工具）..."
 GW_AUTH_CONFIG="{\"customJWTAuthorizer\": {\"discoveryUrl\": \"$DISCOVERY_URL\", \"allowedAudience\": [\"analysis-gateway\"]}}"
 # 注意：结果多于一页时 CLI 会按页应用 --query、逐页输出（可能出现多行
 # "None"），需过滤后取第一个真实值
@@ -323,7 +406,7 @@ else
   echo "    复用已有 target: $TARGET_ID（已同步工具 schema）"
 fi
 
-echo "==> [5/9] 创建 Identity OAuth2 credential provider（M2M）..."
+echo "==> [6/10] 创建 Identity OAuth2 credential provider（M2M）..."
 PROVIDER_CONFIG="{\"customOauth2ProviderConfig\": {\"oauthDiscovery\": {\"discoveryUrl\": \"$DISCOVERY_URL\"}, \"clientId\": \"analysis-agent\", \"clientSecret\": \"$AGENT_CLIENT_SECRET\"}}"
 if aws bedrock-agentcore-control get-oauth2-credential-provider --region "$REGION" \
     --name "$IDENTITY_PROVIDER_NAME" >/dev/null 2>&1; then
@@ -340,9 +423,21 @@ else
   echo "    已创建 provider: $IDENTITY_PROVIDER_NAME"
 fi
 
-echo "==> [6/9] 部署分析 Agent 到 Runtime（JWT 入站认证 + 流式）..."
+echo "==> [7/10] 部署分析 Agent 到 Runtime（JWT 入站认证 + 流式）..."
+# 长期记忆（mem0）配置提示：LLM 与 embedding 走 OpenAI 兼容端点，四个必填
+# 变量缺一记忆功能整体禁用（Agent 侧优雅降级，对话正常）
+MEM0_CONFIGURED="true"
+if [ -z "${MEM0_LLM_BASE_URL:-}" ] || [ -z "${MEM0_LLM_API_KEY:-}" ] \
+    || [ -z "${MEM0_LLM_MODEL:-}" ] || [ -z "${MEM0_EMBEDDER_MODEL:-}" ]; then
+  MEM0_CONFIGURED="false"
+  echo "    ⚠️ 未配置 MEM0_LLM_MODEL / MEM0_LLM_BASE_URL / MEM0_LLM_API_KEY /"
+  echo "       MEM0_EMBEDDER_MODEL（四者均必填），长期记忆（mem0）将处于禁用状态；"
+  echo "       需要时 export 后重跑本脚本"
+fi
 RUNTIME_AUTH_CONFIG="{\"customJWTAuthorizer\": {\"discoveryUrl\": \"$DISCOVERY_URL\", \"allowedAudience\": [\"analysis-runtime\"]}}"
 cd "$PART2_DIR/agent"
+# --disable-memory 禁用的是 AgentCore 托管 Memory；本 workshop 的长期记忆是
+# 自建 mem0（memory_backend.py + 记忆向量 Lambda），两者无关
 agentcore configure --entrypoint main.py --name "$AGENT_NAME" --region "$REGION" \
   --requirements-file requirements.txt --non-interactive --disable-memory \
   --authorizer-config "$RUNTIME_AUTH_CONFIG"
@@ -352,12 +447,24 @@ agentcore launch \
   --env AURORA_CLUSTER_ARN="$AURORA_CLUSTER_ARN" \
   --env AURORA_SECRET_ARN="$DB_SECRET_ARN" \
   --env AURORA_DATABASE="$DATABASE" \
+  --env MEMORY_LAMBDA_NAME="$MEMORY_LAMBDA_NAME" \
+  --env MEM0_COLLECTION="$MEM0_COLLECTION" \
+  --env MEM0_EMBEDDER_DIMS="$MEM0_EMBEDDER_DIMS" \
+  ${MEM0_LLM_MODEL:+--env MEM0_LLM_MODEL="$MEM0_LLM_MODEL"} \
+  ${MEM0_LLM_BASE_URL:+--env MEM0_LLM_BASE_URL="$MEM0_LLM_BASE_URL"} \
+  ${MEM0_LLM_API_KEY:+--env MEM0_LLM_API_KEY="$MEM0_LLM_API_KEY"} \
+  ${MEM0_EMBEDDER_MODEL:+--env MEM0_EMBEDDER_MODEL="$MEM0_EMBEDDER_MODEL"} \
+  ${MEM0_EMBEDDER_BASE_URL:+--env MEM0_EMBEDDER_BASE_URL="$MEM0_EMBEDDER_BASE_URL"} \
+  ${MEM0_EMBEDDER_API_KEY:+--env MEM0_EMBEDDER_API_KEY="$MEM0_EMBEDDER_API_KEY"} \
+  ${MEM0_EMBEDDER_PASS_DIMS:+--env MEM0_EMBEDDER_PASS_DIMS="$MEM0_EMBEDDER_PASS_DIMS"} \
+  ${MEM0_SEARCH_TIMEOUT:+--env MEM0_SEARCH_TIMEOUT="$MEM0_SEARCH_TIMEOUT"} \
+  ${MEM0_ADD_TIMEOUT:+--env MEM0_ADD_TIMEOUT="$MEM0_ADD_TIMEOUT"} \
   ${OPENAI_API_KEY:+--env OPENAI_API_KEY="$OPENAI_API_KEY"} \
   ${AWS_BEARER_TOKEN_BEDROCK:+--env AWS_BEARER_TOKEN_BEDROCK="$AWS_BEARER_TOKEN_BEDROCK"} \
   ${MODEL_ID:+--env MODEL_ID="$MODEL_ID"} \
   ${OPENAI_BASE_URL:+--env OPENAI_BASE_URL="$OPENAI_BASE_URL"}
 
-echo "==> [7/9] 附加 Runtime 执行角色所需策略..."
+echo "==> [8/10] 附加 Runtime 执行角色所需策略..."
 ROLE_ARN=$(grep -oE 'arn:aws:iam::[0-9]+:role/[A-Za-z0-9+=,.@_/-]+' .bedrock_agentcore.yaml | head -1 || true)
 ROLE_NAME="${ROLE_ARN##*/}"
 if [ -n "$ROLE_NAME" ]; then
@@ -394,6 +501,11 @@ if [ -n "$ROLE_NAME" ]; then
         \"Effect\": \"Allow\",
         \"Action\": [\"bedrock-mantle:CreateInference\"],
         \"Resource\": \"arn:aws:bedrock-mantle:*:$ACCOUNT_ID:project/*\"
+      }, {
+        \"Sid\": \"Mem0MemoryLambda\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"lambda:InvokeFunction\"],
+        \"Resource\": \"arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$MEMORY_LAMBDA_NAME\"
       }]
     }"
   # 会话历史落库要读写 Aurora（RDS Data API + 读集群 Secret）：直接挂 Part 1
@@ -411,16 +523,17 @@ fi
 AGENT_ARN=$(grep -oE 'arn:aws:bedrock-agentcore:[a-z0-9-]+:[0-9]+:runtime/[A-Za-z0-9_-]+' \
   .bedrock_agentcore.yaml | head -1 || true)
 
-echo "==> [8/9] 生成前端配置 web/.env.local ..."
+echo "==> [9/10] 生成前端配置 web/.env.local ..."
 cat > "$PART2_DIR/web/.env.local" <<EOF
 VITE_KC_URL=$KC_URL
 VITE_KC_REALM=$KC_REALM
 VITE_KC_CLIENT_ID=workshop-web
 VITE_RUNTIME_ARN=$AGENT_ARN
 VITE_AWS_REGION=$REGION
+VITE_MEM0_ENABLED=$MEM0_CONFIGURED
 EOF
 
-echo "==> [9/9] 部署数据摄入任务管理模块（Tasks API + 两个 Lambda + 调度组）..."
+echo "==> [10/10] 部署数据摄入任务管理模块（Tasks API + 两个 Lambda + 调度组）..."
 # 依赖 Part 1 的 Runtime（runner 要调它）与 Aurora 栈输出；Part 1 未部署时
 # 只警告跳过，不让整个 Part 2 部署失败
 PART1_AGENT_CONFIG="$(dirname "$PART2_DIR")/part1_data_ingestion/agent/.bedrock_agentcore.yaml"
@@ -457,6 +570,7 @@ else
         "AgentDataAccessPolicyArn=$DATA_POLICY_ARN" \
         "TasksApiFunctionName=$TASKS_API_NAME" \
         "RunnerFunctionName=$RUNNER_NAME" \
+        "MemoryFunctionName=$MEMORY_LAMBDA_NAME" \
         "AllowedOrigins=$TASKS_ALLOWED_ORIGINS" \
         "ApiEnabled=$1" \
       --no-fail-on-empty-changeset
@@ -513,7 +627,7 @@ else
     "Variables={$AURORA_ENV,PART1_RUNTIME_ARN=$PART1_RUNTIME_ARN}"
   _deploy_tasks_lambda "$TASKS_API_NAME" "$PART2_DIR/infra/tasks-api-lambda/handler.py" \
     "$TASKS_API_ROLE_ARN" 60 256 \
-    "Variables={$AURORA_ENV,RUNNER_FUNCTION_NAME=$RUNNER_NAME,RUNNER_FUNCTION_ARN=$RUNNER_ARN,SCHEDULE_GROUP=$SCHEDULE_GROUP,SCHEDULER_ROLE_ARN=$SCHEDULER_ROLE_ARN}"
+    "Variables={$AURORA_ENV,RUNNER_FUNCTION_NAME=$RUNNER_NAME,RUNNER_FUNCTION_ARN=$RUNNER_ARN,SCHEDULE_GROUP=$SCHEDULE_GROUP,SCHEDULER_ROLE_ARN=$SCHEDULER_ROLE_ARN,MEMORY_LAMBDA_NAME=$MEMORY_LAMBDA_NAME,MEM0_COLLECTION=$MEM0_COLLECTION,MEM0_EMBEDDER_DIMS=$MEM0_EMBEDDER_DIMS}"
 
   # 首轮：函数就绪后补建 HTTP API（路由 + JWT authorizer + 调用许可）
   if [ "$TASKS_API_ENABLED" != "true" ]; then
@@ -529,7 +643,9 @@ echo ""
 echo "✅ Part 2 部署完成！"
 echo ""
 echo "   Keycloak:      $KC_URL（管理台 admin / 密码见 $SECRETS_FILE）"
-echo "   门户测试账号:   analyst / $ANALYST_PASSWORD"
+echo "   门户测试账号:   analyst / $ANALYST_PASSWORD（基线，无预置记忆）"
+echo "                  vivian  / $VIVIAN_PASSWORD（资深买手，跑 seed_memories.py 预置偏好）"
+echo "                  marco   / $MARCO_PASSWORD（风控合规，跑 seed_memories.py 预置偏好）"
 echo "   Gateway:       $GATEWAY_URL"
 echo "   Runtime Agent: $AGENT_ARN"
 if [ -n "${TASKS_API_URL:-}" ]; then

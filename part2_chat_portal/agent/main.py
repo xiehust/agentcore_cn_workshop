@@ -12,9 +12,12 @@
                      即席 SQL）。Lambda 挂在 Aurora 同 VPC 内直连集群——
                      Gateway 侧零 VPC egress 配置。
 - Code Interpreter : 安全沙箱，对查询结果做统计分析 / 衍生计算。
-- Memory（预留）    : 本期不启用 AgentCore Memory（部署时 --disable-memory）。
-                     后续计划接入 AWS 自部署的 mem0 方案记住用户分析偏好，
-                     接入点见 invoke() 里的标注。
+- Memory（自建 mem0）: 不启用 AgentCore 托管 Memory（部署时 --disable-memory）。
+                     长期记忆用自部署 mem0 记住用户分析偏好：会话首轮按用户
+                     检索记忆注入 system prompt（跨会话生效），每轮结束把
+                     对话交 mem0 提取写回。LLM/embedding 走 OpenAI 兼容端点，
+                     向量存 Aurora pgvector（经 VPC 内记忆 Lambda 读写），
+                     见 memory_backend.py。
 
 多轮对话：Runtime 按 session 隔离 microVM，同一 session 的请求落在同一进程，
 用模块级 dict 按 session_id 保存对话历史即可实现会话内多轮；microVM 回收
@@ -38,6 +41,10 @@ from strands.models.openai_responses import OpenAIResponsesModel
 from strands.tools.mcp import MCPClient
 from strands_tools.code_interpreter import AgentCoreCodeInterpreter
 from mcp.client.streamable_http import streamablehttp_client
+
+# 长期记忆（自建 mem0）。模块内部自带降级：mem0 未安装/未配置时 import 不抛错、
+# recall/memorize 变成空操作，对话主链路零影响
+import memory_backend
 
 # ---- 配置（deploy.sh 注入） ----
 REGION = os.environ.get("AWS_REGION", "us-west-2")
@@ -147,8 +154,14 @@ async def _gateway_token() -> str:
 _HISTORY: dict[str, list] = {}
 # 写游标：session_id -> 已落库的消息条数（= 下一条的 seq）
 _PERSISTED_SEQ: dict[str, int] = {}
-# [Memory 预留] 后续接入 mem0（AWS 自部署）时：invoke 开始前按用户检索
-# 长期记忆注入上下文，结束后把本轮对话写回 mem0。本期不实现。
+# 长期记忆（自建 mem0，见 memory_backend.py）的会话级缓存：
+# session_id -> 注入 system prompt 的记忆块（可为空串）。只在会话首轮 recall
+# 一次并缓存整个会话——同一会话内 system prompt 逐字节不变，主模型的
+# prompt cache 前缀才能持续命中；每轮 recall 会把缓存全部打穿。跨会话切换时
+# 新会话首轮重新检索，用户的长期记忆自然延续。
+_MEMORY_SECTION: dict[str, str] = {}
+# session_id -> 会话归属用户（chat_sessions.user_name；None=查不到，不再重查）
+_SESSION_USER: dict[str, str | None] = {}
 
 # ---- 会话历史持久化（chat_messages 表，RDS Data API） ----
 # 全部 best-effort：读失败按空历史继续，写失败只打日志，绝不影响 SSE 流。
@@ -346,6 +359,45 @@ def _persist_new(session_id: str, messages: list) -> None:
             return
 
 
+def _memory_user(session_id: str) -> str | None:
+    """session -> 用户：查 chat_sessions.user_name。
+
+    该列由 tasks-api Lambda 从已验证的 Keycloak JWT 写入（身份可信）——
+    Runtime 自身拿不到用户身份，长期记忆按用户隔离只能走这条反查路径。
+    确认无归属（chat_test.sh 的 smoke-* 会话未注册、本地裸跑无库）缓存
+    None 不再重查；查询异常（多为集群冷恢复）**不缓存**——流尾 memorize
+    再调时集群多半已被本轮对话唤醒，可以补上。best-effort，失败不阻断对话。
+    """
+    if session_id in _SESSION_USER:
+        return _SESSION_USER[session_id]
+    if not _db_enabled():
+        _SESSION_USER[session_id] = None
+        return None
+    try:
+        rows = _db_execute(
+            "SELECT user_name FROM chat_sessions WHERE session_id = :session_id",
+            [_p("session_id", session_id)],
+        )
+    except Exception as e:
+        print(f"[mem0] 查询会话归属失败（本轮跳过记忆，之后重试）: {type(e).__name__}: {e}")
+        return None
+    user = str(rows[0]["user_name"]) if rows and rows[0].get("user_name") else None
+    _SESSION_USER[session_id] = user
+    return user
+
+
+def _render_memory_section(memories: list[str]) -> str:
+    """把检索到的长期记忆渲染成 system prompt 追加块；无记忆返回空串。"""
+    if not memories:
+        return ""
+    lines = "\n".join(f"- {m}" for m in memories)
+    return (
+        "\n\n## 用户长期记忆\n"
+        "以下是该用户在过去会话中沉淀的分析偏好与事实（按相关度排序）。"
+        "回答时自然运用，不要逐条复述，也不要向用户提及记忆系统本身：\n" + lines
+    )
+
+
 @app.entrypoint
 async def invoke(payload: dict, context=None):
     """Runtime 调用入口（流式）。
@@ -367,7 +419,31 @@ async def invoke(payload: dict, context=None):
         _HISTORY[session_id] = history
         _PERSISTED_SEQ[session_id] = len(history)
 
-    token = await _gateway_token()
+    # 长期记忆：只在会话首轮检索一次（与取 Gateway token 并行，耗时被遮蔽）。
+    # 管道 = 反查会话归属 + 语义检索，总预算约 2×MEM0_SEARCH_TIMEOUT；超时/
+    # 无记忆缓存空串且不再重试——空也要缓存，保证本会话 system prompt 逐字节
+    # 稳定、主模型 prompt cache 前缀不被打穿。非首轮零额外调用
+    if session_id not in _MEMORY_SECTION:
+
+        async def _recall_pipeline() -> list[str]:
+            if not memory_backend.enabled():
+                return []  # 记忆未配置/已熔断：连会话归属查询都省掉
+            uid = await asyncio.to_thread(_memory_user, session_id)
+            return await memory_backend.recall(uid, prompt)
+
+        try:
+            token, memories = await asyncio.gather(
+                _gateway_token(),
+                asyncio.wait_for(_recall_pipeline(), timeout=memory_backend.SEARCH_TIMEOUT_S * 2),
+            )
+        except asyncio.TimeoutError:
+            # gather 里只有 wait_for 会抛 TimeoutError；token 任务此时已完成/
+            # 将完成，重取一次命中 Identity token vault 缓存，代价可忽略
+            print("[mem0] 会话首轮记忆管道超时（多为集群冷恢复），本会话无记忆注入")
+            token, memories = await _gateway_token(), []
+        _MEMORY_SECTION[session_id] = _render_memory_section(memories)
+    else:
+        token = await _gateway_token()
     mcp_client = MCPClient(lambda: streamablehttp_client(
         GATEWAY_URL, headers={"Authorization": f"Bearer {token}"}
     ))
@@ -379,7 +455,9 @@ async def invoke(payload: dict, context=None):
         agent = Agent(
             model=_create_model(),
             tools=[*gateway_tools, code_interpreter.code_interpreter],
-            system_prompt=SYSTEM_PROMPT,
+            # 记忆块拼在 SYSTEM_PROMPT 之后，且整个会话固定不变（见 _MEMORY_SECTION）；
+            # 不碰 messages，_HISTORY 与 chat_messages 落库零污染
+            system_prompt=SYSTEM_PROMPT + _MEMORY_SECTION.get(session_id, ""),
             messages=list(_HISTORY.get(session_id, [])),
         )
         async for event in agent.stream_async(prompt):
@@ -388,6 +466,21 @@ async def invoke(payload: dict, context=None):
         _HISTORY[session_id] = agent.messages
         # 落库放在流结束之后：本身是 best-effort，慢一点也不占用回答时延
         await asyncio.to_thread(_persist_new, session_id, agent.messages)
+        # 长期记忆写回：本轮问答交 mem0 做 LLM 事实提取（与既有记忆去重/合并）。
+        # 必须 await——microVM 在响应结束后可能被冻结，fire-and-forget 会丢写；
+        # 代价是 SSE 流关闭最坏再晚 MEM0_ADD_TIMEOUT（默认 20s，正文已全部
+        # 送达，仅前端 busy 态解除变晚；连续失败有熔断兜底）。
+        # 归属带补查：首轮 SELECT 可能跑在前端注册会话的 INSERT 之前（两者并发）
+        # 而缓存下 None——流尾此刻行早已提交、集群也已被本轮唤醒，弹掉缓存
+        # 重查一次，否则整个会话的记忆写入都会静默丢失。真正未注册的会话
+        # （smoke-*）每轮只多付一次流后的 best-effort SELECT，不占回答时延。
+        # 本会话新沉淀的事实对当前会话不注入（上下文在场），下个新会话生效
+        if memory_backend.enabled():
+            if _SESSION_USER.get(session_id) is None:
+                _SESSION_USER.pop(session_id, None)
+            user_id = await asyncio.to_thread(_memory_user, session_id)
+            reply_text = _display_text(agent.messages[-1]) if agent.messages else None
+            await memory_backend.memorize(user_id, prompt, reply_text or "")
 
 
 if __name__ == "__main__":

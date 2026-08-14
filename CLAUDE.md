@@ -45,7 +45,8 @@ aws rds-data execute-statement --resource-arn "$CLUSTER_ARN" --secret-arn "$SECR
 ```
 
 E2E 浏览器验证用本机 Python 版 Playwright（`playwright` CLI 是 pip 装的）；
-门户登录账号 `analyst`，密码在 `part2_chat_portal/.deploy/secrets.env`。
+门户登录账号 `analyst` / `vivian` / `marco`（长期记忆按登录名隔离，后两者由
+`scripts/seed_memories.py` 预置人设记忆），密码在 `part2_chat_portal/.deploy/secrets.env`。
 
 ## 架构
 
@@ -118,7 +119,14 @@ Gateway → Lambda（挂 Aurora 同 VPC，pg8000 直连）→ Aurora
   增量落库。全程 best-effort，DB 异常不阻断 SSE；无 `AURORA_*` 环境变量时降级为
   纯内存。会话元数据由 tasks-api Lambda 的 `/chat` 路由管（`user_name` 取 JWT 的
   `preferred_username`），Runtime 拿不到用户身份，故只管消息不管归属。
-- 部署走 `agentcore configure --disable-memory`（Memory 本期不用，预留 mem0）。
+- 部署走 `agentcore configure --disable-memory`（禁的是 AgentCore 托管 Memory）。
+- **长期记忆是自建 mem0**：mem0 跑在 Runtime 进程内（`agent/memory_backend.py`，
+  LLM 提取与 embedding 走 OpenAI 兼容端点，`MEM0_*` 环境变量注入）；向量读写经
+  `lambda.invoke` 走 VPC 内记忆 Lambda（`infra/memory-lambda/`，pg8000 直连
+  Aurora pgvector）。会话首轮 recall 一次注入 system prompt 并缓存整会话
+  （保 prompt cache 前缀稳定），每轮流结束后 memorize（await，best-effort，
+  绝不阻断 SSE）。user_id 用 session_id 反查 `chat_sessions.user_name`。
+  契约见 `.trellis/spec/backend/mem0-long-term-memory.md`。
 
 ### 文档
 

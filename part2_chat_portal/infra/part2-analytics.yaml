@@ -26,6 +26,10 @@ Parameters:
   AnalyticsFunctionName:
     Type: String
     Default: agentcore-workshop-analytics
+  MemoryFunctionName:
+    Type: String
+    Default: agentcore-workshop-memory
+    Description: mem0 长期记忆向量 Lambda（pgvector 数据面，Runtime 直接 lambda.invoke）
 
 Resources:
   # 数据查询 Lambda 的执行角色：VPC ENI 管理 + 读数据库 Secret
@@ -33,6 +37,30 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: agentcore-workshop-analytics-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Ref DbSecretArn
+
+  # 记忆向量 Lambda 的执行角色：与分析 Lambda 同构（VPC ENI 管理 + 读数据库 Secret）。
+  # 调用方是聊天 Runtime（lambda.invoke 权限在 deploy.sh 步骤 8 加到 Runtime 执行角色），
+  # 不走 Gateway。
+  MemoryLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agentcore-workshop-memory-lambda-role
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -75,7 +103,11 @@ Resources:
 Outputs:
   AnalyticsLambdaRoleArn:
     Value: !GetAtt AnalyticsLambdaRole.Arn
+  MemoryLambdaRoleArn:
+    Value: !GetAtt MemoryLambdaRole.Arn
   GatewayRoleArn:
     Value: !GetAtt GatewayRole.Arn
   AnalyticsFunctionName:
     Value: !Ref AnalyticsFunctionName
+  MemoryFunctionName:
+    Value: !Ref MemoryFunctionName

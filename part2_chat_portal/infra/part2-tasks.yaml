@@ -36,6 +36,10 @@ Parameters:
   RunnerFunctionName:
     Type: String
     Default: agentcore-workshop-ingestion-runner
+  MemoryFunctionName:
+    Type: String
+    Default: agentcore-workshop-memory
+    Description: 记忆向量 Lambda（GET /chat/memories 读当前用户的 mem0 长期记忆）
   AllowedOrigins:
     Type: CommaDelimitedList
     Default: http://localhost:5173
@@ -78,6 +82,11 @@ Resources:
                 Effect: Allow
                 Action: [lambda:InvokeFunction]
                 Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${RunnerFunctionName}
+              # GET /chat/memories：同步调记忆向量 Lambda 的 list op
+              - Sid: InvokeMemoryLambda
+                Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${MemoryFunctionName}
               # 定期任务：在专属调度组内增删改 schedule
               - Sid: ManageSchedules
                 Effect: Allow

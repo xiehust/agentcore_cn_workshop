@@ -30,10 +30,25 @@ export interface ChatMessage {
   created_at: string;
 }
 
+/** 当前用户的一条 mem0 长期记忆（事实文本 + 沉淀时间）。 */
+export interface MemoryItem {
+  id: string;
+  memory: string;
+  created_at: string | null;
+}
+
 /* ================= 接口 ================= */
 
 export function listSessions(): Promise<{ sessions: ChatSession[] }> {
   return request("/chat/sessions");
+}
+
+/**
+ * 当前用户的长期记忆（按沉淀时间倒序）。记忆是增强功能：后端在记忆
+ * Lambda 不可达 / 未配置时降级返回空列表 + degraded 标记，不抛 500。
+ */
+export function listMemories(): Promise<{ memories: MemoryItem[]; degraded?: boolean }> {
+  return request("/chat/memories");
 }
 
 /**
