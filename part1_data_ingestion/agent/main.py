@@ -26,6 +26,7 @@ import re
 
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
+from strands.agent.conversation_manager import SummarizingConversationManager
 from strands.models.openai_responses import OpenAIResponsesModel
 from strands_tools.code_interpreter import AgentCoreCodeInterpreter
 
@@ -109,6 +110,9 @@ def create_agent(browser: ExtendedAgentCoreBrowser | None = None) -> Agent:
 
     return Agent(
         model=model,
+        # 长任务（逐个商品爬页）工具结果体积大，容易撑爆上下文窗口；
+        # 溢出时把最旧的 50% 消息压缩成摘要，而非直接截断丢弃
+        conversation_manager=SummarizingConversationManager(summary_ratio=0.5),
         plugins=[skills_plugin],
         tools=[
             browser.browser,                      # 浏览器工具
