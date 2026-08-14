@@ -64,6 +64,18 @@
   Runtime 进程内缓存 `_SESSION_USER`）。查不到（`smoke-*` 会话、本地
   裸跑）→ 该会话记忆整体跳过。**信 chat_sessions 不信前端**：user_name
   由 tasks-api Lambda 从已验证 JWT 写入（见 chat-sessions-module.md）。
+- **REST 读路径**：`GET /chat/memories`（tasks-api Lambda，与 `/chat/sessions`
+  同一 JWT 信任模型——身份取 `preferred_username`，绝不接受前端传参）→
+  lambda.invoke 记忆 Lambda `list` op `filters={"user_id": <user>}` →
+  映射 `payload.data/created_at` 为 `{memories: [{id, memory, created_at}]}`
+  按时间倒序；记忆 Lambda 不可达降级 `{memories: [], degraded: true}`
+  不抛 500。前端镜像类型在 `web/src/chat/api.ts`（MemoryItem）。
+- **多分析师演示**：Keycloak realm 预置 `analyst`（无预置记忆）/`vivian`/
+  `marco` 三账号；`scripts/seed_memories.py` 给后两者种入偏好事实——
+  **payload 键形复刻 mem0 `_create_memory`**（`data`/`hash`=md5(data)/
+  `created_at`/`updated_at`/`user_id`/`text_lemmatized`），幂等靠脚本侧
+  hash 去重（mem0 `add(infer=False)` 自身无去重）。mem0 升级时种子脚本
+  与 memory_test.sh 一起回归。
 
 ### 4. Contracts
 

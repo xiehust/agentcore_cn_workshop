@@ -17,9 +17,11 @@ import { displayName, logout } from "./auth";
 import ChatView, { QUICK_ACTIONS, type ChatRequest } from "./ChatView";
 import {
   deleteSession,
+  listMemories,
   listSessions,
   renameSession,
   type ChatSession,
+  type MemoryItem,
 } from "./chat/api";
 import { formatRelative } from "./lib/time";
 import TasksView from "./tasks/TasksView";
@@ -44,6 +46,32 @@ export default function App() {
   const [sessions, setSessions] = useState<ChatSession[] | null>(null);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [acting, setActing] = useState<string | null>(null);
+  // 「我的长期记忆」面板：点徽标展开，首次展开才拉取（null=未加载/加载中）
+  const [memOpen, setMemOpen] = useState(false);
+  const [memories, setMemories] = useState<MemoryItem[] | null>(null);
+  const [memHint, setMemHint] = useState<string | null>(null);
+
+  const refreshMemories = useCallback(() => {
+    setMemories(null);
+    setMemHint(null);
+    listMemories()
+      .then((d) => {
+        setMemories(d.memories);
+        if (d.degraded) setMemHint("记忆服务暂不可达（可能在冷启动），稍后重试");
+      })
+      .catch((e: Error) => {
+        setMemories([]);
+        setMemHint(e.message);
+      });
+  }, []);
+
+  const toggleMemories = useCallback(() => {
+    if (!mem0Enabled) return;
+    setMemOpen((open) => {
+      if (!open) refreshMemories();
+      return !open;
+    });
+  }, [refreshMemories]);
 
   const refreshSessions = useCallback(() => {
     listSessions()
@@ -215,17 +243,47 @@ export default function App() {
         </div>
 
         <div className="sidebar-footer">
-          <div
+          {memOpen && mem0Enabled && (
+            <div className="memory-panel">
+              <div className="memory-panel-head">
+                <span>我的长期记忆</span>
+                <button className="memory-refresh" onClick={refreshMemories}>
+                  刷新
+                </button>
+              </div>
+              {memories === null ? (
+                <div className="history-hint">加载中…</div>
+              ) : memories.length === 0 ? (
+                <div className="history-hint">
+                  {memHint ?? "还没有沉淀记忆——聊两句让它记住你的偏好"}
+                </div>
+              ) : (
+                <div className="memory-list">
+                  {memories.map((m) => (
+                    <div key={m.id} className="memory-item">
+                      <span className="memory-text">{m.memory}</span>
+                      {m.created_at && (
+                        <span className="memory-time">{formatRelative(m.created_at)}</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          <button
             className={mem0Enabled ? "memory-note on" : "memory-note"}
+            onClick={toggleMemories}
+            disabled={!mem0Enabled}
             title={
               mem0Enabled
-                ? "基于 AWS 自部署 mem0：跨会话记住你的分析偏好（新会话首轮自动带入，本轮对话结束后自动沉淀）"
+                ? "基于 AWS 自部署 mem0：跨会话记住你的分析偏好（新会话首轮自动带入，本轮对话结束后自动沉淀）。点击查看我的记忆"
                 : "部署时未配置 MEM0_* 环境变量；export 后重跑 deploy.sh 即可启用"
             }
           >
             <BrainIcon size={14} />
-            长期记忆 mem0 · {mem0Enabled ? "已启用" : "未启用"}
-          </div>
+            长期记忆 mem0 · {mem0Enabled ? (memOpen ? "收起" : "已启用") : "未启用"}
+          </button>
           <div className="user-row">
             <span className="avatar">{displayName().slice(0, 1)}</span>
             <span className="user-name">{displayName()}</span>

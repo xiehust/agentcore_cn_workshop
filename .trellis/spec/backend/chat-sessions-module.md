@@ -47,6 +47,8 @@
   - `GET /chat/sessions/{id}/messages?after_seq=N`：seq 升序单页 200 条 +
     `has_more`（Data API 单次 1MB 上限，截断必须显形，前端游标续拉）。
   - `PATCH`（重命名）/`DELETE`（软删，消息保留）。
+  - `GET /chat/memories`（长期记忆读路径，同一 JWT 信任模型）归
+    mem0-long-term-memory.md 管，此处不重复。
 - env（Runtime）：`AURORA_CLUSTER_ARN/AURORA_SECRET_ARN/AURORA_DATABASE`，
   任一缺失 → 持久化整体短路，行为等同纯内存旧版（本地裸跑依赖这一点）。
 - IAM：Runtime 执行角色 attach Part 1 栈输出的 `AgentDataAccessPolicyArn`

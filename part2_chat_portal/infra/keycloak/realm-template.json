@@ -20,6 +20,36 @@
           "temporary": false
         }
       ]
+    },
+    {
+      "username": "vivian",
+      "enabled": true,
+      "firstName": "薇薇安",
+      "lastName": "资深买手",
+      "email": "vivian@example.com",
+      "emailVerified": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "__VIVIAN_PASSWORD__",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "marco",
+      "enabled": true,
+      "firstName": "马可",
+      "lastName": "风控合规",
+      "email": "marco@example.com",
+      "emailVerified": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "__MARCO_PASSWORD__",
+          "temporary": false
+        }
+      ]
     }
   ],
   "clients": [

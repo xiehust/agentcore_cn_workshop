@@ -45,7 +45,8 @@ aws rds-data execute-statement --resource-arn "$CLUSTER_ARN" --secret-arn "$SECR
 ```
 
 E2E 浏览器验证用本机 Python 版 Playwright（`playwright` CLI 是 pip 装的）；
-门户登录账号 `analyst`，密码在 `part2_chat_portal/.deploy/secrets.env`。
+门户登录账号 `analyst` / `vivian` / `marco`（长期记忆按登录名隔离，后两者由
+`scripts/seed_memories.py` 预置人设记忆），密码在 `part2_chat_portal/.deploy/secrets.env`。
 
 ## 架构
 

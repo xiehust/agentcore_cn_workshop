@@ -97,6 +97,12 @@ ANALYST_PASSWORD=$(openssl rand -hex 8)
 EOF
   echo "ℹ️  已生成部署机密: $SECRETS_FILE"
 fi
+# 增量迁移：老部署的 secrets.env 里没有后加的 key，缺哪个补哪个
+# （set -u 下缺 key 会让后面的 sed 注入直接炸掉）
+for demo_user in VIVIAN MARCO; do
+  grep -q "^${demo_user}_PASSWORD=" "$SECRETS_FILE" \
+    || echo "${demo_user}_PASSWORD=$(openssl rand -hex 8)" >> "$SECRETS_FILE"
+done
 # shellcheck disable=SC1090
 source "$SECRETS_FILE"
 
@@ -144,6 +150,8 @@ mkdir -p "$KC_BUILD_DIR"
 cp "$PART2_DIR/infra/keycloak/Dockerfile" "$KC_BUILD_DIR/"
 sed -e "s/__AGENT_CLIENT_SECRET__/$AGENT_CLIENT_SECRET/" \
     -e "s/__ANALYST_PASSWORD__/$ANALYST_PASSWORD/" \
+    -e "s/__VIVIAN_PASSWORD__/$VIVIAN_PASSWORD/" \
+    -e "s/__MARCO_PASSWORD__/$MARCO_PASSWORD/" \
     "$PART2_DIR/infra/keycloak/realm-template.json" > "$KC_BUILD_DIR/realm.json"
 
 # 1b. ECR 仓库 + 构建推送
@@ -562,6 +570,7 @@ else
         "AgentDataAccessPolicyArn=$DATA_POLICY_ARN" \
         "TasksApiFunctionName=$TASKS_API_NAME" \
         "RunnerFunctionName=$RUNNER_NAME" \
+        "MemoryFunctionName=$MEMORY_LAMBDA_NAME" \
         "AllowedOrigins=$TASKS_ALLOWED_ORIGINS" \
         "ApiEnabled=$1" \
       --no-fail-on-empty-changeset
@@ -618,7 +627,7 @@ else
     "Variables={$AURORA_ENV,PART1_RUNTIME_ARN=$PART1_RUNTIME_ARN}"
   _deploy_tasks_lambda "$TASKS_API_NAME" "$PART2_DIR/infra/tasks-api-lambda/handler.py" \
     "$TASKS_API_ROLE_ARN" 60 256 \
-    "Variables={$AURORA_ENV,RUNNER_FUNCTION_NAME=$RUNNER_NAME,RUNNER_FUNCTION_ARN=$RUNNER_ARN,SCHEDULE_GROUP=$SCHEDULE_GROUP,SCHEDULER_ROLE_ARN=$SCHEDULER_ROLE_ARN}"
+    "Variables={$AURORA_ENV,RUNNER_FUNCTION_NAME=$RUNNER_NAME,RUNNER_FUNCTION_ARN=$RUNNER_ARN,SCHEDULE_GROUP=$SCHEDULE_GROUP,SCHEDULER_ROLE_ARN=$SCHEDULER_ROLE_ARN,MEMORY_LAMBDA_NAME=$MEMORY_LAMBDA_NAME,MEM0_COLLECTION=$MEM0_COLLECTION,MEM0_EMBEDDER_DIMS=$MEM0_EMBEDDER_DIMS}"
 
   # 首轮：函数就绪后补建 HTTP API（路由 + JWT authorizer + 调用许可）
   if [ "$TASKS_API_ENABLED" != "true" ]; then
@@ -634,7 +643,9 @@ echo ""
 echo "✅ Part 2 部署完成！"
 echo ""
 echo "   Keycloak:      $KC_URL（管理台 admin / 密码见 $SECRETS_FILE）"
-echo "   门户测试账号:   analyst / $ANALYST_PASSWORD"
+echo "   门户测试账号:   analyst / $ANALYST_PASSWORD（基线，无预置记忆）"
+echo "                  vivian  / $VIVIAN_PASSWORD（资深买手，跑 seed_memories.py 预置偏好）"
+echo "                  marco   / $MARCO_PASSWORD（风控合规，跑 seed_memories.py 预置偏好）"
 echo "   Gateway:       $GATEWAY_URL"
 echo "   Runtime Agent: $AGENT_ARN"
 if [ -n "${TASKS_API_URL:-}" ]; then

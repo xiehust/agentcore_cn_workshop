@@ -145,7 +145,7 @@ export MEM0_EMBEDDER_DIMS=1024                      # 维度决定 pgvector 表�
 
 | 入口 | 地址 | 账号 | 说明 |
 |------|------|------|------|
-| 选品分析门户 | http://localhost:5173 | `analyst`（密码见 `.deploy/secrets.env` 的 `ANALYST_PASSWORD`） | 属于 `agentcore-workshop` realm，只认门户用户 |
+| 选品分析门户 | http://localhost:5173 | 三个分析师：`analyst`（基线，无预置记忆）、`vivian`（资深买手）、`marco`（风控合规）；密码见 `.deploy/secrets.env` 的 `<大写用户名>_PASSWORD` | 属于 `agentcore-workshop` realm，只认门户用户；长期记忆按登录名隔离，多账号用于[记忆对比演示](#长期记忆mem0-自部署) |
 | Keycloak 管理台 | `https://<api-id>.execute-api.<region>.amazonaws.com/admin/`（deploy.sh 输出的 Keycloak 地址 + `/admin/`） | `admin`（密码见 `KC_ADMIN_PASSWORD`） | master realm 管理员，与门户账号不通用；登录后左上角可切到 `agentcore-workshop` realm 管理用户/client |
 
 > 注意：两个入口的账号体系是分开的，用 admin 登门户或用 analyst 登管理台
@@ -220,6 +220,7 @@ tasks-api Lambda**：
 | `GET /chat/sessions/{id}/messages?after_seq=N` | 消息列表，按 `seq` 升序，单页 200 条 + `has_more`（Data API 单次结果 1MB 上限，长会话靠游标续拉，不做静默截断） |
 | `PATCH /chat/sessions/{id}` | 重命名。body：`title` |
 | `DELETE /chat/sessions/{id}` | 软删会话（列表消失），消息保留 |
+| `GET /chat/memories` | 当前用户的 mem0 长期记忆条目（按沉淀时间倒序）；记忆服务不可达时降级返回空列表 + `degraded` 标记 |
 
 ### 页面上的使用
 
@@ -272,6 +273,28 @@ Runtime（分析 Agent + mem0，公网）                VPC 内
 
 完整契约（RPC 协议、表结构、降级矩阵、mem0 版本锁定原因）见
 `.trellis/spec/backend/mem0-long-term-memory.md`。
+
+### 多分析师记忆对比（演示形态）
+
+记忆按登录名隔离，workshop 预置三个分析师账号演示"不同人、不同经验"：
+
+| 账号 | 人设 | 预置记忆 |
+|------|------|---------|
+| `analyst` | 基线 | 无——现场演示"说一句偏好 → 新会话自动生效"的沉淀链路 |
+| `vivian` | 资深买手 | 人民币展示、只看英国站、月销≥50 才纳入、结论先行带表格、高毛利优先 |
+| `marco` | 风控合规 | 英镑原币注汇率、必查认证与材质、评分<3 排除、结论附数据来源、保守表述 |
+
+预置记忆由种子脚本写入（幂等，重复跑不产生重复条目；`--wipe <user>` 可清空重来）：
+
+```bash
+# 环境变量与部署时的 MEM0_* 同一套
+python3 scripts/seed_memories.py
+```
+
+演示：vivian 与 marco 分别登录问同一个问题，回答口径截然不同；点侧栏底部
+「长期记忆 mem0」徽标展开**「我的长期记忆」面板**（`GET /chat/memories`，
+tasks-api 按 JWT 用户过滤后从记忆 Lambda 读取），直接看到当前账号的记忆条目。
+命令行对比：`PORTAL_USER=vivian ./scripts/chat_test.sh '...'`。
 
 ### 验证
 

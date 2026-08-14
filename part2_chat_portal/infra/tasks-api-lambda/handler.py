@@ -40,6 +40,11 @@ RUNNER_FUNCTION_NAME = os.environ.get("RUNNER_FUNCTION_NAME", "")
 RUNNER_FUNCTION_ARN = os.environ.get("RUNNER_FUNCTION_ARN", "")
 SCHEDULE_GROUP = os.environ.get("SCHEDULE_GROUP", "agentcore-workshop-ingestion")
 SCHEDULER_ROLE_ARN = os.environ.get("SCHEDULER_ROLE_ARN", "")
+# 长期记忆（mem0）读路径：GET /chat/memories 直接 invoke 记忆向量 Lambda 的
+# list op（按 JWT 用户过滤）。与 Runtime 侧写路径共用同一套 collection/dims 约定
+MEMORY_LAMBDA_NAME = os.environ.get("MEMORY_LAMBDA_NAME", "")
+MEM0_COLLECTION = os.environ.get("MEM0_COLLECTION", "mem0_ltm")
+MEM0_EMBEDDER_DIMS = int(os.environ.get("MEM0_EMBEDDER_DIMS", "1024") or "1024")
 
 # Live View 画面尺寸：与 Part 1 browser 会话的 viewport、前端 BrowserLiveView
 # 的 remoteWidth/remoteHeight 三处必须一致，否则画面被裁切或留黑边
@@ -151,7 +156,7 @@ def _user_name(event: dict) -> str:
     """从 JWT claims 取登录用户名（会话归属的唯一依据）。
 
     authorizer 已经校验过签名/issuer/audience，claims 可信；Keycloak 的
-    preferred_username 就是登录名（门户账号 analyst）。取不到说明路由挂错了
+    preferred_username 就是登录名（门户账号 analyst/vivian/marco）。取不到说明路由挂错了
     authorizer——宁可 403 也不能把会话落到空用户名下。
     """
     claims = (
@@ -707,11 +712,59 @@ def delete_chat_session(session_id: str, user_name: str) -> dict:
     return _resp(200, {"ok": True})
 
 
+def list_user_memories(user_name: str) -> dict:
+    """当前用户的 mem0 长期记忆条目（按沉淀时间倒序）。
+
+    读路径：lambda.invoke 记忆向量 Lambda 的 list op，payload 里的 data 即
+    记忆文本（键形约定见 .trellis/spec/backend/mem0-long-term-memory.md）。
+    记忆是增强功能：Lambda 未配置/不可达/集群冷恢复时降级返回空列表 +
+    degraded 标记，不给门户抛 500。
+    """
+    if not MEMORY_LAMBDA_NAME:
+        return _resp(200, {"memories": [], "degraded": True})
+    try:
+        resp = _client("lambda").invoke(
+            FunctionName=MEMORY_LAMBDA_NAME,
+            Payload=json.dumps({
+                "op": "list",
+                "args": {
+                    "collection": MEM0_COLLECTION,
+                    "dims": MEM0_EMBEDDER_DIMS,
+                    "filters": {"user_id": user_name},
+                    "top_k": 100,
+                },
+            }).encode("utf-8"),
+        )
+        body = json.loads(resp["Payload"].read())
+        if resp.get("FunctionError") or body.get("status") != "ok":
+            raise RuntimeError(f"memory lambda list 失败: {body}")
+    except Exception as e:
+        print(f"[mem0] 读取用户记忆失败（降级空列表）: {type(e).__name__}: {e}")
+        return _resp(200, {"memories": [], "degraded": True})
+
+    rows = body.get("result") or []
+    memories = [
+        {
+            "id": r.get("id"),
+            "memory": (r.get("payload") or {}).get("data") or "",
+            "created_at": (r.get("payload") or {}).get("created_at"),
+        }
+        for r in rows
+        if (r.get("payload") or {}).get("data")
+    ]
+    # 记忆 Lambda 的 list 无 ORDER BY，这里按沉淀时间倒序（ISO8601 字符串可比）
+    memories.sort(key=lambda m: m.get("created_at") or "", reverse=True)
+    return _resp(200, {"memories": memories})
+
+
 def _dispatch_chat(method: str, segments: list[str], event: dict, params: dict) -> dict:
-    """/chat/... 路由。所有查询都按 JWT 里的用户名过滤（会话不跨用户可见）。"""
+    """/chat/... 路由。所有查询都按 JWT 里的用户名过滤（会话与记忆不跨用户可见）。"""
     user_name = _user_name(event)
     if not user_name:
         return _err(403, "token 缺少 preferred_username claim，无法确定会话归属")
+
+    if segments == ["chat", "memories"] and method == "GET":
+        return list_user_memories(user_name)
 
     if segments[:2] == ["chat", "sessions"]:
         if len(segments) == 2:
