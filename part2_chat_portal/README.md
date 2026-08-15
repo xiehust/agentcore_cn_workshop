@@ -294,7 +294,8 @@ python3 scripts/seed_memories.py
 演示：vivian 与 marco 分别登录问同一个问题，回答口径截然不同；点侧栏底部
 「长期记忆 mem0」徽标展开**「我的长期记忆」面板**（`GET /chat/memories`，
 tasks-api 按 JWT 用户过滤后从记忆 Lambda 读取），直接看到当前账号的记忆条目。
-命令行对比：`PORTAL_USER=vivian ./scripts/chat_test.sh '...'`。
+注意 `chat_test.sh` 的冒烟会话不注册归属用户，记忆的注入与沉淀都不会发生，
+命令行验证记忆请用下面的 `memory_test.sh --e2e`（它会先注册会话）。
 
 ### 验证
 
