@@ -22,12 +22,10 @@
 """
 
 import os
-import re
-
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
 from strands.agent.conversation_manager import SummarizingConversationManager
-from strands.models.openai_responses import OpenAIResponsesModel
+from strands.models.openai import OpenAIModel
 from strands_tools.code_interpreter import AgentCoreCodeInterpreter
 
 from tools.aurora_tools import save_candidate, save_verdict, set_current_run_id
@@ -38,7 +36,8 @@ REGION = os.environ.get("AWS_REGION", "us-west-2")
 MODEL_ID = os.environ.get("MODEL_ID", "openai.gpt-5.6-terra")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://bedrock-mantle.us-east-1.api.aws/openai/v1")
 # 模型认证 key：优先 OPENAI_API_KEY，其次 AWS_BEARER_TOKEN_BEDROCK
-#（Bedrock API key 的标准环境变量）；都未设置则用 IAM 凭证自动铸 token
+#（Bedrock API key 的标准环境变量）。key 必填——IAM 铸 token 分支已删除
+#（中国区无 Bedrock，统一为标准 OpenAI 兼容端点 + key 形态）
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or os.environ.get(
     "AWS_BEARER_TOKEN_BEDROCK"
 )
@@ -77,27 +76,29 @@ def create_agent(browser: ExtendedAgentCoreBrowser | None = None) -> Agent:
     # AgentCore Code Interpreter：沙箱代码执行（经济测算用）
     code_interpreter = AgentCoreCodeInterpreter(region=REGION)
 
-    # GPT-5.6 Terra 只通过 Bedrock 的 OpenAI 兼容端点（bedrock-mantle）提供，
-    # 不走 Converse API。两种认证方式：
-    # - 设置了 OPENAI_API_KEY（须是 Bedrock API key，不是 OpenAI 官网的 sk- key）：
-    #   显式 key + OPENAI_BASE_URL（默认 us-east-1）；
-    # - 未设置：用当前 AWS 凭证（Runtime 的 IAM 角色）为每次请求自动铸造
-    #   bearer token，免 key 管理、不会过期，端点区域从 OPENAI_BASE_URL 解析。
-    if OPENAI_API_KEY:
-        model = OpenAIResponsesModel(
-            model_id=MODEL_ID,
-            client_args={
-                "api_key": OPENAI_API_KEY,
-                "base_url": OPENAI_BASE_URL,
-            },
+    # 模型统一走标准 OpenAI 兼容 Chat Completions：端点 + key + 模型名三元组。
+    # 全球区默认 bedrock-mantle（/chat/completions 已实测可用，key 用 Bedrock
+    # API key）；中国区无 Bedrock，export 区内模型服务商三元组即可。
+    # IAM 铸 token 分支已删除（CN 无等价物），key 必填。
+    if not OPENAI_API_KEY:
+        raise RuntimeError(
+            "缺少模型 API key：请设置 OPENAI_API_KEY（或 AWS_BEARER_TOKEN_BEDROCK，"
+            "使用 Bedrock API key 时），并确认 OPENAI_BASE_URL / MODEL_ID 与之配套"
         )
-    else:
-        m = re.match(r"https://bedrock-mantle\.([a-z0-9-]+)\.api\.aws", OPENAI_BASE_URL)
-        mantle_region = m.group(1) if m else REGION
-        model = OpenAIResponsesModel(
-            model_id=MODEL_ID,
-            bedrock_mantle_config={"region": mantle_region},
-        )
+    # reasoning_effort：gpt-5.6-terra 经 /chat/completions 使用函数工具时必须
+    # 显式置 none（端点 400 明示，实测）。自定义端点缺省不发该参数（严格实现
+    # 可能拒绝未知参数），需要时用 MODEL_REASONING_EFFORT 显式指定
+    model_params: dict = {}
+    reasoning = os.environ.get("MODEL_REASONING_EFFORT")
+    if reasoning:
+        model_params["reasoning_effort"] = reasoning
+    elif "bedrock-mantle" in OPENAI_BASE_URL:
+        model_params["reasoning_effort"] = "none"
+    model = OpenAIModel(
+        model_id=MODEL_ID,
+        client_args={"api_key": OPENAI_API_KEY, "base_url": OPENAI_BASE_URL},
+        params=model_params or None,
+    )
 
     # AgentSkills 插件：加载 skills/ 目录下所有含 SKILL.md 的子目录。
     # 兼容说明：新版 strands 顶层导出 AgentSkills；旧版在 vended_plugins 下。
