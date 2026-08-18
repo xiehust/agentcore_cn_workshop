@@ -30,6 +30,10 @@ Parameters:
     Type: String
     Default: agentcore-workshop-memory
     Description: mem0 长期记忆向量 Lambda（pgvector 数据面，Runtime 直接 lambda.invoke）
+  DbFunctionName:
+    Type: String
+    Default: agentcore-workshop-db
+    Description: Part 2 通用数据面 Lambda（VPC 内 pg8000 直连 Aurora，供 Runtime / tasks-api / runner lambda.invoke）
 
 Resources:
   # 数据查询 Lambda 的执行角色：VPC ENI 管理 + 读数据库 Secret
@@ -44,7 +48,7 @@ Resources:
             Principal: { Service: lambda.amazonaws.com }
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
       Policies:
         - PolicyName: read-db-secret
           PolicyDocument:
@@ -68,7 +72,31 @@ Resources:
             Principal: { Service: lambda.amazonaws.com }
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Ref DbSecretArn
+
+  # 通用数据面 Lambda（db）的执行角色：与分析/记忆 Lambda 同构
+  #（VPC ENI 管理 + 读数据库 Secret）。Data API 退役后 Part 2 的
+  # Runtime / tasks-api / runner 读写 Aurora 统一 lambda.invoke 走它。
+  DbLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agentcore-workshop-db-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
       Policies:
         - PolicyName: read-db-secret
           PolicyDocument:
@@ -98,16 +126,20 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: [lambda:InvokeFunction]
-                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AnalyticsFunctionName}
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AnalyticsFunctionName}
 
 Outputs:
   AnalyticsLambdaRoleArn:
     Value: !GetAtt AnalyticsLambdaRole.Arn
   MemoryLambdaRoleArn:
     Value: !GetAtt MemoryLambdaRole.Arn
+  DbLambdaRoleArn:
+    Value: !GetAtt DbLambdaRole.Arn
   GatewayRoleArn:
     Value: !GetAtt GatewayRole.Arn
   AnalyticsFunctionName:
     Value: !Ref AnalyticsFunctionName
   MemoryFunctionName:
     Value: !Ref MemoryFunctionName
+  DbFunctionName:
+    Value: !Ref DbFunctionName

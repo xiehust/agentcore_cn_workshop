@@ -13,7 +13,7 @@
 # 用法: ./memory_test.sh            # 只跑第 1 部分（快，无 LLM 成本）
 #      ./memory_test.sh --e2e      # 两部分都跑（会产生模型调用费用）
 #
-# 前置：Part 2 已部署（deploy.sh），本机 aws credentials 可调 Lambda 与 rds-data
+# 前置：Part 2 已部署（deploy.sh），本机 aws credentials 可调 Lambda
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -116,21 +116,19 @@ echo "✅ 向量 Lambda 数据面全部通过"
 
 echo ""
 echo "==> [2/2] 端到端跨会话回忆（同一用户 analyst 的两个新会话）..."
-CLUSTER_ARN=$(aws cloudformation describe-stacks --stack-name agentcore-workshop-aurora \
-  --region "$REGION" --query "Stacks[0].Outputs[?OutputKey=='ClusterArn'].OutputValue" --output text)
-SECRET_ARN=$(aws cloudformation describe-stacks --stack-name agentcore-workshop-aurora \
-  --region "$REGION" --query "Stacks[0].Outputs[?OutputKey=='SecretArn'].OutputValue" --output text)
-DATABASE=$(aws cloudformation describe-stacks --stack-name agentcore-workshop-aurora \
-  --region "$REGION" --query "Stacks[0].Outputs[?OutputKey=='DatabaseName'].OutputValue" --output text)
+DB_LAMBDA_NAME="${DB_LAMBDA_NAME:-agentcore-workshop-db}"
 
 SESSION_A="web-$(uuidgen | tr '[:upper:]' '[:lower:]')"
 SESSION_B="web-$(uuidgen | tr '[:upper:]' '[:lower:]')"
-# Runtime 按 chat_sessions.user_name 归属记忆——直接落两行（等价于门户注册会话）
+# Runtime 按 chat_sessions.user_name 归属记忆——经 db Lambda 落两行
+#（等价于门户注册会话；中国区无 RDS Data API，统一走 lambda.invoke）
 for S in "$SESSION_A" "$SESSION_B"; do
-  aws rds-data execute-statement --region "$REGION" \
-    --resource-arn "$CLUSTER_ARN" --secret-arn "$SECRET_ARN" --database "$DATABASE" \
-    --sql "INSERT INTO chat_sessions (session_id, user_name, title) VALUES (:sid, 'analyst', 'memory e2e') ON CONFLICT (session_id) DO NOTHING" \
-    --parameters "[{\"name\": \"sid\", \"value\": {\"stringValue\": \"$S\"}}]" >/dev/null
+  REG_PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'op':'execute','args':{'sql':\"INSERT INTO chat_sessions (session_id, user_name, title) VALUES (:sid, 'analyst', 'memory e2e') ON CONFLICT (session_id) DO NOTHING\",'params':{'sid':sys.argv[1]}}}))" "$S")
+  aws lambda invoke --function-name "$DB_LAMBDA_NAME" --region "$REGION" \
+    --cli-binary-format raw-in-base64-out --cli-read-timeout 310 \
+    --payload "$REG_PAYLOAD" /tmp/memory_e2e_reg.json >/dev/null
+  grep -q '"status": *"ok"' /tmp/memory_e2e_reg.json \
+    || { echo "❌ 会话注册失败: $(cat /tmp/memory_e2e_reg.json)"; exit 1; }
 done
 echo "   会话已注册: A=$SESSION_A  B=$SESSION_B（user=analyst）"
 
@@ -146,6 +144,7 @@ echo "--- 会话 B：询问偏好（预期回复带出会话 A 沉淀的记忆�
 "$SCRIPT_DIR/chat_test.sh" '我之前说过什么分析偏好？' "$SESSION_B"
 echo ""
 echo "==> 人工核对：会话 B 的回复应提到「人民币」与「英国站」。"
-echo "    直查记忆库: aws rds-data execute-statement --resource-arn \"$CLUSTER_ARN\" \\"
-echo "      --secret-arn \"$SECRET_ARN\" --database \"$DATABASE\" --region $REGION \\"
-echo "      --sql \"SELECT payload->>'data' AS memory, payload->>'user_id' AS user FROM $MEM0_COLLECTION\""
+echo "    直查记忆库（记忆向量 Lambda 的 list op）:"
+echo "    aws lambda invoke --function-name $MEMORY_LAMBDA_NAME --region $REGION \\"
+echo "      --cli-binary-format raw-in-base64-out \\"
+echo "      --payload '{\"op\": \"list\", \"args\": {\"collection\": \"$MEM0_COLLECTION\", \"dims\": $DIMS, \"top_k\": 100}}' /dev/stdout"

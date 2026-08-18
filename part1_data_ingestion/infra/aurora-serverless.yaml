@@ -4,8 +4,8 @@ Description: >
   自建 VPC + 两个私有子网：私网访问统一由挂进本 VPC 的 Lambda 承担——
   Part 1 的 Agent 走 lambda.invoke -> 写库 Lambda(VPC) -> pg8000 直连集群，
   Part 2 走 Gateway -> 数据查询 Lambda(VPC) -> 集群，两侧的托管服务都不需要
-  VPC egress。之所以不用 RDS Data API：中国区没有该服务，本 workshop 后续要
-  整体移植过去，先用等效架构在海外区验证。
+  VPC egress。RDS Data API 已整体退役（中国区没有该服务），数据访问统一走
+  VPC 内 Lambda，模板在 aws / aws-cn 两个分区可原样部署。
   Secrets Manager 接口端点归本栈（VPC 拥有者），Part 1/Part 2 的 VPC 内
   Lambda 共用；同一 VPC 同一服务的 Private DNS 端点只能有一个。
 
@@ -24,6 +24,10 @@ Parameters:
     Type: String
     Default: agentcore-workshop-writer
     Description: 写库 Lambda 的函数名（函数本体由 deploy.sh 打包创建，本栈只建角色与授权）
+
+Conditions:
+  # 中国区（aws-cn）的接口端点 ServiceName 带 cn. 前缀
+  IsChinaPartition: !Equals [!Ref "AWS::Partition", aws-cn]
 
 Resources:
   # ---- 网络：私有 VPC（无 IGW/NAT；两个部分的 Lambda 直接挂进来） ----
@@ -58,7 +62,7 @@ Resources:
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
 
   # 集群安全组：仅允许持有 LambdaClientSecurityGroup 的客户端访问 5432
-  #（VPC 内 Lambda 挂 client SG 即可直连；Data API 不走安全组）
+  #（VPC 内 Lambda 挂 client SG 即可直连）
   DbSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -102,13 +106,15 @@ Resources:
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref WorkshopVpc
-      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      ServiceName: !If [IsChinaPartition, !Sub "cn.com.amazonaws.${AWS::Region}.secretsmanager", !Sub "com.amazonaws.${AWS::Region}.secretsmanager"]
       VpcEndpointType: Interface
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
       SecurityGroupIds: [!Ref SecretsEndpointSecurityGroup]
       PrivateDnsEnabled: true
 
-  # ---- Aurora Serverless v2（PostgreSQL）+ Data API ----
+  # ---- Aurora Serverless v2（PostgreSQL）----
+  # 不开 RDS Data API（EnableHttpEndpoint）：Data API 已整体退役（中国区无此服务），
+  # 数据访问统一走 VPC 内 Lambda（pg8000 直连集群）。
   AuroraCluster:
     Type: AWS::RDS::DBCluster
     DeletionPolicy: Delete
@@ -118,7 +124,6 @@ Resources:
       DatabaseName: !Ref DatabaseName
       MasterUsername: postgres
       ManageMasterUserPassword: true          # 密码托管在 Secrets Manager
-      EnableHttpEndpoint: true                # RDS Data API：Part 2 与 CLI 查数仓仍在用
       ServerlessV2ScalingConfiguration:
         MinCapacity: !Ref MinCapacityACU
         MaxCapacity: !Ref MaxCapacityACU
@@ -148,7 +153,7 @@ Resources:
             Principal: { Service: lambda.amazonaws.com }
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
       Policies:
         - PolicyName: read-db-secret
           PolicyDocument:
@@ -170,37 +175,11 @@ Resources:
           - Sid: InvokeWriterLambda
             Effect: Allow
             Action: [lambda:InvokeFunction]
-            Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${WriterFunctionName}
-
-  # ---- RDS Data API 访问策略：现在只服务 Part 2 ----
-  # Part 2 的 Runtime（会话历史落库）与 tasks-api / runner 两个 Lambda 都挂它
-  #（part2-tasks.yaml 按 ARN 引用）。Part 1 已改走写库 Lambda，不再挂这份。
-  # ManagedPolicyName 不可改：改名会触发 replacement，而删除仍附着在
-  # Part 2 各角色上的旧 policy 会失败。Part 2 迁出 Data API 后本策略可删。
-  AgentDataAccessPolicy:
-    Type: AWS::IAM::ManagedPolicy
-    Properties:
-      ManagedPolicyName: agentcore-workshop-agent-data-access-aurora
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: AuroraDataApi
-            Effect: Allow
-            Action:
-              - rds-data:ExecuteStatement
-              - rds-data:BatchExecuteStatement
-              - rds-data:BeginTransaction
-              - rds-data:CommitTransaction
-              - rds-data:RollbackTransaction
-            Resource: !Sub arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${AuroraCluster}
-          - Sid: ReadDbSecret
-            Effect: Allow
-            Action: [secretsmanager:GetSecretValue]
-            Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+            Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${WriterFunctionName}
 
 Outputs:
   ClusterArn:
-    Value: !Sub arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${AuroraCluster}
+    Value: !GetAtt AuroraCluster.DBClusterArn
   SecretArn:
     Value: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
   DatabaseName:
@@ -208,9 +187,6 @@ Outputs:
   # Part 1 Runtime 执行角色挂这份（调写库 Lambda）
   AgentWriterInvokePolicyArn:
     Value: !Ref AgentWriterInvokePolicy
-  # Data API 访问策略：Part 2 的 Runtime 与两个任务管理 Lambda 挂这份
-  AgentDataAccessPolicyArn:
-    Value: !Ref AgentDataAccessPolicy
   WriterLambdaRoleArn:
     Value: !GetAtt WriterLambdaRole.Arn
   WriterFunctionName:

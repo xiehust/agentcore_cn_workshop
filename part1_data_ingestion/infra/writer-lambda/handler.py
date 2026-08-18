@@ -13,7 +13,7 @@ analytics Lambda 同构（Gateway -> Lambda(VPC) -> Aurora），共同验证
 子网无 IGW/NAT）。
 
 请求协议（event）：
-    {"op": "save_verdict" | "save_candidate" | "setup_tables",
+    {"op": "save_verdict" | "save_candidate" | "setup_tables" | "check_tables",
      "args": {…工具入参原样…},
      "run_id": "uuid 或 null"}
 响应：
@@ -208,6 +208,28 @@ def save_candidate(args: dict, run_id: str | None) -> dict:
     return {"status": "ok", "detail": args.get("product_name_cn")}
 
 
+def check_tables(args: dict, _run_id: str | None) -> dict:
+    """只读预检：确认给定表是否都已存在（Part 2 部署脚本用——中国区没有
+    RDS Data API，预检不能再走 aws rds-data，改为 invoke 本函数）。
+
+    入参 args: {"tables": ["chat_sessions", ...]}
+    响应 detail: {"expected": N, "found": M, "missing": [...]}
+    """
+    tables = [str(t) for t in (args.get("tables") or []) if str(t).strip()]
+    if not tables:
+        return {"status": "error", "error": "缺少 tables 入参"}
+    rows = _run(
+        "SELECT tablename FROM pg_tables WHERE tablename = ANY(:names)",
+        names=tables,
+    )
+    found = {r[0] for r in (rows or [])}
+    missing = [t for t in tables if t not in found]
+    return {
+        "status": "ok",
+        "detail": {"expected": len(tables), "found": len(found), "missing": missing},
+    }
+
+
 def setup_tables(_args: dict, _run_id: str | None) -> dict:
     """建表：执行随部署包一起打进来的 setup_tables.sql（不吃入参，签名对齐 OPS 分发）。
 
@@ -228,6 +250,7 @@ OPS = {
     "save_verdict": save_verdict,
     "save_candidate": save_candidate,
     "setup_tables": setup_tables,
+    "check_tables": check_tables,
 }
 
 
