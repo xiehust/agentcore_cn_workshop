@@ -35,15 +35,22 @@ AgentCore Runtime（公网，不挂 VPC）── Strands Agent + 选品 SOP Skil
 ## 前置条件
 
 ```bash
-# 1. AWS 凭证已配置，区域 us-west-2，且已开通 Bedrock OpenAI GPT-5.6 模型访问
+# 1. AWS 凭证已配置，区域由 AWS_REGION 指定（海外 us-west-2 / 中国 cn-northwest-1）；
+#    全球区需已开通 Bedrock OpenAI GPT-5.6 模型访问
 aws sts get-caller-identity
 
-# 2. 模型认证：设置 AWS_BEARER_TOKEN_BEDROCK（Bedrock API key 的标准环境变量，
-#    控制台 Bedrock -> API keys 生成）即可；也支持 OPENAI_API_KEY（优先级更高，
-#    注意须是 Bedrock API key，不是 OpenAI 官网的 sk- key）。
-#    两者都不设置时，Agent 用 Runtime IAM 角色自动铸 token（需要
-#    bedrock-mantle:CreateInference 权限，deploy.sh 已附加）
+# 2. 模型认证（必填，二选一）。模型统一走标准 OpenAI 兼容 Chat Completions
+#   （Strands 的 OpenAIModel），由三元组 OPENAI_BASE_URL / OPENAI_API_KEY /
+#    MODEL_ID 控制：
+#    - 全球区默认 bedrock-mantle 端点：设置 AWS_BEARER_TOKEN_BEDROCK
+#      （Bedrock API key 的标准环境变量，控制台 Bedrock -> API keys 生成）即可；
+#      也支持 OPENAI_API_KEY（优先级更高，注意须是 Bedrock API key，
+#      不是 OpenAI 官网的 sk- key，deploy.sh 会 fail-fast 校验 ABSK 前缀）
+#    - 中国区 / 自定义端点：export 三元组指向任意 OpenAI 兼容服务
 export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>
+# export OPENAI_BASE_URL=<OpenAI 兼容端点>/v1
+# export OPENAI_API_KEY=<key>
+# export MODEL_ID=<模型名>
 
 # 3. 安装部署工具链（本 demo 的脚本用 Python 版 CLI 验证过。官方另有 npm 版
 #    @aws/agentcore，但子命令不同——它没有 configure，若装在 PATH 前面会遮蔽
@@ -140,25 +147,22 @@ deploy.sh。
 ## 验证入库结果
 
 ```bash
-# 查最近 10 条判定记录
-# 集群/Secret ARN 从 CloudFormation 输出获取
-CLUSTER_ARN=$(aws cloudformation describe-stacks --stack-name agentcore-workshop-aurora \
-  --region us-west-2 --query "Stacks[0].Outputs[?OutputKey=='ClusterArn'].OutputValue" --output text)
-SECRET_ARN=$(aws cloudformation describe-stacks --stack-name agentcore-workshop-aurora \
-  --region us-west-2 --query "Stacks[0].Outputs[?OutputKey=='SecretArn'].OutputValue" --output text)
-# rds-data 同步返回结果，无需轮询
-aws rds-data execute-statement --resource-arn "$CLUSTER_ARN" --secret-arn "$SECRET_ARN" \
-  --database product_hunting --region us-west-2 \
-  --sql "SELECT verdict, reason, product_title, product_score FROM selection_verdicts ORDER BY created_at DESC LIMIT 10"
+# 查最近 10 条判定记录（经 VPC 内 db Lambda 查询，同步返回结果）
+aws lambda invoke --function-name agentcore-workshop-db --region "$AWS_REGION" \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"op":"execute","args":{"sql":"SELECT verdict, reason, product_title, product_score FROM selection_verdicts ORDER BY created_at DESC LIMIT 10","params":{}}}' \
+  /dev/stdout
 
 # 查候选档案
-# ... --sql "SELECT product_name_cn, product_score, ai_summary FROM product_candidates ORDER BY created_at DESC" ...
+# ... "sql":"SELECT product_name_cn, product_score, ai_summary FROM product_candidates ORDER BY created_at DESC" ...
 ```
 
-也可以在 RDS 控制台的 Query Editor（Data API）里直接查询。
-
-> 写入已经不走 Data API 了（见常见问题），但集群的 Data API 仍然开着：命令行
-> 查数仓、RDS 控制台 Query Editor、以及 Part 2 的会话落库与 tasks-api 都还在用。
+> RDS Data API 已整体退役（中国区无此服务，集群不再开启 HTTP 端点），RDS 控制台的
+> Query Editor 也随之不可用：命令行查数仓、Part 2 的会话落库与 tasks-api 全部统一
+> 经 VPC 内的 db Lambda（`agentcore-workshop-db`，随 Part 2 的 deploy.sh 部署；
+> 还没部署 Part 2 时可先跳过本节，数据一直在库里）。要用交互式客户端
+> （psql / DBeaver 等）需经堡垒机进入 VPC 直连集群，日常验收用上面的
+> `lambda invoke` 即可。
 
 ## 本地调试（不部署 Runtime）
 
@@ -168,10 +172,10 @@ python ../scripts/local_test.py "从 eBay 英国站搜索 desk organizer，对�
 ```
 
 Agent 本体跑在本机，但 Browser / Code Interpreter / 写库 Lambda 仍是云端服务
-（本机凭证需要 `bedrock-agentcore:*`、对写库 Lambda 的 `lambda:InvokeFunction`
-及 `bedrock:InvokeModel` 权限；数据库凭证本机拿不到也不需要。模型调用默认用
-本机 AWS 凭证自动铸 token，也可 `export OPENAI_API_KEY=<Bedrock API key>`
-显式指定）。
+（本机凭证需要 `bedrock-agentcore:*` 和对写库 Lambda 的 `lambda:InvokeFunction`
+权限；数据库凭证本机拿不到也不需要。模型认证与部署时相同、key 必填：
+`export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>`，或三元组
+`OPENAI_BASE_URL` / `OPENAI_API_KEY` / `MODEL_ID` 指向自定义 OpenAI 兼容端点）。
 
 另一种本地方式是 Runtime 本地容器模拟：
 
@@ -211,17 +215,18 @@ agentcore invoke -l '{"prompt": "..."}'
   不编造数据"。
 - **为什么入库要绕一个写库 Lambda，不直接用 RDS Data API**：Data API 是
   HTTPS 接口，Agent 不挂 VPC 就能写库，本来最省事——但**中国区
-  （cn-north-1 / cn-northwest-1）没有这个服务**。本 workshop 后续要整体移植到
-  中国区，所以数据面提前换成两边都可用的形态：Agent 仍留在公网（不挂 VPC），
+  （cn-north-1 / cn-northwest-1）没有这个服务**。本 workshop 要在两个分区
+  可原样部署，所以数据面统一用两边都可用的形态：Agent 仍留在公网（不挂 VPC），
   私网访问全部由挂在 Aurora 同 VPC 的 Lambda 承担，Agent 只做一次
   `lambda.invoke`。这和 Part 2 的「Gateway → Lambda(VPC) → Aurora」是同一个
   设计哲学（AgentCore Gateway 也不支持 VPC egress），只是调用方不同。
   顺带收敛了权限：Runtime 执行角色从「rds-data 五个 Action + 读集群 Secret」
   变成只有对写库 Lambda 的 `lambda:InvokeFunction`，Agent 不再接触数据库凭证。
-  移植到中国区时要改的已知差异：接口端点服务名前缀变
-  `cn.com.amazonaws.<region>.secretsmanager`，ARN 分区变 `arn:aws-cn:`。
-  Part 2 各处的 Data API 调用是后续独立任务。完整差异清单（含模型、镜像、
-  区域域名）见根 README 的「中国区移植说明」。
+  Part 2 各处的 Data API 调用也已全部迁到 VPC 内 db Lambda，全链路零
+  Data API 依赖；分区（`arn:aws-cn:`）、域名后缀与接口端点服务名前缀
+  （`cn.com.amazonaws.<region>.secretsmanager`）已在模板里按区域自动推导，
+  切 `AWS_REGION` 即可。完整差异清单（含模型、镜像、区域域名）见根 README 的
+  「中国区移植说明」。
 - **建表为什么也走 Lambda**：`setup_tables.sql` 随部署包打进写库 Lambda，
   deploy.sh 用 `aws lambda invoke '{"op": "setup_tables"}'` 建表，本地无需
   数据库客户端也无需 Data API，部署链路同样零 Data API 依赖。DDL 全是
@@ -240,11 +245,11 @@ agentcore invoke -l '{"prompt": "..."}'
   `PATH="<仓库路径>/.venv/bin:$PATH" bash scripts/deploy.sh`。
 - **调用超时**：完整处理一个商品（详情页 + 竞品调研 + 测算 + 入库）约 2~5 分钟，
   建议每次调用处理 1~3 个商品；批量场景用 EventBridge 定时分批触发。
-- **想换模型**：部署前 `export MODEL_ID=<模型ID>` 再跑 deploy.sh（或部署时加
-  `--env MODEL_ID=<模型ID>`），仅限 bedrock-mantle（OpenAI 兼容）端点上的模型；
-  换端点区域用 `OPENAI_BASE_URL` 覆盖（默认 us-east-1）。换用 Converse API
-  模型（如 Claude）需把 `agent/main.py` 里的 `OpenAIResponsesModel` 换回
-  `BedrockModel`。中国区移植时：区内没有 Bedrock（也没有 bedrock-mantle），
-  改用任意 OpenAI 兼容的 Chat Completions 模型服务——模型类换成 Strands 的
-  `OpenAIModel`，`OPENAI_BASE_URL` / `MODEL_ID` / `OPENAI_API_KEY` 指向区内
-  服务商的兼容端点即可。
+- **想换模型**：模型统一是 Strands 的 `OpenAIModel`（标准 OpenAI 兼容
+  Chat Completions），由三元组 `OPENAI_BASE_URL` / `OPENAI_API_KEY` /
+  `MODEL_ID` 控制。全球区默认 bedrock-mantle 端点（us-east-1），部署前
+  `export MODEL_ID=<模型ID>` 再跑 deploy.sh（或部署时加
+  `--env MODEL_ID=<模型ID>`）即可换该端点上的模型。中国区（区内没有 Bedrock，
+  也没有 bedrock-mantle）或自建网关：把三元组整体指向任意 OpenAI 兼容的
+  Chat Completions 服务，代码零改动。换用 Converse API 模型（如 Claude）
+  需把 `agent/main.py` 里的 `OpenAIModel` 换成 `BedrockModel`。

@@ -15,14 +15,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 常用命令
 
-区域固定 `us-west-2`。模型认证：`export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>`
-（ABSK 前缀）。注意 `OPENAI_API_KEY` 优先级更高，环境里残留 OpenAI 官网 `sk-` key
-会导致模型 401（deploy.sh 会检测并忽略非 ABSK 前缀的值）。
+区域是唯一开关：海外 `AWS_REGION=us-west-2`、中国 `cn-northwest-1`——部署脚本
+按区域自动推导分区（`arn:aws-cn`）、域名后缀（`.amazonaws.com.cn`）与 SDK 端点
+覆盖。模型统一标准 OpenAI 兼容 Chat Completions（三元组 env）：全球区默认
+bedrock-mantle，`export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>`（ABSK 前缀）；
+中国区/自定义端点 `export OPENAI_BASE_URL + OPENAI_API_KEY + MODEL_ID`。key 必填，
+deploy.sh 做 fail-fast 校验（未配 BASE_URL 时 key 必须 ABSK；显式配了 BASE_URL
+则信任成对 key，但指向 localhost/私网 IP 直接拒绝——注意部署机环境卫生，公网
+残留 BASE_URL 仍会被原样采用）。gpt-5.6-terra 经 /chat/completions 用函数工具
+必须 `reasoning_effort=none`（端点硬约束），Agent 对默认 mantle 端点自动带上；
+自定义端点缺省不发该参数，需要时 `export MODEL_REASONING_EFFORT` 显式指定。
 
 ```bash
 # Part 1：部署（Aurora + 写库 Lambda + 建表 + Browser/Profile + Runtime），幂等可重跑
 cd part1_data_ingestion && bash scripts/deploy.sh
 # Part 1：调用（单商品 2~5 分钟）
+# 中国区注意：deploy.sh 会自动覆盖 SDK 端点，但 agentcore invoke/status、
+# local_test.py 这类交互命令要先 source scripts/cn_env.sh（海外区是空操作）
 cd part1_data_ingestion/agent && agentcore invoke '{"prompt": "..."}'
 # Part 1：本地跑 Agent（Browser/CI/Aurora 仍在云端）
 python scripts/local_test.py "..."
@@ -39,9 +48,10 @@ npm run build                                            # tsc -b && vite build�
 # Part 2：命令行冒烟（token → 流式调用 Runtime；第二个参数传 session id 做多轮）
 ./scripts/chat_test.sh '看下最近30天的选品漏斗' [session-id]
 
-# 查数仓（Data API 只剩「查」和 Part 2 在用；ARN 从 agentcore-workshop-aurora 栈输出取）
-aws rds-data execute-statement --resource-arn "$CLUSTER_ARN" --secret-arn "$SECRET_ARN" \
-  --database product_hunting --region us-west-2 --sql "SELECT ..."
+# 查数仓（RDS Data API 已整体退役——中国区没有；统一经 VPC 内通用数据面 Lambda）
+aws lambda invoke --function-name agentcore-workshop-db --region "$AWS_REGION" \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"op": "execute", "args": {"sql": "SELECT ...", "params": {}}}' /dev/stdout
 ```
 
 E2E 浏览器验证用本机 Python 版 Playwright（`playwright` CLI 是 pip 装的）；
@@ -65,26 +75,26 @@ Part 1 的 `infra/setup_tables.sql` 幂等建出：业务两表 `selection_verdi
 调用方 → Runtime（Strands Agent）→ Browser 爬 eBay / Code Interpreter 测算 →
 `lambda.invoke` 写库 Lambda（挂 Aurora 同 VPC，pg8000 直连）入库（Agent 不挂 VPC）。
 
-- **写库不走 RDS Data API**：中国区没有 Data API，本 workshop 后续要整体移植，
-  数据面提前换成两边都可用的形态（与 Part 2 的 Gateway → Lambda(VPC) → Aurora
-  同一哲学：计算留公网，私网访问全交 VPC 内 Lambda）。写库 Lambda
+- **数据面零 RDS Data API**：中国区没有 Data API（已实证），全仓数据访问统一
+  「计算留公网，私网访问全交 VPC 内 Lambda」形态（与 Part 2 的 Gateway →
+  Lambda(VPC) → Aurora 同一哲学）。写库 Lambda
   （`infra/writer-lambda/handler.py`）实现 `save_verdict` / `save_candidate` /
-  `setup_tables` 三个 op，`aurora_tools.py` 只剩薄壳；建表也是 deploy.sh
-  `aws lambda invoke op=setup_tables`（`setup_tables.sql` 打进 zip，按分号拆句，
-  **不得引入 dollar-quoted 块**）。超时链：handler 重连上限 240s < Lambda
-  timeout 300s < Agent boto3 read_timeout 310s（Agent 侧禁用 boto3 重试）。
+  `setup_tables` / `check_tables` 四个 op，`aurora_tools.py` 只剩薄壳；建表也是
+  deploy.sh `aws lambda invoke op=setup_tables`（`setup_tables.sql` 打进 zip，
+  按分号拆句，**不得引入 dollar-quoted 块**）。超时链：handler 重连上限 240s <
+  Lambda timeout 300s < Agent boto3 read_timeout 310s（Agent 侧禁用 boto3 重试）。
   Runtime 执行角色只有对写库 Lambda 的 `lambda:InvokeFunction`
-  （栈输出 `AgentWriterInvokePolicyArn`）；集群 `EnableHttpEndpoint` 保留，
-  `AgentDataAccessPolicy`（rds-data）如今只服务 Part 2 的 Runtime 与两个
-  tasks Lambda，Part 2 迁完才能删。
+  （栈输出 `AgentWriterInvokePolicyArn`）。**RDS Data API 已整体退役**
+  （中国区没有）：Part 2 的会话历史/任务表统一走通用数据面 Lambda
+  `agentcore-workshop-db`（`infra/db-lambda/handler.py`，op=execute），集群
+  `EnableHttpEndpoint` 与 `AgentDataAccessPolicy` 已删除。
 - **业务 SOP 用 Skill 插拔**：Agent 本体（`agent/main.py`）只有通用能力；选品规则
   全在 `agent/skills/*/SKILL.md`。新增场景 = 新增 Skill 目录，不改 Agent 代码。
-- **模型**：`OpenAIResponsesModel` 走 bedrock-mantle 的 OpenAI 兼容端点
-  （默认 `openai.gpt-5.6-terra`，端点在 us-east-1）。换 Converse 系模型需改回
-  `BedrockModel`。中国区移植时区内无 Bedrock：改用 OpenAI 兼容 Chat
-  Completions 服务（模型类换 Strands 的 `OpenAIModel`，
-  `OPENAI_BASE_URL`/`MODEL_ID`/`OPENAI_API_KEY` 指区内端点）；
-  完整差异清单见根 README「中国区移植说明」。
+- **模型**：统一 Strands `OpenAIModel`（标准 OpenAI 兼容 Chat Completions），
+  三元组 `OPENAI_BASE_URL`/`MODEL_ID`/`OPENAI_API_KEY` env 注入。全球区默认
+  bedrock-mantle 端点（默认 `openai.gpt-5.6-terra`，key 用 Bedrock API key）；
+  中国区指区内模型服务商端点。IAM 铸 token 路径已删除，key 必填。
+  完整移植状态见根 README「中国区移植说明」。
 - **Browser**：自定义 browser 开 Web Bot Auth（请求签名过 Cloudflare/Akamai 反爬），
   Profile 跨会话保留 cookies。亚马逊对数据中心 IP 硬封锁，默认站点是 eBay。
 
@@ -116,7 +126,8 @@ Gateway → Lambda（挂 Aurora 同 VPC，pg8000 直连）→ Aurora
   （≥33 字符），会话内多轮历史存 Runtime microVM 的模块级 dict。
 - **会话持久化**：microVM 内存命中就零 DB 读；miss（回收后 / 换实例）时
   `agent/main.py` 从 `chat_messages` 回灌完整 Strands 消息（含工具轮），流结束后
-  增量落库。全程 best-effort，DB 异常不阻断 SSE；无 `AURORA_*` 环境变量时降级为
+  增量落库（SQL 经 VPC 内通用数据面 Lambda `agentcore-workshop-db` 执行）。
+  全程 best-effort，DB 异常不阻断 SSE；无 `DB_LAMBDA_NAME` 环境变量时降级为
   纯内存。会话元数据由 tasks-api Lambda 的 `/chat` 路由管（`user_name` 取 JWT 的
   `preferred_username`），Runtime 拿不到用户身份，故只管消息不管归属。
 - 部署走 `agentcore configure --disable-memory`（禁的是 AgentCore 托管 Memory）。

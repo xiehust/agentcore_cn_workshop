@@ -45,14 +45,17 @@
     `ORDER BY COALESCE(最后消息时间, updated_at) DESC`；`last_message_at` 可空、
     `message_count` 不含纯工具轮。
   - `GET /chat/sessions/{id}/messages?after_seq=N`：seq 升序单页 200 条 +
-    `has_more`（Data API 单次 1MB 上限，截断必须显形，前端游标续拉）。
+    `has_more`（lambda.invoke 响应 6MB 上限，截断必须显形，前端游标续拉）。
   - `PATCH`（重命名）/`DELETE`（软删，消息保留）。
   - `GET /chat/memories`（长期记忆读路径，同一 JWT 信任模型）归
     mem0-long-term-memory.md 管，此处不重复。
-- env（Runtime）：`AURORA_CLUSTER_ARN/AURORA_SECRET_ARN/AURORA_DATABASE`，
-  任一缺失 → 持久化整体短路，行为等同纯内存旧版（本地裸跑依赖这一点）。
-- IAM：Runtime 执行角色 attach Part 1 栈输出的 `AgentDataAccessPolicyArn`
-  （与任务管理两个 Lambda 同一份），deploy.sh 第 7 步幂等 attach。
+- env（Runtime）：`DB_LAMBDA_NAME`（通用数据面 Lambda 函数名），缺失 →
+  持久化整体短路，行为等同纯内存旧版（本地裸跑依赖这一点）。SQL 经
+  `{"op":"execute","args":{"sql","params"}}` 协议 lambda.invoke 执行——
+  RDS Data API 已退役（中国区没有）。
+- IAM：Runtime 执行角色对 db Lambda 与记忆 Lambda 的 `lambda:InvokeFunction`
+  （deploy.sh 步骤 8 的 `DataPlaneLambdas` 语句）；tasks-api / runner 的
+  `InvokeDbLambda` 在 part2-tasks.yaml。
 
 ### 4. Validation & Error Matrix
 
@@ -72,7 +75,7 @@
 
 - Good：门户发消息 → 流结束落库 → 强停 runtime session → 同 id 追问
   「刚才那个漏斗」→ 回灌后回答接得上（已实测：强停后答出前文的 41.7%）。
-- Base：本地 `python main.py` 裸跑（无 AURORA_* env）→ 纯内存多轮，无报错无落库。
+- Base：本地 `python main.py` 裸跑（无 DB_LAMBDA_NAME env）→ 纯内存多轮，无报错无落库。
 - Bad：前端自己写消息进库（丢工具轮，回灌失真）；Lambda 信前端传的 user_name
   （越权）；回灌不做配对完整性检查（喂给模型非法序列，模型直接拒答，会话
   永久聊不动）。

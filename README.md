@@ -64,32 +64,42 @@ Part 1 的核心思路是 **"Agent 框架不变，业务逻辑用 Skill 插拔"*
 ## 中国区移植说明
 
 AgentCore 在中国区（`cn-north-1` / `cn-northwest-1`）尚未上线。本 workshop
-先在海外区（`us-west-2`）用等效架构验证，**架构层面已提前对齐中国区可用的形态**，
-上线后按下面的清单移植即可。
+先在海外区（`us-west-2`）用等效架构验证，**代码层面的移植改动已全部完成**：
+两个分区共用同一套代码，区域代码（`AWS_REGION`）是唯一开关。
 
-**已就绪、无需改动的设计**：
+**已完成、两分区通用的形态**：
 
-- **数据面不依赖 RDS Data API**（中国区没有该服务）：Part 1 的 Agent 写库与
-  建表都走「lambda.invoke → VPC 内写库 Lambda → pg8000 直连」，两边通用。
+- **数据面零 RDS Data API**（中国区没有该服务，已实证）：Part 1 走写库 Lambda；
+  Part 2 的会话历史（Runtime）、任务表（tasks-api / runner）统一经通用数据面
+  Lambda（`agentcore-workshop-db`，`op=execute` 协议、pg8000 直连），部署预检
+  走写库 Lambda 的 `check_tables`。集群 `EnableHttpEndpoint` 与
+  `AgentDataAccessPolicy` 已删除。
+- **模型统一标准 OpenAI 兼容端点 + key**：两个 Agent 都用 Strands `OpenAIModel`
+  （Chat Completions），`OPENAI_BASE_URL` / `OPENAI_API_KEY` / `MODEL_ID` 三元组
+  env 注入。全球区默认 bedrock-mantle（其 `/chat/completions` 已实测可用，
+  key 用 Bedrock API key）；中国区 export 区内模型服务商的三元组即可，
+  IAM 铸 token 路径已移除。gpt-5.6-terra 在 `/chat/completions` 上用函数工具
+  必须 `reasoning_effort=none`（端点硬约束），Agent 对默认 mantle 端点自动
+  处理；自定义端点缺省不发该参数，可用 `MODEL_REASONING_EFFORT` 显式指定。
+- **分区/域名全模板化**：CloudFormation 统一 `${AWS::Partition}` /
+  `${AWS::URLSuffix}`（含 AWS 托管策略 ARN 与 VPC 端点服务名的
+  `cn.com.amazonaws` 前缀 Condition）；部署脚本按区域推导
+  `PARTITION` / `AWS_DOMAIN`，并在 cn-* 分支自动 export
+  `BEDROCK_AGENTCORE_CP_ENDPOINT` / `DP_ENDPOINT` 覆盖 SDK 内置端点。
 - **Gateway 零 VPC egress**：私网访问全部由 VPC 内 Lambda 承担，不依赖
   Gateway 的 VPC 出口能力。
 - **认证自部署 Keycloak**（中国区没有 Cognito）：OIDC 全链路不依赖海外托管服务。
-- **长期记忆自部署 mem0**（不用 AgentCore 托管 Memory）：向量存 Aurora
-  pgvector、经 VPC 内 Lambda 读写（与写库/分析 Lambda 同构）；mem0 的事实
-  提取 LLM 与 embedding 本来就走 OpenAI 兼容端点（`MEM0_*` 环境变量），
-  中国区只需把端点指向区内模型服务商，向量面零改动。唯一注意点：换
-  embedding 模型时若维度变化，需换 `MEM0_COLLECTION` 重建向量表。
+- **长期记忆自部署 mem0**：向量存 Aurora pgvector、经 VPC 内 Lambda 读写；
+  提取 LLM 与 embedding 走 OpenAI 兼容端点（`MEM0_*` 环境变量），中国区换
+  端点即可。换 embedding 模型若维度变化，需换 `MEM0_COLLECTION` 重建向量表。
 
-**移植时需要处理的差异**（AgentCore 中国区上线后）：
+**AgentCore 中国区上线后仍需处理的事项**：
 
-| 差异点 | 说明 |
+| 事项 | 说明 |
 |--------|------|
-| Part 2 残留的 Data API 调用 | 会话历史落库/回灌（`part2_chat_portal/agent/main.py`）、tasks-api / runner 两个 Lambda、部署脚本的建表预检，共 5 个文件。按 Part 1 写库 Lambda 的同款模式迁移；迁完可关集群 `EnableHttpEndpoint`、删 `AgentDataAccessPolicy` |
-| ARN 分区前缀 | 模板与脚本里约 30 处硬编码 `arn:aws:`，中国区是 `arn:aws-cn:`。CloudFormation 内建议统一改 `${AWS::Partition}`（含 `AWSLambdaVPCAccessExecutionRole` 这类 AWS 托管策略 ARN），脚本内拼接同理 |
-| 区域与域名 | 默认区域 `us-west-2` 散在两个 deploy.sh 与 agent 代码默认值里；API Gateway 等服务域名后缀变为 `.amazonaws.com.cn` |
-| VPC 接口端点服务名 | `com.amazonaws.<region>.secretsmanager` → 中国区前缀不同：`cn.com.amazonaws.<region>.secretsmanager` |
-| 模型 | 中国区没有 Bedrock。改用任意 OpenAI 兼容的 Chat Completions 模型服务即可：模型类从 `OpenAIResponsesModel` 换成 Strands 的 `OpenAIModel`（Chat Completions），`OPENAI_BASE_URL` / `MODEL_ID` / `OPENAI_API_KEY` 本来就走环境变量，指向区内模型服务商的兼容端点即可 |
-| 镜像与外网可达性 | Keycloak 基础镜像来自 `quay.io`，中国区构建前先转存到区内 ECR；Browser 出网爬 eBay 等境外站点的网络可达性需实测 |
+| Keycloak 基础镜像转存 | 镜像来自 `quay.io`，中国区构建前先转存到区内 ECR（`docker pull` → 区内 ECR push，deploy.sh 构建段配合改 build-arg） |
+| 出网可达性实测 | Browser 出网爬 eBay 等境外站点在中国区的链路质量与反爬挑战需实测；Web Bot Auth（预览特性）若中国区首发不含需降级 |
+| 上线验证清单 | Aurora PG 引擎小版本目录、starter-toolkit 对 aws-cn 的支持、Browser Live View（DCV 直播）是否随首发、`bedrock-agentcore.amazonaws.com` 服务 principal 写法——均以中国区实际发布为准逐项验证 |
 
 ## 目录结构
 
@@ -136,9 +146,11 @@ AgentCore 在中国区（`cn-north-1` / `cn-northwest-1`）尚未上线。本 wo
 
 ## 前置条件
 
-- AWS 账号，区域建议 `us-west-2`（AgentCore 目前在部分区域可用）
-- 已在 Bedrock 控制台开通 OpenAI GPT-5.6 模型访问权限，并生成 Bedrock API key
-  （Part 1 默认模型 `openai.gpt-5.6-terra` 走 bedrock-mantle 端点，
-  `export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>`；不设置则用
-  IAM 角色自动铸 token）
+- AWS 账号。区域是唯一开关：海外 `us-west-2`、中国区 `cn-northwest-1`
+  （`AWS_REGION` 驱动分区/域名等全部差异）
+- 模型（标准 OpenAI 兼容 Chat Completions，key 必填）：全球区在 Bedrock
+  控制台开通 OpenAI GPT-5.6 并生成 Bedrock API key
+  （`export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>`，默认走
+  bedrock-mantle 端点）；中国区 export
+  `OPENAI_BASE_URL + OPENAI_API_KEY + MODEL_ID` 指区内 OpenAI 兼容服务
 - Python 3.10+，配置好 AWS 凭证（`aws configure`）

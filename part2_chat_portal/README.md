@@ -33,7 +33,8 @@ AgentCore Runtime（分析 Agent，Strands SDK，SSE 流式）
    │
    ├──▶ Code Interpreter：统计分析、衍生计算
    │
-   └──▶ RDS Data API ──▶ chat_messages（对话逐轮落库；沙箱回收后回灌恢复上下文）
+   └──▶ lambda.invoke ──▶ db Lambda（Aurora 同 VPC，pg8000）──▶ chat_messages
+             （对话逐轮落库；沙箱回收后回灌恢复上下文）
 ```
 
 **本部分要验证的关键设计**：Gateway 侧**不使用 VPC egress**——私网访问全部由挂在
@@ -59,13 +60,15 @@ Aurora 同 VPC 内的 Lambda 承担（`Gateway → Lambda(VPC) → Aurora(同 VP
 part2_chat_portal/
 ├── agent/                        # 分析 Agent（部署到 AgentCore Runtime）
 │   ├── main.py                   # 流式入口 + Identity M2M + Gateway MCP 工具
-│   │                             #   + 会话历史落库/回灌（RDS Data API）
+│   │                             #   + 会话历史落库/回灌（经 VPC 内 db Lambda）
 │   ├── memory_backend.py         # 长期记忆：mem0 封装 + 自定义向量后端
 │   │                             #   （向量操作 RPC 到 VPC 内记忆 Lambda）
 │   └── requirements.txt
 ├── infra/
 │   ├── keycloak/                 # 自部署 Keycloak（Dockerfile + realm 模板）
 │   ├── analytics-lambda/         # 数据查询 Lambda（pg8000 直连 Aurora）
+│   ├── db-lambda/                # 通用数据面 db Lambda（pg8000 直连 Aurora，
+│   │                             #   供 Runtime/tasks-api/runner 读写，替代 Data API）
 │   ├── memory-lambda/            # 记忆向量 Lambda（mem0 pgvector 数据面）
 │   ├── part2-analytics.yaml      # CloudFormation：Lambda/Gateway 角色
 │   │                             #   （Secrets VPC 端点归 Part 1 的 Aurora 栈）
@@ -91,14 +94,22 @@ part2_chat_portal/
 前置：Part 1 已部署（依赖其 Aurora 栈）；本机有 Docker；模型认证同 Part 1。
 
 ```bash
-export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>   # 或依赖 IAM 自动铸 token
+export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>   # 全球区默认 bedrock-mantle
+# 中国区 / 自定义端点：改为三元组指向任意 OpenAI 兼容 Chat Completions 服务
+# export OPENAI_BASE_URL=<OpenAI 兼容端点>/v1
+# export OPENAI_API_KEY=<key>
+# export MODEL_ID=<模型名>
 ./scripts/deploy.sh
 ```
 
+模型 key 必填，脚本会 fail-fast 校验（未配 `OPENAI_BASE_URL` 时 key 必须是
+ABSK 前缀的 Bedrock API key；显式配了 `OPENAI_BASE_URL` 则信任成对的 key，
+但指向 localhost/私网 IP 会被直接拒绝——公网 Runtime 访问不到）。
+
 脚本幂等，可重复执行。首次部署约 10 分钟，共 10 步：Keycloak（1）→ 分析链路
-基础设施与数据查询 Lambda（2-3）→ 记忆向量 Lambda 与 pgvector 初始化（4）→
+基础设施与数据查询 Lambda（2-3）→ 记忆向量 Lambda 与通用数据面 db Lambda（4）→
 Gateway 与工具注册（5）→ Identity credential provider（6）→ 分析 Agent 到
-Runtime（7-8）→ 前端配置（9）→ 数据摄入任务管理模块（10）。部署机密
+Runtime 并附加角色策略（7-8）→ 前端配置（9）→ 数据摄入任务管理模块（10）。部署机密
 （Keycloak admin 密码、demo 账号密码、M2M client secret）生成后存放在
 `.deploy/secrets.env`（已 gitignore）。
 
@@ -127,17 +138,18 @@ export MEM0_EMBEDDER_DIMS=1024                      # 维度决定 pgvector 表�
 
 会话历史相关的三处部署动作：
 
-- 脚本开头**预检** `chat_sessions` / `chat_messages` 两表（查询带冷恢复重试）。
-  缺表就地失败并提示回 Part 1 重跑 `deploy.sh` 建表——与其部署完再排查
-  `/chat` 接口 500、Runtime 每轮落库报错，不如先失败。
-- 第 6 步 `agentcore launch` 给 Runtime 注入
-  `AURORA_CLUSTER_ARN` / `AURORA_SECRET_ARN` / `AURORA_DATABASE`（值取自 Part 1
-  的 Aurora 栈输出）。
-- 第 7 步给 Runtime 执行角色 attach Part 1 栈输出的数据访问托管策略
-  （`AgentDataAccessPolicyArn`，与任务管理模块的两个 Lambda 同一份权限）。
+- 脚本开头**预检** `chat_sessions` / `chat_messages` 两表（经 Part 1 写库
+  Lambda 的只读 `check_tables` op，中国区没有 Data API，此刻本部分的 db Lambda
+  还没部署）。缺表就地失败并提示回 Part 1 重跑 `deploy.sh` 建表——与其部署完
+  再排查 `/chat` 接口 500、Runtime 每轮落库报错，不如先失败。
+- 第 7 步 `agentcore launch` 给 Runtime 注入 `DB_LAMBDA_NAME`（会话历史的
+  读写全部经这只 VPC 内的 db Lambda，Runtime 不再接触集群 ARN 与凭证）。
+- 第 8 步给 Runtime 执行角色附加对 db Lambda 与记忆向量 Lambda 的
+  `lambda:InvokeFunction` 内联策略（Data API 时代的托管策略
+  `AgentDataAccessPolicy` 已随之退役）。
 
-后两项由脚本无条件执行、天然幂等；本地裸跑 Agent（没有这些环境变量）时对话
-功能不受影响，只是历史退化为纯内存（等同旧行为）。
+后两项由脚本无条件执行、天然幂等；本地裸跑 Agent（没有 `DB_LAMBDA_NAME`
+环境变量）时对话功能不受影响，只是历史退化为纯内存（等同旧行为）。
 
 ## 使用
 
@@ -177,7 +189,8 @@ tasks-api Lambda**：
                  │ ① 沙箱内存里没有该会话时，按 seq 回灌 chat_messages（含工具轮）
                  │ ② 流结束后把本轮新增的消息增量写回
                  ▼
-             RDS Data API（Runtime 不挂 VPC）──▶ Aurora
+             lambda.invoke ──▶ VPC 内 db Lambda（pg8000 直连）──▶ Aurora
+             （Runtime 自身不挂 VPC；中国区没有 RDS Data API，两个分区统一走这条链路）
 
 读取 / 管理：SPA ──▶ Tasks HTTP API 的 /chat/* ──▶ tasks-api Lambda ──▶ Aurora
              （与任务管理模块同一个 API、同一个 Lambda、同一个 JWT authorizer）
@@ -192,8 +205,9 @@ tasks-api Lambda**：
 - **存全量 Strands message**。`chat_messages.content` 是消息原样 JSON（含
   `toolUse` / `toolResult`），回灌保真；前端回看用的是另一列 `display_text`
   （text block 拼接），纯工具轮该列为 NULL，读接口过滤掉。
-- **落库绝不阻断聊天**。任何 DB 异常只打日志，SSE 流照常返回；没有 `AURORA_*`
-  环境变量时（例如本地裸跑）整体降级为纯内存历史，行为等同这个功能上线之前。
+- **落库绝不阻断聊天**。任何 DB 异常只打日志，SSE 流照常返回；没有
+  `DB_LAMBDA_NAME` 环境变量时（例如本地裸跑）整体降级为纯内存历史，
+  行为等同这个功能上线之前。
 - **回灌会修尾**。库里若存着不完整的轮次（例如上次落库中途失败，工具调用没有
   对应结果），回灌时把这段尾巴丢掉并顺手从表里删除——留着它们会占住后续消息的
   `seq`，被唯一索引静默挡掉。这样交给模型的消息序列始终合法。
@@ -217,7 +231,7 @@ tasks-api Lambda**：
 |------------|------|
 | `POST /chat/sessions` | 注册会话，幂等：已存在则 touch `updated_at` 并把软删状态恢复 `active`（删掉当前会话后又继续聊，应重新可见）。body：`session_id`、`title`；id 已属于别的用户时 409 |
 | `GET /chat/sessions` | 当前用户的会话列表，按最后活动倒序（最多 200 条）；带 `last_message_at`（会话还没消息时为空）和 `message_count`（不含纯工具轮） |
-| `GET /chat/sessions/{id}/messages?after_seq=N` | 消息列表，按 `seq` 升序，单页 200 条 + `has_more`（Data API 单次结果 1MB 上限，长会话靠游标续拉，不做静默截断） |
+| `GET /chat/sessions/{id}/messages?after_seq=N` | 消息列表，按 `seq` 升序，单页 200 条 + `has_more`（Lambda 响应有 6MB 上限，长会话靠游标续拉，不做静默截断） |
 | `PATCH /chat/sessions/{id}` | 重命名。body：`title` |
 | `DELETE /chat/sessions/{id}` | 软删会话（列表消失），消息保留 |
 | `GET /chat/memories` | 当前用户的 mem0 长期记忆条目（按沉淀时间倒序）；记忆服务不可达时降级返回空列表 + `degraded` 标记 |
@@ -305,13 +319,18 @@ tasks-api 按 JWT 用户过滤后从记忆 Lambda 读取），直接看到当前
 
 或者直接在门户里体验：会话 A 告诉它"以后金额都换算成人民币，我只关注英国站"，
 新建会话 B 问"看下最近 30 天的选品漏斗"——回答应默认按人民币与英国站口径。
-直查记忆库：
+直查记忆库（经 VPC 内 db Lambda，SQL 里有单引号，payload 写进文件最省事）：
 
 ```bash
-aws rds-data execute-statement --resource-arn "$CLUSTER_ARN" --secret-arn "$SECRET_ARN" \
-  --database product_hunting --region us-west-2 \
-  --sql "SELECT payload->>'data' AS memory, payload->>'user_id' AS user_name FROM mem0_ltm"
+cat > /tmp/query.json <<'EOF'
+{"op": "execute", "args": {"sql": "SELECT payload->>'data' AS memory, payload->>'user_id' AS user_name FROM mem0_ltm", "params": {}}}
+EOF
+aws lambda invoke --function-name agentcore-workshop-db --region "$AWS_REGION" \
+  --cli-binary-format raw-in-base64-out --payload file:///tmp/query.json /dev/stdout
 ```
+
+也可以 invoke 记忆向量 Lambda 的 `list` op（`memory_test.sh` 末尾会打印现成的
+命令，含 collection 与维度参数）。
 
 ## 数据摄入任务管理模块
 
@@ -329,7 +348,7 @@ Tasks HTTP API（API Gateway HTTP API + JWT authorizer + CORS）
    │  ② 校验 Keycloak issuer 与 audience，未带有效 token 直接 401
    ▼
 tasks-api Lambda（python3.12，无 VPC）
-   │  · 任务/运行/事件/结果 CRUD：RDS Data API 读写（同 Part 1 的入库方式）
+   │  · 任务/运行/事件/结果 CRUD：lambda.invoke → VPC 内 db Lambda（pg8000）读写
    │  · 定期任务：EventBridge Scheduler 建/改/删 schedule
    │  · Live View：服务端 SigV4 预签 URL（AWS 凭证不下发浏览器）
    │
@@ -349,9 +368,10 @@ tasks-api Lambda（python3.12，无 VPC）
 
 - **前端只有 Keycloak token**。调 Part 1 Runtime 需要的 SigV4 由 runner Lambda
   用自身执行角色代签，所以 Part 1 不必挂 JWT authorizer，命令行用法得以保留。
-- **两个 Lambda 都不进 VPC**，走 RDS Data API。既避开分析侧 Lambda 的只读会话
-  限制（那个 Lambda 显式设了 `default_transaction_read_only=on`），也免去 VPC
-  出口配置。
+- **两个 Lambda 都不进 VPC**，数据读写统一经 `lambda.invoke` 交给 VPC 内的
+  db Lambda（与 Runtime 的会话历史同一条链路）。既避开分析侧数据查询 Lambda 的
+  只读会话限制（那个 Lambda 显式设了 `default_transaction_read_only=on`），
+  也免去这两个函数自身的 VPC 出口配置。
 - **并发靠 session 隔离**。每次运行分配独立的 Runtime session id
   （`ingest-run-<run_id>`，满足 ≥33 字符要求），对应各自的 microVM，多个任务
   同时跑不会互相污染历史或浏览器会话。
@@ -377,7 +397,7 @@ tasks-api Lambda（python3.12，无 VPC）
 | tasks-api Lambda | `agentcore-workshop-tasks-api`（python3.12，60 秒 / 256MB） |
 | runner Lambda | `agentcore-workshop-ingestion-runner`（python3.12，900 秒 / 512MB） |
 | 调度组 | `agentcore-workshop-ingestion`（每个定期任务一个 schedule，名字就是 `task_id`） |
-| 前端配置 | `web/.env.local` 追加 `VITE_TASKS_API_URL=https://<api-id>.execute-api.<region>.amazonaws.com` |
+| 前端配置 | `web/.env.local` 追加 `VITE_TASKS_API_URL=https://<api-id>.execute-api.<region>.amazonaws.com`（域名后缀由脚本按分区生成，中国区为 `.amazonaws.com.cn`） |
 
 首轮部署会看到该栈被部署两次：两个 Lambda 的执行角色由栈创建，而 HTTP API 的
 Lambda 调用许可要等函数存在才能建，脚本因此先用 `ApiEnabled=false` 建角色和调度组，
@@ -444,13 +464,13 @@ Lambda 调用许可要等函数存在才能建，脚本因此先用 `ApiEnabled=
   start-dev + `--import-realm`（realm 配置烧进镜像，重启自动恢复）；若容器
   收不到 `X-Forwarded-Proto` 导致 issuer 变 http，deploy.sh 会自动设置
   `KC_HOSTNAME` 强制 https。
-- **Aurora 冷恢复**：集群 MinCapacity=0 空闲自动暂停，Lambda 首次连接会触发恢复
-  （15 秒~1 分钟），连接层带重试；首个问题偶尔偏慢属正常现象。两个任务管理
-  Lambda 走 RDS Data API，同样带 `DatabaseResumingException` 退避重试。Runtime
-  侧的会话历史读写把重试上限收紧到 20 秒——回灌等不起一分钟，超时就按空历史继续，
-  宁可丢上下文也不挂住请求。
-- **超大消息裁剪**：单条消息 JSON 超过 300KB（Data API 单参数 512KB 留余量）时
-  降级为只存文本的裁剪版，极端场景丢的是工具明细，回灌链路不会断。
+- **Aurora 冷恢复**：集群 MinCapacity=0 空闲自动暂停，首次连接会触发恢复
+  （15 秒~1 分钟）；首个问题偶尔偏慢属正常现象。冷恢复重连收敛在 db Lambda
+  内部（上限 240 秒 < 其 Lambda 超时 300 秒），各调用方按自己等得起的时长设
+  invoke 超时：tasks-api 55 秒、runner 70 秒，Runtime 侧的会话历史读写收紧到
+  30 秒——回灌等不起一分钟，超时就按空历史继续，宁可丢上下文也不挂住请求。
+- **超大消息裁剪**：单条消息 JSON 超过 300KB（`lambda.invoke` 请求 6MB，
+  留足余量）时降级为只存文本的裁剪版，极端场景丢的是工具明细，回灌链路不会断。
 - **Live View 的前端集成**：`bedrock-agentcore` 包里的 `BrowserLiveView` 写的是
   `import dcv from "dcv"` / `dcv-ui`，这两个裸 specifier 没有对应 npm 包，指的是
   包内 vendored 的 Amazon DCV Web SDK——`vite.config.ts` 用 `resolve.alias` 指过去，
@@ -480,15 +500,18 @@ Lambda 调用许可要等函数存在才能建，脚本因此先用 `ApiEnabled=
 - **每轮回答完输入框要多等几秒才解锁**：正常——流结束后 mem0 在做本轮的
   记忆提取（LLM 调用），必须等它写完 Runtime 才能安全冻结沙箱。典型几秒、
   最坏 `MEM0_ADD_TIMEOUT`（默认 20s）；提取连续失败 3 次会自动熔断停付。
-- **想清空某用户的长期记忆**：直接删行即可
+- **想清空某用户的长期记忆**：直接删行即可——经 db Lambda 执行
   `DELETE FROM mem0_ltm WHERE payload->>'user_id' = '<用户名>'`
-  （rds-data execute-statement，库表见上文「长期记忆」节）。
+  （invoke 形态同上文「验证」节的直查示例：
+  `{"op":"execute","args":{"sql":"DELETE ...","params":{}}}`，
+  库表见「长期记忆」节）。
 - **侧栏「历史会话」不显示，或回看旧会话后追问不认前文**：这两个症状对应链路的
   两端。列表空说明读侧有问题——`GET /chat/sessions` 是不是 401/403（token 过期，
   或 token 里没有 `preferred_username`），以及会话是否真的注册过（CLI 会话不注册）。
-  追问丢上下文说明写侧没落库，按顺序查：Runtime 有没有
-  `AURORA_CLUSTER_ARN` / `AURORA_SECRET_ARN` 环境变量（`agentcore status` 或控制台
-  看运行时配置）、执行角色有没有挂 Part 1 的数据访问策略、数仓里两张表是否存在
+  追问丢上下文说明写侧没落库，按顺序查：Runtime 有没有 `DB_LAMBDA_NAME`
+  环境变量（`agentcore status` 或控制台看运行时配置）、执行角色有没有对
+  db Lambda 的 `lambda:InvokeFunction` 权限（deploy.sh 第 8 步附加）、
+  数仓里两张表是否存在
   （`SELECT COUNT(*) FROM pg_tables WHERE tablename IN ('chat_sessions','chat_messages')`）。
   落库失败只打日志不影响回答，所以界面上不会报错，日志在 Runtime 的 CloudWatch
   日志组里。重跑 Part 1 的 deploy.sh 建表、再重跑本脚本可一并修好后两项。
@@ -501,6 +524,7 @@ Lambda 调用许可要等函数存在才能建，脚本因此先用 `ApiEnabled=
   ```bash
   TOKEN=$(./scripts/get_token.sh)
   ARN_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('<Runtime ARN>', safe=''))")
+  # 域名按分区：全球区 .amazonaws.com，中国区 .amazonaws.com.cn
   curl -X POST "https://bedrock-agentcore.<region>.amazonaws.com/runtimes/$ARN_ENC/stopruntimesession" \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     -H "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id: <session id>" -d '{}'
