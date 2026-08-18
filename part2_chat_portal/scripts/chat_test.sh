@@ -15,11 +15,13 @@ SESSION_ID="${2:-smoke-$(uuidgen)}"
 TOKEN=$("$SCRIPT_DIR/get_token.sh")
 ESCAPED_ARN=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$RUNTIME_ARN")
 PAYLOAD=$(python3 -c "import json, sys; print(json.dumps({'prompt': sys.argv[1]}))" "$PROMPT")
+# 域名后缀按分区推导（中国区 .amazonaws.com.cn）
+case "$REGION" in cn-*) AWS_DOMAIN="amazonaws.com.cn" ;; *) AWS_DOMAIN="amazonaws.com" ;; esac
 
 echo "session: $SESSION_ID"
 # -N 关闭缓冲，SSE 增量实时打印
 curl -sN -X POST \
-  "https://bedrock-agentcore.$REGION.amazonaws.com/runtimes/$ESCAPED_ARN/invocations?qualifier=DEFAULT" \
+  "https://bedrock-agentcore.$REGION.$AWS_DOMAIN/runtimes/$ESCAPED_ARN/invocations?qualifier=DEFAULT" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id: $SESSION_ID" \

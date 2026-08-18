@@ -178,7 +178,7 @@ try:
         collection_name: str = "mem0_ltm"
         embedding_model_dims: int = 1024
         function_name: str = "agentcore-workshop-memory"
-        region: str = "us-west-2"
+        region: str = REGION  # 单点取自 AWS_REGION，不留第二份硬编码默认
 
     # 共享 lambda client：Runtime 与 Lambda 走 AWS 内网 API，禁重试
     # （对齐 Part 1 aurora_tools.py：重试只会放大尾延迟；insert 有 UUID

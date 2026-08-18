@@ -6,7 +6,8 @@
 #   2. 部署分析链路基础设施（CloudFormation：Lambda/Gateway 角色；
 #      取凭证用的 Secrets Manager VPC 端点归 Part 1 的 Aurora 栈）
 #   3. 打包并部署数据查询 Lambda（挂进 Aurora VPC，pg8000 直连 5432）
-#   4. 打包并部署记忆向量 Lambda（mem0 长期记忆的 pgvector 数据面，同 VPC），
+#   4. 打包并部署记忆向量 Lambda（mem0 pgvector 数据面）与通用数据面 db Lambda
+#     （会话历史/任务表读写，Data API 的替代——中国区没有 RDS Data API），
 #      并初始化 pgvector 扩展与记忆表
 #   5. 创建 Gateway（JWT 认证）+ Lambda target（MCP 工具）
 #   6. 创建 Identity OAuth2 credential provider（Agent 访问 Gateway 的 M2M）
@@ -17,7 +18,9 @@
 #      EventBridge Scheduler 调度组），并把 API 地址补进 web/.env.local
 #
 # 前置：Part 1 已部署（依赖其 Aurora 栈输出）；本机有 docker；
-#      模型认证同 Part 1（export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>）
+#      模型认证同 Part 1：默认 bedrock-mantle（export AWS_BEARER_TOKEN_BEDROCK=
+#      <Bedrock API key>），或 export OPENAI_BASE_URL + OPENAI_API_KEY + MODEL_ID
+#      指向任意 OpenAI 兼容 Chat Completions 端点（中国区形态）
 #      长期记忆（mem0）需要 OpenAI 兼容端点，部署前 export（缺省则记忆功能禁用，
 #      对话不受影响）：
 #        MEM0_LLM_MODEL / MEM0_LLM_BASE_URL / MEM0_LLM_API_KEY          事实提取 LLM
@@ -27,17 +30,52 @@
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-west-2}"
-# Bedrock API key 以 ABSK 开头；环境里若残留 OpenAI 官网的 sk- key，
-# 透传进 Runtime 会压过 AWS_BEARER_TOKEN_BEDROCK 导致模型 401，这里直接忽略
-if [ -n "${OPENAI_API_KEY:-}" ] && [[ "${OPENAI_API_KEY}" != ABSK* ]]; then
-  echo "⚠️  OPENAI_API_KEY 不是 Bedrock API key（非 ABSK 前缀），忽略；改用 AWS_BEARER_TOKEN_BEDROCK / IAM"
-  # 成对残留成对忽略：非 ABSK 的 key 多半来自其他项目的环境（本地 LLM 代理等），
-  # 配套的 OPENAI_BASE_URL 往往指向 Runtime 根本不可达的私网地址，一并丢弃
-  if [ -n "${OPENAI_BASE_URL:-}" ]; then
-    echo "⚠️  同时忽略残留的 OPENAI_BASE_URL（$OPENAI_BASE_URL）——如需自定义端点请配 ABSK key 后重跑"
-    unset OPENAI_BASE_URL
-  fi
-  unset OPENAI_API_KEY
+# ---- 分区/域名推导：区域代码是唯一开关（us-west-2 / cn-northwest-1 ...） ----
+case "$REGION" in
+  cn-*) PARTITION="aws-cn"; AWS_DOMAIN="amazonaws.com.cn"
+        # SDK/starter-toolkit 库内硬编码 .amazonaws.com 端点，中国区用官方
+        # 环境变量覆盖（agentcore CLI 与 Runtime 内 SDK 都认这两个变量）
+        export BEDROCK_AGENTCORE_CP_ENDPOINT="https://bedrock-agentcore-control.$REGION.$AWS_DOMAIN"
+        export BEDROCK_AGENTCORE_DP_ENDPOINT="https://bedrock-agentcore.$REGION.$AWS_DOMAIN"
+        ;;
+  *)    PARTITION="aws"; AWS_DOMAIN="amazonaws.com" ;;
+esac
+
+# ---- 模型三元组校验（fail-fast，不再静默丢弃） ----
+# 显式配了 OPENAI_BASE_URL：视为自定义端点，信任成对的 key（任意前缀——中国区
+# 服务商的 key 不是 ABSK）。注意部署机环境卫生：残留的 BASE_URL 会被原样采用。
+# 未配 BASE_URL：走默认 bedrock-mantle，key 必须是 Bedrock API key（ABSK 前缀）。
+MODEL_KEY="${OPENAI_API_KEY:-${AWS_BEARER_TOKEN_BEDROCK:-}}"
+if [ -z "$MODEL_KEY" ]; then
+  echo "❌ 缺少模型 API key：export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>（默认 mantle 端点），"
+  echo "   或 export OPENAI_BASE_URL + OPENAI_API_KEY + MODEL_ID 指向自定义 OpenAI 兼容端点。"
+  exit 1
+fi
+if [ -z "${OPENAI_BASE_URL:-}" ] && [ "$PARTITION" = "aws-cn" ]; then
+  echo "❌ 中国区无默认模型端点（bedrock-mantle 仅全球区可用）："
+  echo "   请 export OPENAI_BASE_URL + OPENAI_API_KEY + MODEL_ID 指向区内 OpenAI 兼容端点。"
+  exit 1
+fi
+if [ -z "${OPENAI_BASE_URL:-}" ] && [[ "$MODEL_KEY" != ABSK* ]]; then
+  echo "❌ 未配置 OPENAI_BASE_URL 时默认走 bedrock-mantle，key 必须是 Bedrock API key（ABSK 前缀）。"
+  echo "   当前 key 非 ABSK：要么换 Bedrock API key，要么补 export 配套的 OPENAI_BASE_URL（+MODEL_ID）。"
+  exit 1
+fi
+if [ -n "${OPENAI_BASE_URL:-}" ] \
+    && printf '%s' "$OPENAI_BASE_URL" | grep -qE '://(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)'; then
+  echo "❌ OPENAI_BASE_URL 指向私网/本机地址（$OPENAI_BASE_URL）——公网 Runtime 永远无法访问。"
+  echo "   多半是部署机残留的环境变量：unset OPENAI_BASE_URL OPENAI_API_KEY 后重跑，"
+  echo "   或改指公网可达的 OpenAI 兼容端点。"
+  exit 1
+fi
+if [ -n "${OPENAI_BASE_URL:-}" ] && [ -z "${MODEL_ID:-}" ]; then
+  echo "⚠️  已配置 OPENAI_BASE_URL 但未 export MODEL_ID，Runtime 将用内置默认模型"
+  echo "   openai.gpt-5.6-terra——若自定义端点不提供该模型，首次调用才会失败。"
+fi
+if [ -n "${OPENAI_BASE_URL:-}" ]; then
+  echo "ℹ️  模型端点: $OPENAI_BASE_URL（自定义 OpenAI 兼容端点，MODEL_ID=${MODEL_ID:-<内置默认>}）"
+else
+  echo "ℹ️  模型端点: bedrock-mantle 默认端点（Bedrock API key 认证）"
 fi
 AURORA_STACK="agentcore-workshop-aurora"
 PART2_STACK="agentcore-workshop-part2"
@@ -48,6 +86,8 @@ LAMBDA_NAME="agentcore-workshop-analytics"
 # 长期记忆（mem0）：向量 Lambda 与 pgvector collection（表名）；embedding 维度
 # 与 embedding 模型绑定，换模型必须同时换 collection（表按维度建，不能就地改）
 MEMORY_LAMBDA_NAME="agentcore-workshop-memory"
+# 通用数据面 Lambda：会话历史/任务表的全部 SQL 经它进 Aurora（Data API 替代）
+DB_LAMBDA_NAME="agentcore-workshop-db"
 MEM0_COLLECTION="${MEM0_COLLECTION:-mem0_ltm}"
 MEM0_EMBEDDER_DIMS="${MEM0_EMBEDDER_DIMS:-1024}"
 GATEWAY_NAME="agentcore-workshop-analytics-gw"
@@ -113,10 +153,9 @@ _aurora_output() {
 CLUSTER_ENDPOINT=$(_aurora_output ClusterEndpoint)
 DB_SECRET_ARN=$(_aurora_output SecretArn)
 DATABASE=$(_aurora_output DatabaseName)
-# 集群 ARN 与数据访问策略：Runtime（会话历史落库，步骤 7/8）与任务管理模块的
-# 两个 Lambda（步骤 10）都要用，统一在这里取
+# 集群 ARN：任务管理栈参数记录用（数据访问已统一走 VPC 内 db Lambda，
+# Data API 时代的托管策略 AgentDataAccessPolicy 已随之退役）
 AURORA_CLUSTER_ARN=$(_aurora_output ClusterArn)
-DATA_POLICY_ARN=$(_aurora_output AgentDataAccessPolicyArn)
 VPC_ID=$(_aurora_output VpcId)
 PRIVATE_SUBNET_IDS=$(_aurora_output PrivateSubnetIds)
 LAMBDA_SG_ID=$(_aurora_output LambdaClientSecurityGroupId)
@@ -126,20 +165,21 @@ fi
 
 # 预检会话历史两表（建表归 Part 1 deploy.sh 管）：缺表时 /chat 接口会 500、
 # Runtime 落库每轮报错，与其部署完再排查，不如现在快速失败。
-# 集群 Min 0 ACU 空闲自动暂停，首查可能撞冷恢复，重试约 60 秒。
+# 中国区没有 RDS Data API，预检经 Part 1 写库 Lambda 的只读 check_tables op
+#（此刻 Part 2 自己的 db Lambda 还没部署）；--cli-read-timeout 310 对齐其
+# 内部 240s 冷恢复重连。
 echo "==> 预检数仓会话历史表（chat_sessions / chat_messages）..."
-CHAT_TABLES=""
-for _ in $(seq 1 12); do
-  CHAT_TABLES=$(aws rds-data execute-statement --region "$REGION" \
-    --resource-arn "$AURORA_CLUSTER_ARN" --secret-arn "$DB_SECRET_ARN" \
-    --database "$DATABASE" \
-    --sql "SELECT COUNT(*) FROM pg_tables WHERE tablename IN ('chat_sessions','chat_messages')" \
-    --query 'records[0][0].longValue' --output text 2>/dev/null) && break
-  sleep 5
-done
-if [ "$CHAT_TABLES" != "2" ]; then
-  echo "❌ 数仓缺少会话历史表（chat_sessions / chat_messages）。"
-  echo "   请先重跑 Part 1 部署脚本建表：cd part1_data_ingestion && bash scripts/deploy.sh"
+CHECK_PAYLOAD='{"op": "check_tables", "args": {"tables": ["chat_sessions", "chat_messages"]}}'
+if ! aws lambda invoke --function-name agentcore-workshop-writer --region "$REGION" \
+    --cli-binary-format raw-in-base64-out --cli-read-timeout 310 \
+    --payload "$CHECK_PAYLOAD" /tmp/check_tables_out.json >/dev/null 2>&1 \
+    || ! grep -q '"missing": *\[\]' /tmp/check_tables_out.json; then
+  echo "❌ 数仓缺少会话历史表（chat_sessions / chat_messages），或 Part 1 写库 Lambda"
+  echo "   不可用/版本过旧（不识别 check_tables op）："
+  cat /tmp/check_tables_out.json 2>/dev/null || true
+  echo "   请先重跑 Part 1 部署脚本：cd part1_data_ingestion && bash scripts/deploy.sh"
+  echo "  （若上方输出是「未知操作: check_tables」，说明写库 Lambda 代码过旧，"
+  echo "   重跑 Part 1 即可更新，再回来重跑本脚本）"
   exit 1
 fi
 
@@ -157,9 +197,9 @@ sed -e "s/__AGENT_CLIENT_SECRET__/$AGENT_CLIENT_SECRET/" \
 # 1b. ECR 仓库 + 构建推送
 aws ecr describe-repositories --repository-names "$KC_ECR_REPO" --region "$REGION" >/dev/null 2>&1 \
   || aws ecr create-repository --repository-name "$KC_ECR_REPO" --region "$REGION" >/dev/null
-ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$KC_ECR_REPO"
+ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.$AWS_DOMAIN/$KC_ECR_REPO"
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin \
-  "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com" >/dev/null
+  "$ACCOUNT_ID.dkr.ecr.$REGION.$AWS_DOMAIN" >/dev/null
 # Fargate 任务定义按 ARM64 运行（便宜且本机可原生构建）；平台显式声明，
 # 在 x86 机器上部署也能交叉构建（本 Dockerfile 无 RUN 步骤）
 docker build -q --platform linux/arm64 -t "$ECR_URI:latest" "$KC_BUILD_DIR"
@@ -241,7 +281,8 @@ aws cloudformation deploy \
     "LambdaClientSecurityGroupId=$LAMBDA_SG_ID" \
     "DbSecretArn=$DB_SECRET_ARN" \
     "AnalyticsFunctionName=$LAMBDA_NAME" \
-    "MemoryFunctionName=$MEMORY_LAMBDA_NAME"
+    "MemoryFunctionName=$MEMORY_LAMBDA_NAME" \
+    "DbFunctionName=$DB_LAMBDA_NAME"
 
 _part2_output() {
   aws cloudformation describe-stacks --stack-name "$PART2_STACK" --region "$REGION" \
@@ -249,6 +290,7 @@ _part2_output() {
 }
 LAMBDA_ROLE_ARN=$(_part2_output AnalyticsLambdaRoleArn)
 MEMORY_LAMBDA_ROLE_ARN=$(_part2_output MemoryLambdaRoleArn)
+DB_LAMBDA_ROLE_ARN=$(_part2_output DbLambdaRoleArn)
 GATEWAY_ROLE_ARN=$(_part2_output GatewayRoleArn)
 
 echo "==> [3/10] 打包并部署数据查询 Lambda（VPC 内直连 Aurora）..."
@@ -342,6 +384,45 @@ if aws lambda invoke --function-name "$MEMORY_LAMBDA_NAME" --region "$REGION" \
 else
   echo "    ⚠️ 记忆表初始化未成功（$(cat /tmp/memory_setup_out.json 2>/dev/null || echo '无响应')），"
   echo "       不阻断部署；Agent 首次使用记忆时会自动建表，或稍后手动重试 op=setup"
+fi
+
+# 通用数据面 db Lambda：会话历史（Runtime）与任务表（tasks-api/runner）的全部
+# SQL 经它进 Aurora——RDS Data API 的中国区可移植替代（打包模式与上面两个一致）
+echo "    打包并部署通用数据面 Lambda（$DB_LAMBDA_NAME）..."
+DB_BUILD_DIR="$DEPLOY_DIR/db-lambda-build"
+rm -rf "$DB_BUILD_DIR" && mkdir -p "$DB_BUILD_DIR"
+cp "$PART2_DIR/infra/db-lambda/handler.py" "$DB_BUILD_DIR/"
+pip install -q pg8000 -t "$DB_BUILD_DIR" >/dev/null
+(cd "$DB_BUILD_DIR" && zip -qr "$DEPLOY_DIR/db-lambda.zip" .)
+
+DB_LAMBDA_ENV="Variables={DB_HOST=$CLUSTER_ENDPOINT,DB_NAME=$DATABASE,DB_SECRET_ARN=$DB_SECRET_ARN}"
+if aws lambda get-function --function-name "$DB_LAMBDA_NAME" --region "$REGION" >/dev/null 2>&1; then
+  aws lambda update-function-code --function-name "$DB_LAMBDA_NAME" --region "$REGION" \
+    --zip-file "fileb://$DEPLOY_DIR/db-lambda.zip" >/dev/null
+  aws lambda wait function-updated --function-name "$DB_LAMBDA_NAME" --region "$REGION"
+  aws lambda update-function-configuration --function-name "$DB_LAMBDA_NAME" --region "$REGION" \
+    --environment "$DB_LAMBDA_ENV" --timeout 300 --memory-size 256 \
+    --vpc-config "SubnetIds=$PRIVATE_SUBNET_IDS,SecurityGroupIds=$LAMBDA_SG_ID" >/dev/null
+  aws lambda wait function-updated --function-name "$DB_LAMBDA_NAME" --region "$REGION"
+  echo "    已更新 Lambda: $DB_LAMBDA_NAME"
+else
+  # 新建 IAM 角色到 Lambda 可见有延迟，带重试
+  for attempt in $(seq 1 10); do
+    if aws lambda create-function --function-name "$DB_LAMBDA_NAME" --region "$REGION" \
+      --runtime python3.12 --handler handler.lambda_handler \
+      --role "$DB_LAMBDA_ROLE_ARN" \
+      --zip-file "fileb://$DEPLOY_DIR/db-lambda.zip" \
+      --timeout 300 --memory-size 256 \
+      --vpc-config "SubnetIds=$PRIVATE_SUBNET_IDS,SecurityGroupIds=$LAMBDA_SG_ID" \
+      --environment "$DB_LAMBDA_ENV" >/dev/null 2>/tmp/create_db_lambda_err; then
+      break
+    fi
+    [ "$attempt" -eq 10 ] && { echo "创建 Lambda 失败:"; cat /tmp/create_db_lambda_err; exit 1; }
+    echo "    等待 IAM 角色生效后重试（$attempt/10）..."
+    sleep 10
+  done
+  aws lambda wait function-active-v2 --function-name "$DB_LAMBDA_NAME" --region "$REGION"
+  echo "    已创建 Lambda: $DB_LAMBDA_NAME"
 fi
 
 echo "==> [5/10] 创建 Gateway + Lambda target（MCP 工具）..."
@@ -444,10 +525,9 @@ agentcore configure --entrypoint main.py --name "$AGENT_NAME" --region "$REGION"
 agentcore launch \
   --env GATEWAY_URL="$GATEWAY_URL" \
   --env IDENTITY_PROVIDER_NAME="$IDENTITY_PROVIDER_NAME" \
-  --env AURORA_CLUSTER_ARN="$AURORA_CLUSTER_ARN" \
-  --env AURORA_SECRET_ARN="$DB_SECRET_ARN" \
-  --env AURORA_DATABASE="$DATABASE" \
+  --env DB_LAMBDA_NAME="$DB_LAMBDA_NAME" \
   --env MEMORY_LAMBDA_NAME="$MEMORY_LAMBDA_NAME" \
+  ${BEDROCK_AGENTCORE_DP_ENDPOINT:+--env BEDROCK_AGENTCORE_DP_ENDPOINT="$BEDROCK_AGENTCORE_DP_ENDPOINT"} \
   --env MEM0_COLLECTION="$MEM0_COLLECTION" \
   --env MEM0_EMBEDDER_DIMS="$MEM0_EMBEDDER_DIMS" \
   ${MEM0_LLM_MODEL:+--env MEM0_LLM_MODEL="$MEM0_LLM_MODEL"} \
@@ -465,9 +545,11 @@ agentcore launch \
   ${OPENAI_BASE_URL:+--env OPENAI_BASE_URL="$OPENAI_BASE_URL"}
 
 echo "==> [8/10] 附加 Runtime 执行角色所需策略..."
-ROLE_ARN=$(grep -oE 'arn:aws:iam::[0-9]+:role/[A-Za-z0-9+=,.@_/-]+' .bedrock_agentcore.yaml | head -1 || true)
+#（grep 正则做分区通配：aws-cn 分区的 ARN 是 arn:aws-cn:...）
+ROLE_ARN=$(grep -oE 'arn:aws[a-z-]*:iam::[0-9]+:role/[A-Za-z0-9+=,.@_/-]+' .bedrock_agentcore.yaml | head -1 || true)
 ROLE_NAME="${ROLE_ARN##*/}"
 if [ -n "$ROLE_NAME" ]; then
+  # 会话历史读写 = 调 db Lambda；模型不再需要 IAM 权限（OpenAI 兼容端点 + key）
   aws iam put-role-policy --role-name "$ROLE_NAME" \
     --policy-name part2-agent-access \
     --policy-document "{
@@ -481,7 +563,7 @@ if [ -n "$ROLE_NAME" ]; then
           \"bedrock-agentcore:GetWorkloadAccessTokenForUserId\",
           \"bedrock-agentcore:GetResourceOauth2Token\"
         ],
-        \"Resource\": \"arn:aws:bedrock-agentcore:$REGION:$ACCOUNT_ID:*\"
+        \"Resource\": \"arn:$PARTITION:bedrock-agentcore:$REGION:$ACCOUNT_ID:*\"
       }, {
         \"Sid\": \"CodeInterpreter\",
         \"Effect\": \"Allow\",
@@ -493,34 +575,24 @@ if [ -n "$ROLE_NAME" ]; then
           \"bedrock-agentcore:StopCodeInterpreterSession\"
         ],
         \"Resource\": [
-          \"arn:aws:bedrock-agentcore:$REGION:aws:code-interpreter/*\",
-          \"arn:aws:bedrock-agentcore:$REGION:$ACCOUNT_ID:*\"
+          \"arn:$PARTITION:bedrock-agentcore:$REGION:aws:code-interpreter/*\",
+          \"arn:$PARTITION:bedrock-agentcore:$REGION:$ACCOUNT_ID:*\"
         ]
       }, {
-        \"Sid\": \"MantleModelInvocation\",
-        \"Effect\": \"Allow\",
-        \"Action\": [\"bedrock-mantle:CreateInference\"],
-        \"Resource\": \"arn:aws:bedrock-mantle:*:$ACCOUNT_ID:project/*\"
-      }, {
-        \"Sid\": \"Mem0MemoryLambda\",
+        \"Sid\": \"DataPlaneLambdas\",
         \"Effect\": \"Allow\",
         \"Action\": [\"lambda:InvokeFunction\"],
-        \"Resource\": \"arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$MEMORY_LAMBDA_NAME\"
+        \"Resource\": [
+          \"arn:$PARTITION:lambda:$REGION:$ACCOUNT_ID:function:$MEMORY_LAMBDA_NAME\",
+          \"arn:$PARTITION:lambda:$REGION:$ACCOUNT_ID:function:$DB_LAMBDA_NAME\"
+        ]
       }]
     }"
-  # 会话历史落库要读写 Aurora（RDS Data API + 读集群 Secret）：直接挂 Part 1
-  # 栈输出的托管策略，与任务管理模块的两个 Lambda 同一份权限（attach 幂等）
-  if [ -n "$DATA_POLICY_ARN" ] && [ "$DATA_POLICY_ARN" != "None" ]; then
-    aws iam attach-role-policy --role-name "$ROLE_NAME" \
-      --policy-arn "$DATA_POLICY_ARN"
-  else
-    echo "    ⚠️ 未取到 Aurora 数据访问策略，会话历史将无法落库（Runtime 退化为纯内存历史）"
-  fi
   echo "    已附加到角色: $ROLE_NAME"
 else
-  echo "    ⚠️ 未能自动解析执行角色，请手动附加 Identity / Code Interpreter / mantle 权限"
+  echo "    ⚠️ 未能自动解析执行角色，请手动附加 Identity / Code Interpreter / 数据面 Lambda 权限"
 fi
-AGENT_ARN=$(grep -oE 'arn:aws:bedrock-agentcore:[a-z0-9-]+:[0-9]+:runtime/[A-Za-z0-9_-]+' \
+AGENT_ARN=$(grep -oE 'arn:aws[a-z-]*:bedrock-agentcore:[a-z0-9-]+:[0-9]+:runtime/[A-Za-z0-9_-]+' \
   .bedrock_agentcore.yaml | head -1 || true)
 
 echo "==> [9/10] 生成前端配置 web/.env.local ..."
@@ -539,7 +611,7 @@ echo "==> [10/10] 部署数据摄入任务管理模块（Tasks API + 两个 Lamb
 PART1_AGENT_CONFIG="$(dirname "$PART2_DIR")/part1_data_ingestion/agent/.bedrock_agentcore.yaml"
 PART1_RUNTIME_ARN=""
 if [ -f "$PART1_AGENT_CONFIG" ]; then
-  PART1_RUNTIME_ARN=$(grep -oE 'arn:aws:bedrock-agentcore:[a-z0-9-]+:[0-9]+:runtime/[A-Za-z0-9_-]+' \
+  PART1_RUNTIME_ARN=$(grep -oE 'arn:aws[a-z-]*:bedrock-agentcore:[a-z0-9-]+:[0-9]+:runtime/[A-Za-z0-9_-]+' \
     "$PART1_AGENT_CONFIG" | head -1 || true)
 fi
 
@@ -567,7 +639,7 @@ else
         "Part1RuntimeArn=$PART1_RUNTIME_ARN" \
         "AuroraClusterArn=$AURORA_CLUSTER_ARN" \
         "AuroraSecretArn=$DB_SECRET_ARN" \
-        "AgentDataAccessPolicyArn=$DATA_POLICY_ARN" \
+        "DbFunctionName=$DB_LAMBDA_NAME" \
         "TasksApiFunctionName=$TASKS_API_NAME" \
         "RunnerFunctionName=$RUNNER_NAME" \
         "MemoryFunctionName=$MEMORY_LAMBDA_NAME" \
@@ -585,7 +657,9 @@ else
   RUNNER_ROLE_ARN=$(_tasks_output RunnerRoleArn)
   SCHEDULE_GROUP=$(_tasks_output ScheduleGroupName)
   SCHEDULER_ROLE_ARN=$(_tasks_output SchedulerInvokeRoleArn)
-  RUNNER_ARN="arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$RUNNER_NAME"
+  # runner 函数 ARN：Scheduler 的调度目标——按 $PARTITION 拼接（分区随区域推导；
+  # 此处函数尚未创建，无法回读真实 ARN）
+  RUNNER_ARN="arn:$PARTITION:lambda:$REGION:$ACCOUNT_ID:function:$RUNNER_NAME"
 
   # 两个函数都只依赖 runtime 自带的 boto3，直接 zip 单文件即可
   _deploy_tasks_lambda() {
@@ -620,14 +694,15 @@ else
     fi
   }
 
-  AURORA_ENV="AURORA_CLUSTER_ARN=$AURORA_CLUSTER_ARN,AURORA_SECRET_ARN=$DB_SECRET_ARN,AURORA_DATABASE=$DATABASE"
+  # 数仓读写统一经 VPC 内 db Lambda（Data API 已退役）
+  DB_ENV="DB_LAMBDA_NAME=$DB_LAMBDA_NAME"
   # runner 同步消费 SSE，单次运行 2~5 分钟，超时给到 15 分钟上限
   _deploy_tasks_lambda "$RUNNER_NAME" "$PART2_DIR/infra/runner-lambda/handler.py" \
     "$RUNNER_ROLE_ARN" 900 512 \
-    "Variables={$AURORA_ENV,PART1_RUNTIME_ARN=$PART1_RUNTIME_ARN}"
+    "Variables={$DB_ENV,PART1_RUNTIME_ARN=$PART1_RUNTIME_ARN}"
   _deploy_tasks_lambda "$TASKS_API_NAME" "$PART2_DIR/infra/tasks-api-lambda/handler.py" \
     "$TASKS_API_ROLE_ARN" 60 256 \
-    "Variables={$AURORA_ENV,RUNNER_FUNCTION_NAME=$RUNNER_NAME,RUNNER_FUNCTION_ARN=$RUNNER_ARN,SCHEDULE_GROUP=$SCHEDULE_GROUP,SCHEDULER_ROLE_ARN=$SCHEDULER_ROLE_ARN,MEMORY_LAMBDA_NAME=$MEMORY_LAMBDA_NAME,MEM0_COLLECTION=$MEM0_COLLECTION,MEM0_EMBEDDER_DIMS=$MEM0_EMBEDDER_DIMS}"
+    "Variables={$DB_ENV,RUNNER_FUNCTION_NAME=$RUNNER_NAME,RUNNER_FUNCTION_ARN=$RUNNER_ARN,SCHEDULE_GROUP=$SCHEDULE_GROUP,SCHEDULER_ROLE_ARN=$SCHEDULER_ROLE_ARN,MEMORY_LAMBDA_NAME=$MEMORY_LAMBDA_NAME,MEM0_COLLECTION=$MEM0_COLLECTION,MEM0_EMBEDDER_DIMS=$MEM0_EMBEDDER_DIMS}"
 
   # 首轮：函数就绪后补建 HTTP API（路由 + JWT authorizer + 调用许可）
   if [ "$TASKS_API_ENABLED" != "true" ]; then

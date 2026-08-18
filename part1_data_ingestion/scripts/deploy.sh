@@ -9,33 +9,63 @@
 #   5. 部署 Agent 到 AgentCore Runtime（agentcore CLI）
 #   6. 把写库/浏览器访问策略附加到 Runtime 执行角色
 #
-# 数据面全程不用 RDS Data API（中国区没有该服务）：Agent 与本脚本写数仓都经
-# 写库 Lambda。集群的 Data API 仍开着，供 Part 2 与 CLI 查数仓使用。
+# 数据面全程不用 RDS Data API（中国区没有该服务，已整体退役）：Agent 与本脚本
+# 写数仓都经写库 Lambda；Part 2 与 CLI 查数仓也已迁到 VPC 内 db Lambda。
 #
 # 前置：aws CLI 已配置凭证；pip install bedrock-agentcore-starter-toolkit
-# 模型认证（二选一）：export OPENAI_API_KEY=<Bedrock API key>；
-# 或不设置，Agent 用 Runtime IAM 角色自动铸 token（推荐，免 key 管理）
+# 模型：标准 OpenAI 兼容 Chat Completions 端点 + key 三元组——
+#   全球区默认 bedrock-mantle（export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>）；
+#   中国区/自定义端点 export OPENAI_BASE_URL + OPENAI_API_KEY + MODEL_ID 指向
+#   区内模型服务商。key 必填（IAM 铸 token 路径已随 Responses API 一并移除）
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-west-2}"
-# Bedrock API key 以 ABSK 开头；环境里若残留 OpenAI 官网的 sk- key，
-# 透传进 Runtime 会压过 AWS_BEARER_TOKEN_BEDROCK 导致模型 401，这里直接忽略
-if [ -n "${OPENAI_API_KEY:-}" ] && [[ "${OPENAI_API_KEY}" != ABSK* ]]; then
-  echo "⚠️  OPENAI_API_KEY 不是 Bedrock API key（非 ABSK 前缀），忽略；改用 AWS_BEARER_TOKEN_BEDROCK / IAM"
-  # 成对残留成对忽略：非 ABSK 的 key 多半来自其他项目的环境（本地 LLM 代理等），
-  # 配套的 OPENAI_BASE_URL 往往指向 Runtime 根本不可达的私网地址，一并丢弃
-  if [ -n "${OPENAI_BASE_URL:-}" ]; then
-    echo "⚠️  同时忽略残留的 OPENAI_BASE_URL（$OPENAI_BASE_URL）——如需自定义端点请配 ABSK key 后重跑"
-    unset OPENAI_BASE_URL
-  fi
-  unset OPENAI_API_KEY
+# ---- 分区/域名推导：区域代码是唯一开关（us-west-2 / cn-northwest-1 ...） ----
+case "$REGION" in
+  cn-*) PARTITION="aws-cn"; AWS_DOMAIN="amazonaws.com.cn"; VPCE_PREFIX="cn.com.amazonaws"
+        # SDK/starter-toolkit 库内硬编码 .amazonaws.com 端点，中国区用官方
+        # 环境变量覆盖（agentcore CLI 与 Runtime 内 SDK 都认这两个变量）
+        export BEDROCK_AGENTCORE_CP_ENDPOINT="https://bedrock-agentcore-control.$REGION.$AWS_DOMAIN"
+        export BEDROCK_AGENTCORE_DP_ENDPOINT="https://bedrock-agentcore.$REGION.$AWS_DOMAIN"
+        ;;
+  *)    PARTITION="aws"; AWS_DOMAIN="amazonaws.com"; VPCE_PREFIX="com.amazonaws" ;;
+esac
+
+# ---- 模型三元组校验（fail-fast，不再静默丢弃） ----
+# 显式配了 OPENAI_BASE_URL：视为自定义端点，信任成对的 key（任意前缀——中国区
+# 服务商的 key 不是 ABSK）。注意部署机环境卫生：残留的 BASE_URL 会被原样采用。
+# 未配 BASE_URL：走默认 bedrock-mantle，key 必须是 Bedrock API key（ABSK 前缀）。
+MODEL_KEY="${OPENAI_API_KEY:-${AWS_BEARER_TOKEN_BEDROCK:-}}"
+if [ -z "$MODEL_KEY" ]; then
+  echo "❌ 缺少模型 API key：export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>（默认 mantle 端点），"
+  echo "   或 export OPENAI_BASE_URL + OPENAI_API_KEY + MODEL_ID 指向自定义 OpenAI 兼容端点。"
+  exit 1
 fi
-if [ -n "${OPENAI_API_KEY:-}" ]; then
-  echo "ℹ️  使用显式 OPENAI_API_KEY 认证模型（须是 Bedrock API key，不是 OpenAI 官网 sk- key）"
-elif [ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ]; then
-  echo "ℹ️  使用 AWS_BEARER_TOKEN_BEDROCK（Bedrock API key）认证模型"
+if [ -z "${OPENAI_BASE_URL:-}" ] && [ "$PARTITION" = "aws-cn" ]; then
+  echo "❌ 中国区无默认模型端点（bedrock-mantle 仅全球区可用）："
+  echo "   请 export OPENAI_BASE_URL + OPENAI_API_KEY + MODEL_ID 指向区内 OpenAI 兼容端点。"
+  exit 1
+fi
+if [ -z "${OPENAI_BASE_URL:-}" ] && [[ "$MODEL_KEY" != ABSK* ]]; then
+  echo "❌ 未配置 OPENAI_BASE_URL 时默认走 bedrock-mantle，key 必须是 Bedrock API key（ABSK 前缀）。"
+  echo "   当前 key 非 ABSK：要么换 Bedrock API key，要么补 export 配套的 OPENAI_BASE_URL（+MODEL_ID）。"
+  exit 1
+fi
+if [ -n "${OPENAI_BASE_URL:-}" ] \
+    && printf '%s' "$OPENAI_BASE_URL" | grep -qE '://(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)'; then
+  echo "❌ OPENAI_BASE_URL 指向私网/本机地址（$OPENAI_BASE_URL）——公网 Runtime 永远无法访问。"
+  echo "   多半是部署机残留的环境变量：unset OPENAI_BASE_URL OPENAI_API_KEY 后重跑，"
+  echo "   或改指公网可达的 OpenAI 兼容端点。"
+  exit 1
+fi
+if [ -n "${OPENAI_BASE_URL:-}" ] && [ -z "${MODEL_ID:-}" ]; then
+  echo "⚠️  已配置 OPENAI_BASE_URL 但未 export MODEL_ID，Runtime 将用内置默认模型"
+  echo "   openai.gpt-5.6-terra——若自定义端点不提供该模型，首次调用才会失败。"
+fi
+if [ -n "${OPENAI_BASE_URL:-}" ]; then
+  echo "ℹ️  模型端点: $OPENAI_BASE_URL（自定义 OpenAI 兼容端点，MODEL_ID=${MODEL_ID:-<内置默认>}）"
 else
-  echo "ℹ️  未设置 API key，模型调用将用 Runtime IAM 角色自动铸 token"
+  echo "ℹ️  模型端点: bedrock-mantle 默认端点（Bedrock API key 认证）"
 fi
 STACK_NAME="agentcore-workshop-aurora"
 DATABASE="product_hunting"
@@ -83,7 +113,7 @@ if aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGI
   if [ -n "$EXISTING_VPC_ID" ] && [ "$EXISTING_VPC_ID" != "None" ]; then
     FOREIGN_ENDPOINTS=$(aws ec2 describe-vpc-endpoints --region "$REGION" \
       --filters "Name=vpc-id,Values=$EXISTING_VPC_ID" \
-                "Name=service-name,Values=com.amazonaws.$REGION.secretsmanager" \
+                "Name=service-name,Values=$VPCE_PREFIX.$REGION.secretsmanager" \
       --query "VpcEndpoints[?!(Tags[?Key=='aws:cloudformation:stack-name' && Value=='$STACK_NAME'])].VpcEndpointId" \
       --output text)
     if [ -n "$FOREIGN_ENDPOINTS" ] && [ "$FOREIGN_ENDPOINTS" != "None" ]; then
@@ -92,6 +122,24 @@ if aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGI
       echo "   请先运行 part2_chat_portal/scripts/deploy.sh 更新 Part 2 栈移除旧端点，再重跑本脚本。"
       exit 1
     fi
+  fi
+fi
+
+# ---- 一次性迁移清理：Data API 退役后模板删除了 AgentDataAccessPolicy ----
+# 存量环境里该托管策略还附着在 Part 2 的 Runtime 执行角色与 tasks/runner 角色上，
+# 不先摘掉的话 CFN 更新时 iam:DeletePolicy 会撞 DeleteConflict 整栈回滚。
+# 全新环境（栈不存在或无该输出）自动跳过。
+if aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" >/dev/null 2>&1; then
+  OLD_DATA_POLICY_ARN=$(_stack_output AgentDataAccessPolicyArn 2>/dev/null || true)
+  if [ -n "$OLD_DATA_POLICY_ARN" ] && [ "$OLD_DATA_POLICY_ARN" != "None" ]; then
+    echo "==> 迁移清理：摘除旧 Data API 策略的全部角色附着（随后由 CFN 删除策略）..."
+    for r in $(aws iam list-entities-for-policy --policy-arn "$OLD_DATA_POLICY_ARN" \
+        --entity-filter Role --query 'PolicyRoles[].RoleName' --output text 2>/dev/null); do
+      [ "$r" = "None" ] && continue
+      aws iam detach-role-policy --role-name "$r" --policy-arn "$OLD_DATA_POLICY_ARN" \
+        >/dev/null 2>&1 || true
+      echo "    已摘除: $r"
+    done
   fi
 fi
 
@@ -104,7 +152,6 @@ aws cloudformation deploy \
   --parameter-overrides "WriterFunctionName=$WRITER_NAME"
 
 POLICY_ARN=$(_stack_output AgentWriterInvokePolicyArn)
-DATA_POLICY_ARN=$(_stack_output AgentDataAccessPolicyArn)
 CLUSTER_ARN=$(_stack_output ClusterArn)
 CLUSTER_ENDPOINT=$(_stack_output ClusterEndpoint)
 SECRET_ARN=$(_stack_output SecretArn)
@@ -200,7 +247,7 @@ if ! aws iam get-role --role-name "$BROWSER_ROLE_NAME" >/dev/null 2>&1; then
         \"Action\": \"sts:AssumeRole\",
         \"Condition\": {
           \"StringEquals\": {\"aws:SourceAccount\": \"$ACCOUNT_ID\"},
-          \"ArnLike\": {\"aws:SourceArn\": \"arn:aws:bedrock-agentcore:$REGION:$ACCOUNT_ID:*\"}
+          \"ArnLike\": {\"aws:SourceArn\": \"arn:$PARTITION:bedrock-agentcore:$REGION:$ACCOUNT_ID:*\"}
         }
       }]
     }" >/dev/null
@@ -263,22 +310,19 @@ agentcore launch \
   --env BROWSER_IDENTIFIER="$BROWSER_ID" \
   --env BROWSER_PROFILE_ID="$PROFILE_ID" \
   ${MODEL_ID:+--env MODEL_ID="$MODEL_ID"} \
-  ${OPENAI_BASE_URL:+--env OPENAI_BASE_URL="$OPENAI_BASE_URL"}
+  ${OPENAI_BASE_URL:+--env OPENAI_BASE_URL="$OPENAI_BASE_URL"} \
+  ${BEDROCK_AGENTCORE_DP_ENDPOINT:+--env BEDROCK_AGENTCORE_DP_ENDPOINT="$BEDROCK_AGENTCORE_DP_ENDPOINT"}
 
 echo "==> [6/6] 附加写库/浏览器访问策略到 Runtime 执行角色..."
 # launch 完成后 .bedrock_agentcore.yaml 中会写入自动创建的执行角色 ARN
-ROLE_ARN=$(grep -oE 'arn:aws:iam::[0-9]+:role/[A-Za-z0-9+=,.@_/-]+' .bedrock_agentcore.yaml | head -1 || true)
+#（正则做分区通配：aws-cn 分区的 ARN 是 arn:aws-cn:iam::...）
+ROLE_ARN=$(grep -oE 'arn:aws[a-z-]*:iam::[0-9]+:role/[A-Za-z0-9+=,.@_/-]+' .bedrock_agentcore.yaml | head -1 || true)
 ROLE_NAME="${ROLE_ARN##*/}"
 if [ -n "$ROLE_NAME" ]; then
   # 写数仓只需要「能调写库 Lambda」，不再需要 rds-data 与数据库凭证
   aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN"
-  # 老环境上挂过的 Data API 策略在此摘掉（该策略如今只服务 Part 2）；
-  # 没挂过时 detach 会报 NoSuchEntity，忽略即可
-  if [ -n "$DATA_POLICY_ARN" ] && [ "$DATA_POLICY_ARN" != "None" ]; then
-    aws iam detach-role-policy --role-name "$ROLE_NAME" \
-      --policy-arn "$DATA_POLICY_ARN" >/dev/null 2>&1 || true
-  fi
-  # 自定义 browser 与 profile 的数据面权限（CLI 自动生成的角色只覆盖默认浏览器）
+  # 自定义 browser 与 profile 的数据面权限（CLI 自动生成的角色只覆盖默认浏览器）。
+  # 模型不再需要任何 IAM 权限（统一 OpenAI 兼容端点 + key 认证）
   aws iam put-role-policy --role-name "$ROLE_NAME" \
     --policy-name browser-profile-access \
     --policy-document "{
@@ -295,15 +339,10 @@ if [ -n "$ROLE_NAME" ]; then
           \"bedrock-agentcore:SaveBrowserSessionProfile\"
         ],
         \"Resource\": [
-          \"arn:aws:bedrock-agentcore:$REGION:$ACCOUNT_ID:browser/*\",
-          \"arn:aws:bedrock-agentcore:$REGION:$ACCOUNT_ID:browser-custom/*\",
-          \"arn:aws:bedrock-agentcore:$REGION:$ACCOUNT_ID:browser-profile/*\"
+          \"arn:$PARTITION:bedrock-agentcore:$REGION:$ACCOUNT_ID:browser/*\",
+          \"arn:$PARTITION:bedrock-agentcore:$REGION:$ACCOUNT_ID:browser-custom/*\",
+          \"arn:$PARTITION:bedrock-agentcore:$REGION:$ACCOUNT_ID:browser-profile/*\"
         ]
-      }, {
-        \"Sid\": \"MantleModelInvocation\",
-        \"Effect\": \"Allow\",
-        \"Action\": [\"bedrock-mantle:CreateInference\"],
-        \"Resource\": \"arn:aws:bedrock-mantle:*:$ACCOUNT_ID:project/*\"
       }]
     }"
   echo "    已附加到角色: $ROLE_NAME"

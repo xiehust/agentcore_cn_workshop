@@ -20,6 +20,8 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const region = env.VITE_AWS_REGION || "us-west-2";
   const runtimeArn = env.VITE_RUNTIME_ARN || "";
+  // 域名后缀按分区推导（中国区 .amazonaws.com.cn），区域来自 .env.local 单点配置
+  const urlSuffix = region.startsWith("cn-") ? "amazonaws.com.cn" : "amazonaws.com";
   return {
     plugins: [
       react(),
@@ -50,7 +52,7 @@ export default defineConfig(({ mode }) => {
       port: 5173,
       proxy: {
         "/api/invoke": {
-          target: `https://bedrock-agentcore.${region}.amazonaws.com`,
+          target: `https://bedrock-agentcore.${region}.${urlSuffix}`,
           changeOrigin: true,
           rewrite: () =>
             `/runtimes/${encodeURIComponent(runtimeArn)}/invocations?qualifier=DEFAULT`,
