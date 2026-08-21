@@ -44,6 +44,7 @@ FLUSH_CHARS = 400
 FLUSH_SECONDS = 2.0
 
 _db_lambda_client = None
+_runtime_client = None
 
 
 # ---------------------------------------------------------------- 数据访问 ----
@@ -134,6 +135,19 @@ def _build_runtime_prompt(country: str | None, prompt: str) -> str:
     return f"{directive}\n\n{prompt}"
 
 
+def _runtime():
+    """AgentCore 数据面 client：摄入任务可运行 2~5 分钟，不能用 SDK 默认 60s 读超时。"""
+    global _runtime_client
+    if _runtime_client is None:
+        _runtime_client = boto3.client(
+            "bedrock-agentcore",
+            region_name=REGION,
+            config=Config(connect_timeout=5, read_timeout=870,
+                          retries={"max_attempts": 0}),
+        )
+    return _runtime_client
+
+
 def _invoke_runtime_stream(session_id: str, payload: dict):
     """调 Part 1 Runtime 并返回 SSE 的按行迭代器。
 
@@ -143,7 +157,7 @@ def _invoke_runtime_stream(session_id: str, payload: dict):
     """
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     try:
-        client = boto3.client("bedrock-agentcore", region_name=REGION)
+        client = _runtime()
     except Exception as e:
         print(f"[runner] boto3 无 bedrock-agentcore 数据面模型，改用 SigV4 直连: {e}")
         return _invoke_runtime_stream_signed(session_id, body)

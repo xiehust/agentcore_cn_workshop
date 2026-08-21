@@ -21,8 +21,7 @@ to_char 格式串里的引号内冒号——已实测）。
 
 请求协议（event）：
     {"op": "execute", "args": {"sql": "...", "params": {"name": "value", ...},
-     "deadline_s": 45}}   # 可选：冷恢复重连预算（秒），应小于调用方的
-                          # invoke read_timeout，保住「超时 = 零写入」语义
+     "deadline_s": 45}}   # 可选：执行应用 SQL 前的健康检查/冷恢复预算（秒）
 响应：
     {"status": "ok", "rows": [...]} / {"status": "error", "error": "..."}
 """
@@ -52,58 +51,67 @@ def _credentials():
     return _CREDS
 
 
-def _connect(deadline_s: float):
-    """建立连接。集群 MinCapacity=0 空闲自动暂停，首个连接触发冷恢复
-    （约 15 秒~1 分钟），失败重试而不是直接报错。
+def _deadline(deadline_s: float) -> float:
+    """把相对预算换成一次调用内唯一的 monotonic 绝对截止点。"""
+    return time.monotonic() + min(240.0, max(5.0, deadline_s))
 
-    重连等待上限由**调用方限定**（args.deadline_s，封顶 240s < Lambda
-    timeout 300s）：调用方的 invoke read_timeout（Runtime 30s / tasks-api
-    55s / runner 70s）到期放弃时，本函数必已先放弃、语句从未执行——保住
-    「调用方超时 = 零写入」的原子失败语义，避免幽灵写（调用方看到 500
-    但几分钟后语句仍提交）。
 
-    注意 timeout=10 是 socket 超时，pg8000 连上后不会重置：任何服务端
-    静默超过 10 秒的语句（长锁等待、首行前的慢聚合）会以 InterfaceError
-    失败并触发 _run 的重连整条重放（非幂等语句有双写风险）；下面的
-    statement_timeout='60s' 只对持续回传字节的流式语句是有效约束。
-    本通道的语句应保持索引级 OLTP 量级。"""
+def _connect(deadline: float):
+    """在绝对截止点前建立连接；冷恢复重试不会重置整次调用的预算。"""
     user, password = _credentials()
     # Aurora PostgreSQL 强制 SSL；RDS CA 不在系统信任链里，demo 不做证书校验
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    deadline = time.time() + min(240.0, max(5.0, deadline_s))
     while True:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("数据库连接预算已耗尽")
         try:
             return pg8000.native.Connection(
                 user=user, password=password, host=DB_HOST, port=5432,
                 database=DB_NAME, ssl_context=ctx, timeout=10,
             )
         except Exception:
-            if time.time() > deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise
-            time.sleep(5)
+            time.sleep(min(5.0, remaining))
+
+
+def _prepare_connection(deadline: float):
+    """只在应用 SQL 开始前探活/重连；此阶段失败可安全重试。"""
+    global _CONN
+    while True:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("数据库预检预算已耗尽，未执行应用 SQL")
+        try:
+            if _CONN is None:
+                _CONN = _connect(deadline)
+            _CONN.run("SELECT 1")
+            return _CONN
+        except Exception:
+            _CONN = None
 
 
 def _run(sql: str, params: dict, deadline_s: float):
-    """执行一条 SQL（pg8000.native 自动提交），连接跨调用复用，失效重连一次。
-    返回 (rows, columns)：无结果集的语句（INSERT/UPDATE/DELETE/DDL）rows 为 None。
+    """探活后只执行应用 SQL 一次，并返回 (rows, columns)。
+
+    pg8000.native 默认自动提交。若应用 SQL 执行时连接/读取失败，服务端可能尚未执行，
+    也可能已经提交但响应丢失；客户端无法区分这个 ambiguous-commit 边界。因此这里
+    绝不自动重放应用 SQL，避免把一次非幂等写变成两次。deadline 只保证预算耗尽时
+    不再开始应用 SQL，不能把调用方超时等同于“零写入”。
     """
     global _CONN
-    for attempt in (1, 2):
-        try:
-            if _CONN is None:
-                _CONN = _connect(deadline_s)
-                _CONN.run("SET statement_timeout = '60s'")
-            rows = _CONN.run(sql, **params)
-            return rows, _CONN.columns
-        except pg8000.native.DatabaseError:
-            raise  # SQL 本身的错误（语法/约束），重连重跑没有意义
-        except Exception:
-            _CONN = None
-            if attempt == 2:
-                raise
-    raise RuntimeError("unreachable")
+    deadline = _deadline(deadline_s)
+    conn = _prepare_connection(deadline)
+    if time.monotonic() >= deadline:
+        raise TimeoutError("数据库预检预算已耗尽，未执行应用 SQL")
+    try:
+        rows = conn.run(sql, **params)
+        return rows, conn.columns
+    except Exception:
+        _CONN = None
+        raise
 
 
 def _jsonable(value):
@@ -122,7 +130,7 @@ def op_execute(args: dict):
     if not sql.strip():
         raise ValueError("缺少 sql")
     params = args.get("params") or {}
-    # 冷恢复重连预算由调用方限定（应 < 其 invoke read_timeout），缺省 240s
+    # 应用 SQL 开始前的探活/冷恢复预算由调用方限定，缺省 240s
     try:
         deadline_s = float(args.get("deadline_s") or 240)
     except (TypeError, ValueError):

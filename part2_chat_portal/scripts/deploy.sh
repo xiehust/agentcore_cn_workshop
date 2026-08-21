@@ -88,6 +88,7 @@ LAMBDA_NAME="agentcore-workshop-analytics"
 MEMORY_LAMBDA_NAME="agentcore-workshop-memory"
 # 通用数据面 Lambda：会话历史/任务表的全部 SQL 经它进 Aurora（Data API 替代）
 DB_LAMBDA_NAME="agentcore-workshop-db"
+WRITER_NAME="agentcore-workshop-writer"
 MEM0_COLLECTION="${MEM0_COLLECTION:-mem0_ltm}"
 MEM0_EMBEDDER_DIMS="${MEM0_EMBEDDER_DIMS:-1024}"
 GATEWAY_NAME="agentcore-workshop-analytics-gw"
@@ -104,6 +105,7 @@ TASKS_ALLOWED_ORIGINS="${TASKS_ALLOWED_ORIGINS:-http://localhost:5173,http://127
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PART2_DIR="$(dirname "$SCRIPT_DIR")"
+PART1_DIR="$(dirname "$PART2_DIR")/part1_data_ingestion"
 DEPLOY_DIR="$PART2_DIR/.deploy"
 
 # agentcore CLI 防遮蔽：npm 也有个同名命令，环境里若被它压住，自动改用仓库根
@@ -168,18 +170,53 @@ fi
 # 中国区没有 RDS Data API，预检经 Part 1 写库 Lambda 的只读 check_tables op
 #（此刻 Part 2 自己的 db Lambda 还没部署）；--cli-read-timeout 310 对齐其
 # 内部 240s 冷恢复重连。
-echo "==> 预检数仓会话历史表（chat_sessions / chat_messages）..."
 CHECK_PAYLOAD='{"op": "check_tables", "args": {"tables": ["chat_sessions", "chat_messages"]}}'
-if ! aws lambda invoke --function-name agentcore-workshop-writer --region "$REGION" \
+_check_tables() {
+  rm -f /tmp/check_tables_out.json /tmp/check_tables_invoke_err
+  aws lambda invoke --function-name "$WRITER_NAME" --region "$REGION" \
     --cli-binary-format raw-in-base64-out --cli-read-timeout 310 \
-    --payload "$CHECK_PAYLOAD" /tmp/check_tables_out.json >/dev/null 2>&1 \
-    || ! grep -q '"missing": *\[\]' /tmp/check_tables_out.json; then
-  echo "❌ 数仓缺少会话历史表（chat_sessions / chat_messages），或 Part 1 写库 Lambda"
-  echo "   不可用/版本过旧（不识别 check_tables op）："
+    --payload "$CHECK_PAYLOAD" /tmp/check_tables_out.json \
+    >/dev/null 2>/tmp/check_tables_invoke_err
+}
+
+# 已有环境的 Part 1 writer 可能早于 check_tables，而旧 Secrets 端点此时仍归 Part 2，
+# 不能先完整跑 Part 1。只对精确的「未知操作: check_tables」做一次代码引导升级；
+# 角色/VPC/环境变量沿用已部署函数，不碰栈与端点，也不掩盖缺表或 invoke 失败。
+_bootstrap_writer_check_tables() {
+  echo "    检测到 Part 1 写库 Lambda 版本过旧，先从同仓 Part 1 源码引导升级..."
+  local build_dir="$DEPLOY_DIR/writer-bootstrap-build"
+  rm -rf "$build_dir" && mkdir -p "$build_dir"
+  cp "$PART1_DIR/infra/writer-lambda/handler.py" "$build_dir/"
+  cp "$PART1_DIR/infra/setup_tables.sql" "$build_dir/"
+  pip install -q pg8000 -t "$build_dir" >/dev/null
+  rm -f "$DEPLOY_DIR/writer-bootstrap.zip"
+  (cd "$build_dir" && zip -qr "$DEPLOY_DIR/writer-bootstrap.zip" .)
+  aws lambda update-function-code --function-name "$WRITER_NAME" --region "$REGION" \
+    --zip-file "fileb://$DEPLOY_DIR/writer-bootstrap.zip" >/dev/null
+  aws lambda wait function-updated --function-name "$WRITER_NAME" --region "$REGION"
+  echo "    已更新并等待 Lambda 就绪，重新预检..."
+}
+
+echo "==> 预检数仓会话历史表（chat_sessions / chat_messages）..."
+if ! _check_tables; then
+  echo "❌ 无法调用 Part 1 写库 Lambda（$WRITER_NAME）："
+  cat /tmp/check_tables_invoke_err 2>/dev/null || true
   cat /tmp/check_tables_out.json 2>/dev/null || true
-  echo "   请先重跑 Part 1 部署脚本：cd part1_data_ingestion && bash scripts/deploy.sh"
-  echo "  （若上方输出是「未知操作: check_tables」，说明写库 Lambda 代码过旧，"
-  echo "   重跑 Part 1 即可更新，再回来重跑本脚本）"
+  exit 1
+fi
+if grep -q '"未知操作: check_tables"' /tmp/check_tables_out.json; then
+  _bootstrap_writer_check_tables
+  if ! _check_tables; then
+    echo "❌ 引导升级后仍无法调用 Part 1 写库 Lambda（$WRITER_NAME）："
+    cat /tmp/check_tables_invoke_err 2>/dev/null || true
+    cat /tmp/check_tables_out.json 2>/dev/null || true
+    exit 1
+  fi
+fi
+if ! grep -q '"missing": *\[\]' /tmp/check_tables_out.json; then
+  echo "❌ 数仓缺少会话历史表（chat_sessions / chat_messages），或预检返回异常："
+  cat /tmp/check_tables_out.json 2>/dev/null || true
+  echo "   这不是旧 writer 的引导升级场景；请先确认 Part 1 建表状态后再继续。"
   exit 1
 fi
 
@@ -542,6 +579,7 @@ agentcore launch \
   ${OPENAI_API_KEY:+--env OPENAI_API_KEY="$OPENAI_API_KEY"} \
   ${AWS_BEARER_TOKEN_BEDROCK:+--env AWS_BEARER_TOKEN_BEDROCK="$AWS_BEARER_TOKEN_BEDROCK"} \
   ${MODEL_ID:+--env MODEL_ID="$MODEL_ID"} \
+  ${MODEL_REASONING_EFFORT:+--env MODEL_REASONING_EFFORT="$MODEL_REASONING_EFFORT"} \
   ${OPENAI_BASE_URL:+--env OPENAI_BASE_URL="$OPENAI_BASE_URL"}
 
 echo "==> [8/10] 附加 Runtime 执行角色所需策略..."

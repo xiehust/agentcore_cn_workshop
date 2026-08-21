@@ -128,8 +128,11 @@ export MEM0_EMBEDDER_DIMS=1024                      # 维度决定 pgvector 表�
 > 从本部分的 analytics 栈挪到 Part 1 的 Aurora 栈（端点随 VPC 归属，且同一 VPC
 > 对同一服务只允许一个 Private DNS 端点）。因此升级顺序是**先跑本部分的
 > `deploy.sh`**（栈更新删掉旧端点），**再跑 Part 1 的 `deploy.sh`**（建新端点）；
-> 顺序反了 Part 1 的脚本会预检报错。两次之间的窗口期里本部分的 Lambda 冷启动
-> 取不到凭证，跑完 Part 1 即恢复。代码与运行时配置零改动。
+> 顺序反了 Part 1 的脚本会预检报错。若存量 Part 1 写库 Lambda 还不认识
+> `check_tables`，本脚本会从同仓 Part 1 源码只更新这只现有函数的代码、等待就绪并
+> 重试预检，不改 Part 1 栈或端点；只有精确的「未知操作: check_tables」会触发，
+> 缺表和其他 invocation 失败仍直接报错。两次部署之间本部分的 Lambda 冷启动取不到
+> 凭证，跑完 Part 1 即恢复；最后再跑一次本脚本，让所有 Part 2 资源收敛。
 
 第 9 步额外依赖 Part 1 的 Runtime（runner 要调它，ARN 从
 `part1_data_ingestion/agent/.bedrock_agentcore.yaml` 解析）和 Part 1 建的任务表；
@@ -140,8 +143,9 @@ export MEM0_EMBEDDER_DIMS=1024                      # 维度决定 pgvector 表�
 
 - 脚本开头**预检** `chat_sessions` / `chat_messages` 两表（经 Part 1 写库
   Lambda 的只读 `check_tables` op，中国区没有 Data API，此刻本部分的 db Lambda
-  还没部署）。缺表就地失败并提示回 Part 1 重跑 `deploy.sh` 建表——与其部署完
-  再排查 `/chat` 接口 500、Runtime 每轮落库报错，不如先失败。
+  还没部署）。旧 writer 不认识该 op 时按上面的已有环境流程引导更新并重试；缺表
+  仍就地失败，并要求先确认 Part 1 已建表；不会绕过预检继续部署——与其部署完再
+  排查 `/chat` 接口 500、Runtime 每轮落库报错，不如先失败。
 - 第 7 步 `agentcore launch` 给 Runtime 注入 `DB_LAMBDA_NAME`（会话历史的
   读写全部经这只 VPC 内的 db Lambda，Runtime 不再接触集群 ARN 与凭证）。
 - 第 8 步给 Runtime 执行角色附加对 db Lambda 与记忆向量 Lambda 的
