@@ -1,0 +1,2 @@
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"修改跨文件重复门槛常量前，按项目规范完成全局搜索与镜像一致性检查"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Skill、Runtime 发布、真实入库与实验手册跨层联动，需要核对端到端契约"}

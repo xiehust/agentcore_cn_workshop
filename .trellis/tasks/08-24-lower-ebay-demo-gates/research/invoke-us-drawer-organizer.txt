@@ -1,0 +1,38 @@
+US drawer organizer（第一批）
+命令：agentcore invoke <实验手册中的对应完整提示词>
+
+started_utc=2026-08-24T06:06:51Z
+
+⚠️ Recommendation: The Starter Toolkit CLI is no longer supported.
+   Please use the AgentCore CLI (@aws/agentcore) to create, develop, and deploy
+agents on Amazon Bedrock AgentCore.
+   New Bedrock AgentCore features are only accessible in the AgentCore CLI.
+
+   To uninstall this starter toolkit, run: pip uninstall
+bedrock-agentcore-starter-toolkit
+   To install the AgentCore CLI: npm install -g @aws/agentcore
+   To import existing agents, run: agentcore import
+   Set AGENTCORE_SUPPRESS_RECOMMENDATION=1 to silence this warning.
+
+╭────────────────────────── product_ingestion_agent ───────────────────────────╮
+│ Session: <已脱敏> │
+│ ARN:                                                                         │
+│ <已脱敏 ARN> │
+│ gent-Ot9UhU3HI6                                                              │
+│ Logs: aws logs tail                                                          │
+│ /aws/bedrock-agentcore/runtimes/<已脱敏日志组> ID>-DEFAULT   │
+│ --log-stream-name-prefix "2026/08/24/[runtime-logs" --follow                 │
+│       aws logs tail                                                          │
+│ /aws/bedrock-agentcore/runtimes/<已脱敏日志组> ID>-DEFAULT   │
+│ --log-stream-name-prefix "2026/08/24/[runtime-logs" --since 1h               │
+│ GenAI Dashboard:                                                             │
+│ <已脱敏控制台链接> │
+│ vability/agent-core                                                          │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+Invocation failed: An error occurred while reading from response stream:
+('Connection broken: IncompleteRead(0 bytes read)', IncompleteRead(0 bytes
+read))
+finished_utc=2026-08-24T06:21:57Z
+duration_seconds=906
+exit_code=1

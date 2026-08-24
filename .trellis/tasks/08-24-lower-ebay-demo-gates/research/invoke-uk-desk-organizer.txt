@@ -1,0 +1,52 @@
+UK desk organizer（第一批）
+命令：agentcore invoke <实验手册中的对应完整提示词>
+
+started_utc=2026-08-24T06:06:50Z
+
+⚠️ Recommendation: The Starter Toolkit CLI is no longer supported.
+   Please use the AgentCore CLI (@aws/agentcore) to create, develop, and deploy
+agents on Amazon Bedrock AgentCore.
+   New Bedrock AgentCore features are only accessible in the AgentCore CLI.
+
+   To uninstall this starter toolkit, run: pip uninstall
+bedrock-agentcore-starter-toolkit
+   To install the AgentCore CLI: npm install -g @aws/agentcore
+   To import existing agents, run: agentcore import
+   Set AGENTCORE_SUPPRESS_RECOMMENDATION=1 to silence this warning.
+
+已按 eBay 英国站 **Best Match** 顺序处理前 2 个非广告、全新、一口价商品，并已逐个入库。
+
+| 序号 | 商品 | 判定 | 核心原因 |
+|---|---|---|---|
+| 1 | Office Wooden Stationery Desk Organiser Tidy Storage Holder A4 Pencil Sorter UK（£9.49） | 排除 | 累计 62 sold，按“累计÷12”保守估算月销 **5.17**（入库取整 5）；产品点 **0.000954**。但无法取得可靠的最早上架/购买记录来完成市场结构判断，未将不确定数据作为采集真值。 |
+| 2 | Metal Mesh Desk Organiser Stationery Pen Pencil Holder Tidy Storage For Office（£4.99） | PASS | 当前价 **£4.99 ≤ £5**，未通过 R1 价格硬门槛。页面显示 3 sold 且上架不足 3 天，月销估算约 30，但不改变价格淘汰结论。 |
+
+### 汇总
+- 已处理：**2**
+- 跳过广告、拍卖、二手、翻新：已按规则执行，不占名额
+- 判定数量：
+  - 采集：**0**
+  - 排除：**1**
+  - PASS：**1**
+  - 补采：**0**
+- 入库结果：**2/2 成功**
+- 候选产品点：**无采集候选**
+  - 已排除商品的测算产品点仅作审计记录：**0.000954**，未进入候选档案。
+╭────────────────────────── product_ingestion_agent ───────────────────────────╮
+│ Session: <已脱敏> │
+│ ARN:                                                                         │
+│ <已脱敏 ARN> │
+│ gent-Ot9UhU3HI6                                                              │
+│ Logs: aws logs tail                                                          │
+│ /aws/bedrock-agentcore/runtimes/<已脱敏日志组> ID>-DEFAULT   │
+│ --log-stream-name-prefix "2026/08/24/[runtime-logs" --follow                 │
+│       aws logs tail                                                          │
+│ /aws/bedrock-agentcore/runtimes/<已脱敏日志组> ID>-DEFAULT   │
+│ --log-stream-name-prefix "2026/08/24/[runtime-logs" --since 1h               │
+│ GenAI Dashboard:                                                             │
+│ <已脱敏控制台链接> │
+│ vability/agent-core                                                          │
+╰──────────────────────────────────────────────────────────────────────────────╯
+finished_utc=2026-08-24T06:09:11Z
+duration_seconds=141
+exit_code=0

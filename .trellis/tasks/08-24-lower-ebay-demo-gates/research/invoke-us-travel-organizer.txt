@@ -1,0 +1,39 @@
+US travel organizer（第二批）
+命令：agentcore invoke <实验手册中的对应完整提示词>
+
+started_utc=2026-08-24T06:22:25Z
+
+⚠️ Recommendation: The Starter Toolkit CLI is no longer supported.
+   Please use the AgentCore CLI (@aws/agentcore) to create, develop, and deploy
+agents on Amazon Bedrock AgentCore.
+   New Bedrock AgentCore features are only accessible in the AgentCore CLI.
+
+   To uninstall this starter toolkit, run: pip uninstall
+bedrock-agentcore-starter-toolkit
+   To install the AgentCore CLI: npm install -g @aws/agentcore
+   To import existing agents, run: agentcore import
+   Set AGENTCORE_SUPPRESS_RECOMMENDATION=1 to silence this warning.
+
+{"error": "prompt tokens (1107840) exceed model maximum (1050000) for
+openai.gpt-5.6-terra", "error_type": "EventLoopException", "message": "An error
+occurred during streaming"}
+
+
+╭────────────────────────── product_ingestion_agent ───────────────────────────╮
+│ Session: <已脱敏> │
+│ ARN:                                                                         │
+│ <已脱敏 ARN> │
+│ gent-Ot9UhU3HI6                                                              │
+│ Logs: aws logs tail                                                          │
+│ /aws/bedrock-agentcore/runtimes/<已脱敏日志组> ID>-DEFAULT   │
+│ --log-stream-name-prefix "2026/08/24/[runtime-logs" --follow                 │
+│       aws logs tail                                                          │
+│ /aws/bedrock-agentcore/runtimes/<已脱敏日志组> ID>-DEFAULT   │
+│ --log-stream-name-prefix "2026/08/24/[runtime-logs" --since 1h               │
+│ GenAI Dashboard:                                                             │
+│ <已脱敏控制台链接> │
+│ vability/agent-core                                                          │
+╰──────────────────────────────────────────────────────────────────────────────╯
+finished_utc=2026-08-24T06:24:08Z
+duration_seconds=103
+exit_code=0

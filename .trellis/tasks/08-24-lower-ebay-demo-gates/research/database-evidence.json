@@ -1,0 +1,86 @@
+{
+  "baseline": {
+    "baseline_utc": "2026-08-24T06:06:37Z",
+    "selection_verdicts_count": 76,
+    "product_candidates_count": 0
+  },
+  "after": {
+    "baseline_utc": "2026-08-24T06:06:37Z",
+    "after_utc": "2026-08-24T06:26:45Z",
+    "selection_verdicts_count": 82,
+    "product_candidates_count": 0,
+    "new_verdicts": 6,
+    "new_candidates": 0
+  },
+  "delta": {
+    "selection_verdicts": 6,
+    "product_candidates": 0
+  },
+  "records_after_baseline": [
+    {
+      "site": "UK",
+      "verdict": "排除",
+      "reason": "上架时间不可精确推断，且无法取得最早购买记录；按SOP保守口径累计62 sold÷12=5.17/月（入库取整5）。当前价£9.49；经济测算产品点0.000954（以同赛道最低£4.99计）。因市场结构上架信息不足，排除以避免将不确定数据作为采集真值。",
+      "product_title": "Office Wooden Stationery Desk Organiser Tidy Storage Holder A4 Pencil Sorter UK",
+      "current_price": "9.49",
+      "monthly_sales": 5,
+      "product_score": "0.0010",
+      "created_at": "2026-08-24 06:08:44.125142"
+    },
+    {
+      "site": "UK",
+      "verdict": "PASS",
+      "reason": "价≤£5：当前一口价£4.99，未通过R1。累计3 sold，页面显示上架不足3天，月销按3÷0.1=30估算；无需继续经济测算。",
+      "product_title": "Metal Mesh Desk Organiser Stationery Pen Pencil Holder Tidy Storage For Office",
+      "current_price": "4.99",
+      "monthly_sales": 30,
+      "product_score": "0.0057",
+      "created_at": "2026-08-24 06:09:06.829119"
+    },
+    {
+      "site": "UK",
+      "verdict": "补采",
+      "reason": "详情页抓取技术失败（空页面），无法取得累计销量/购买记录、品牌、卖家及规格；搜索页仅见全新一口价£1.14–£2.19，不能据此编造月销或完成页面取数。",
+      "product_title": "Mini cable winder organizer for USB cords, desk tidy wire holder for home,office",
+      "current_price": "1.14",
+      "monthly_sales": null,
+      "product_score": null,
+      "created_at": "2026-08-24 06:23:24.179469"
+    },
+    {
+      "site": "UK",
+      "verdict": "补采",
+      "reason": "详情页抓取技术失败（空页面），无法取得累计销量/购买记录、品牌、卖家及规格；搜索页仅见全新一口价£2.37–£3.25，不能据此编造月销或完成页面取数。",
+      "product_title": "Cable Holder Management Clips 3,5,7 Slots Tidy Desk Organiser USB Lead UK",
+      "current_price": "2.37",
+      "monthly_sales": null,
+      "product_score": null,
+      "created_at": "2026-08-24 06:23:25.854723"
+    },
+    {
+      "site": "US",
+      "verdict": "补采",
+      "reason": "当前价$25；页面仅显示“Just listed”（上架不足3天），未展示N sold、购买记录或可用于销量估算的评价时间，无法按SOP估算月销；品牌BAGSMART，卖家lunnel.6jv8dyxrc。",
+      "product_title": "BAGSMART Packing Cubes - Beige - Pack of 6",
+      "current_price": "25.00",
+      "monthly_sales": null,
+      "product_score": null,
+      "created_at": "2026-08-24 06:23:50.366865"
+    },
+    {
+      "site": "US",
+      "verdict": "排除",
+      "reason": "上架≥3年（按页面上架时间2020-10-19计算下界2133天）；月销按累计1355 sold÷12保守估算约112.92",
+      "product_title": "8 Pcs Adjustable DIY Drawer Divider Storage Organizer Separator- White Durable",
+      "current_price": "8.99",
+      "monthly_sales": 113,
+      "product_score": null,
+      "created_at": "2026-08-24 06:25:57.408463"
+    }
+  ],
+  "candidates_after_baseline": [],
+  "notes": [
+    "查询通过 RDS Data API 只读执行",
+    "未保存 Cluster ARN、Secret ARN、账号、端点或凭证"
+  ]
+}
