@@ -68,8 +68,10 @@
   同一 JWT 信任模型——身份取 `preferred_username`，绝不接受前端传参）→
   lambda.invoke 记忆 Lambda `list` op `filters={"user_id": <user>}` →
   映射 `payload.data/created_at` 为 `{memories: [{id, memory, created_at}]}`
-  按时间倒序；记忆 Lambda 不可达降级 `{memories: [], degraded: true}`
-  不抛 500。前端镜像类型在 `web/src/chat/api.ts`（MemoryItem）。
+  按时间倒序；tasks-api 使用禁重试的 8 秒读超时，必须在 HTTP API 约 30 秒
+  集成上限前主动降级（记忆 Lambda 可在后台继续唤醒 Aurora），Lambda 不可达/
+  超时统一返回 `{memories: [], degraded: true}`，不抛 500/503。前端镜像类型在
+  `web/src/chat/api.ts`（MemoryItem）。
 - **多分析师演示**：Keycloak realm 预置 `analyst`（无预置记忆）/`vivian`/
   `marco` 三账号；`scripts/seed_memories.py` 给后两者种入偏好事实——
   **payload 键形复刻 mem0 `_create_memory`**（`data`/`hash`=md5(data)/

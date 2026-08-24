@@ -30,6 +30,7 @@ import uuid
 import boto3
 from botocore.auth import SigV4QueryAuth
 from botocore.awsrequest import AWSRequest
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 REGION = os.environ.get("AWS_REGION", "us-west-2")
@@ -45,6 +46,15 @@ SCHEDULER_ROLE_ARN = os.environ.get("SCHEDULER_ROLE_ARN", "")
 MEMORY_LAMBDA_NAME = os.environ.get("MEMORY_LAMBDA_NAME", "")
 MEM0_COLLECTION = os.environ.get("MEM0_COLLECTION", "mem0_ltm")
 MEM0_EMBEDDER_DIMS = int(os.environ.get("MEM0_EMBEDDER_DIMS", "1024") or "1024")
+# 门户读取不能跟随记忆 Lambda 的 240 秒 Aurora 冷恢复预算：HTTP API 最长只等
+# 30 秒，超过后会先回 503 且丢掉 CORS 头，浏览器只能显示含糊的 Failed to fetch。
+# 用独立客户端在网关预算内提前降级；后台记忆 Lambda 仍会继续唤醒集群。
+MEMORY_INVOKE_TIMEOUT_S = 8
+MEMORY_LAMBDA_CONFIG = Config(
+    connect_timeout=3,
+    read_timeout=MEMORY_INVOKE_TIMEOUT_S,
+    retries={"max_attempts": 0},
+)
 
 # Live View 画面尺寸：与 Part 1 browser 会话的 viewport、前端 BrowserLiveView
 # 的 remoteWidth/remoteHeight 三处必须一致，否则画面被裁切或留黑边
@@ -63,6 +73,16 @@ def _client(name: str):
     if name not in _clients:
         _clients[name] = boto3.client(name, region_name=REGION)
     return _clients[name]
+
+
+def _memory_client():
+    """记忆读取专用 Lambda 客户端；短超时保证能在 HTTP API 断连前降级。"""
+    key = "lambda-memory"
+    if key not in _clients:
+        _clients[key] = boto3.client(
+            "lambda", region_name=REGION, config=MEMORY_LAMBDA_CONFIG
+        )
+    return _clients[key]
 
 
 # ---------------------------------------------------------------- 数据访问 ----
@@ -738,7 +758,7 @@ def list_user_memories(user_name: str) -> dict:
     if not MEMORY_LAMBDA_NAME:
         return _resp(200, {"memories": [], "degraded": True})
     try:
-        resp = _client("lambda").invoke(
+        resp = _memory_client().invoke(
             FunctionName=MEMORY_LAMBDA_NAME,
             Payload=json.dumps({
                 "op": "list",
