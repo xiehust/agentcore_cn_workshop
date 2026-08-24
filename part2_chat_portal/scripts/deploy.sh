@@ -58,9 +58,11 @@ AGENT_NAME="analysis_chat_agent"
 TASKS_STACK="agentcore-workshop-part2-tasks"
 TASKS_API_NAME="agentcore-workshop-tasks-api"
 RUNNER_NAME="agentcore-workshop-ingestion-runner"
-# 允许跨域访问 Tasks API 的前端来源（Vite dev server；多个用逗号分隔）
-# 5273 是 5173 被本机其他项目占用时的备用端口（npm run dev -- --port 5273 --strictPort）
-TASKS_ALLOWED_ORIGINS="${TASKS_ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:5273,http://127.0.0.1:5273}"
+# 允许跨域访问 Tasks API 的前端来源（多个用逗号分隔）。已有栈在步骤 10
+# 自动沿用当前 AllowedOrigins，避免重跑部署时清掉额外配置的 CloudFront/正式域名；
+# 新栈才使用本地 Vite 默认值。显式 TASKS_ALLOWED_ORIGINS 始终优先。
+DEFAULT_TASKS_ALLOWED_ORIGINS="http://localhost:5173,http://127.0.0.1:5173,http://localhost:5273,http://127.0.0.1:5273"
+TASKS_ALLOWED_ORIGINS="${TASKS_ALLOWED_ORIGINS:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PART2_DIR="$(dirname "$SCRIPT_DIR")"
@@ -548,6 +550,18 @@ if [ -z "$PART1_RUNTIME_ARN" ]; then
   echo "       （先在 part1_data_ingestion 下跑 scripts/deploy.sh，再重跑本脚本）"
   TASKS_API_URL=""
 else
+  # 生产入口（如 CloudFront）通常在首次部署后另行建立。重跑 Part 2 时若没有
+  # 显式传 TASKS_ALLOWED_ORIGINS，沿用栈里的现值，不能退回本地默认值。
+  if [ -z "$TASKS_ALLOWED_ORIGINS" ]; then
+    TASKS_ALLOWED_ORIGINS=$(aws cloudformation describe-stacks \
+      --stack-name "$TASKS_STACK" --region "$REGION" \
+      --query "Stacks[0].Parameters[?ParameterKey=='AllowedOrigins'].ParameterValue | [0]" \
+      --output text 2>/dev/null || true)
+    if [ -z "$TASKS_ALLOWED_ORIGINS" ] || [ "$TASKS_ALLOWED_ORIGINS" = "None" ]; then
+      TASKS_ALLOWED_ORIGINS="$DEFAULT_TASKS_ALLOWED_ORIGINS"
+    fi
+  fi
+
   # 首轮部署时两个函数还不存在，而它们的执行角色由本栈创建（鸡生蛋）：
   # 先用 ApiEnabled=false 只建角色/调度组，建完函数再补建 HTTP API
   TASKS_API_ENABLED="true"

@@ -384,8 +384,17 @@ tasks-api Lambda（python3.12，无 VPC）
 Lambda 调用许可要等函数存在才能建，脚本因此先用 `ApiEnabled=false` 建角色和调度组，
 建完函数再补建 API。这是预期行为，重跑时函数已存在，一次部署到位。
 
-允许跨域的前端来源默认是 `http://localhost:5173,http://127.0.0.1:5173`，
-换端口或换机器访问时用 `TASKS_ALLOWED_ORIGINS=... ./scripts/deploy.sh` 覆盖。
+首次部署时，允许跨域的前端来源默认包含本机 Vite 的 5173/5273 端口。
+换端口、换机器或增加 CloudFront/正式域名时，用完整来源列表覆盖，例如：
+
+```bash
+TASKS_ALLOWED_ORIGINS='http://localhost:5173,https://<distribution-id>.cloudfront.net' \
+  ./scripts/deploy.sh
+```
+
+后续未显式传该变量时，部署脚本沿用 Tasks 栈当前的 `AllowedOrigins`，不会把已经
+加入的正式来源重置成本地默认值。来源必须只包含 scheme + host（以及非默认端口），
+末尾不要加 `/`。
 
 ### API
 
