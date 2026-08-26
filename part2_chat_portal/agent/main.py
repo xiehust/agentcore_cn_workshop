@@ -28,8 +28,10 @@
 import asyncio
 import json
 import os
+import threading
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -176,6 +178,18 @@ _PERSISTED_SEQ: dict[str, int] = {}
 _MEMORY_SECTION: dict[str, str] = {}
 # session_id -> 会话归属用户（chat_sessions.user_name；None=查不到，不再重查）
 _SESSION_USER: dict[str, str | None] = {}
+
+# 流尾工作必须脱离 SSE 生命周期，否则历史落库或 mem0 变慢会让浏览器一直等 EOF。
+# 两个固定大小的池分开：记忆最长可等 MEM0_ADD_TIMEOUT，不能反过来占满历史落库
+# worker。AgentCore async task 从调度到两段工作全部结束一直保持 active，让 /ping
+# 报 HealthyBusy，避免响应结束后 microVM 把尚未完成的线程当空闲工作冻结。
+_PERSIST_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chat-persist")
+_MEMORY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chat-memory")
+# 固定分片锁避免 session->lock 字典随历史会话数永久增长。持久化与记忆分开加锁：
+# 同一会话的记忆按轮次串行，但后一轮历史落库无需等待前一轮最长 60s 的记忆提取。
+_FINALIZE_LOCK_SHARDS = 32
+_PERSIST_LOCKS = tuple(threading.Lock() for _ in range(_FINALIZE_LOCK_SHARDS))
+_MEMORY_LOCKS = tuple(threading.Lock() for _ in range(_FINALIZE_LOCK_SHARDS))
 
 # ---- 会话历史持久化（chat_messages 表，经 VPC 内数据面 Lambda） ----
 # 全部 best-effort：读失败按空历史继续，写失败只打日志，绝不影响 SSE 流。
@@ -416,6 +430,90 @@ def _render_memory_section(memories: list[str]) -> str:
     )
 
 
+def _session_lock(locks: tuple, session_id: str):
+    """从固定分片里取同一 session 的串行锁；hash 碰撞只会多串行，不影响正确性。"""
+    return locks[hash(session_id) % len(locks)]
+
+
+def _complete_finalize(task_id: int, session_id: str) -> None:
+    """完成 AgentCore tracked task；统一收口，防止异常路径把 Runtime 永久留在 busy。"""
+    if not app.complete_async_task(task_id):
+        print(f"[finalize] async task 已不存在: session={session_id}")
+
+
+def _memorize_then_complete(
+    task_id: int,
+    session_id: str,
+    prompt: str,
+    reply_text: str,
+) -> None:
+    """后台记忆写回；在线程自己的 event loop 运行 async mem0 包装。"""
+    try:
+        with _session_lock(_MEMORY_LOCKS, session_id):
+            # 首轮反查可能早于前端注册 INSERT，把缓存的 None 弹掉后补查一次。
+            if _SESSION_USER.get(session_id) is None:
+                _SESSION_USER.pop(session_id, None)
+            user_id = _memory_user(session_id)
+            asyncio.run(memory_backend.memorize(user_id, prompt, reply_text))
+    except Exception as e:
+        # memory_backend 自身已降级兜底；这里再守住线程/event-loop 层的意外。
+        print(f"[finalize] 记忆写回异常: session={session_id} {type(e).__name__}: {e}")
+    finally:
+        _complete_finalize(task_id, session_id)
+
+
+def _persist_then_schedule_memory(
+    task_id: int,
+    session_id: str,
+    messages: list,
+    prompt: str,
+    reply_text: str,
+) -> None:
+    """先持久化本轮完整消息，再把慢 Mem0 阶段转交独立线程池。"""
+    try:
+        with _session_lock(_PERSIST_LOCKS, session_id):
+            _persist_new(session_id, messages)
+    except Exception as e:
+        # _persist_new 按条兜底；此处处理锁/线程等函数边界外的意外。
+        print(f"[finalize] 历史落库异常: session={session_id} {type(e).__name__}: {e}")
+
+    if not memory_backend.enabled() or not reply_text:
+        _complete_finalize(task_id, session_id)
+        return
+
+    try:
+        _MEMORY_EXECUTOR.submit(
+            _memorize_then_complete,
+            task_id,
+            session_id,
+            prompt,
+            reply_text,
+        )
+    except Exception as e:
+        print(f"[finalize] 记忆任务提交失败: session={session_id} {type(e).__name__}: {e}")
+        _complete_finalize(task_id, session_id)
+
+
+def _schedule_finalize(session_id: str, messages: list, prompt: str, reply_text: str) -> None:
+    """注册并调度流尾工作；调用返回后 async generator 可以立即结束。"""
+    task_id = app.add_async_task("chat_turn_finalize", {"session_id": session_id})
+    # Strands 的流式文本可能没有以换行结尾；先断行，避免回复正文与诊断前缀粘在
+    # 同一条 CloudWatch 事件里，导致按 [finalize] 检索时顺带暴露回答内容。
+    print(f"\n[finalize] 已调度后台收尾: session={session_id}")
+    try:
+        _PERSIST_EXECUTOR.submit(
+            _persist_then_schedule_memory,
+            task_id,
+            session_id,
+            messages,
+            prompt,
+            reply_text,
+        )
+    except Exception as e:
+        print(f"[finalize] 历史任务提交失败: session={session_id} {type(e).__name__}: {e}")
+        _complete_finalize(task_id, session_id)
+
+
 @app.entrypoint
 async def invoke(payload: dict, context=None):
     """Runtime 调用入口（流式）。
@@ -482,23 +580,12 @@ async def invoke(payload: dict, context=None):
             if "data" in event:
                 yield event["data"]
         _HISTORY[session_id] = agent.messages
-        # 落库放在流结束之后：本身是 best-effort，慢一点也不占用回答时延
-        await asyncio.to_thread(_persist_new, session_id, agent.messages)
-        # 长期记忆写回：本轮问答交 mem0 做 LLM 事实提取（与既有记忆去重/合并）。
-        # 必须 await——microVM 在响应结束后可能被冻结，fire-and-forget 会丢写；
-        # 代价是 SSE 流关闭最坏再晚 MEM0_ADD_TIMEOUT（默认 20s，正文已全部
-        # 送达，仅前端 busy 态解除变晚；连续失败有熔断兜底）。
-        # 归属带补查：首轮 SELECT 可能跑在前端注册会话的 INSERT 之前（两者并发）
-        # 而缓存下 None——流尾此刻行早已提交、集群也已被本轮唤醒，弹掉缓存
-        # 重查一次，否则整个会话的记忆写入都会静默丢失。真正未注册的会话
-        # （smoke-*）每轮只多付一次流后的 best-effort SELECT，不占回答时延。
-        # 本会话新沉淀的事实对当前会话不注入（上下文在场），下个新会话生效
-        if memory_backend.enabled():
-            if _SESSION_USER.get(session_id) is None:
-                _SESSION_USER.pop(session_id, None)
-            user_id = await asyncio.to_thread(_memory_user, session_id)
-            reply_text = _display_text(agent.messages[-1]) if agent.messages else None
-            await memory_backend.memorize(user_id, prompt, reply_text or "")
+        # 历史落库 + 长期记忆写回由 AgentCore tracked async task 承接。任务期间
+        # /ping 保持 HealthyBusy，既能让 SSE 立即 EOF，也不会在响应后丢掉后台写入。
+        # 快照与本轮回复在当前 Agent 生命周期内取好，后台不再访问 agent 对象。
+        messages = list(agent.messages)
+        reply_text = _display_text(messages[-1]) if messages else None
+        _schedule_finalize(session_id, messages, prompt, reply_text or "")
 
 
 if __name__ == "__main__":

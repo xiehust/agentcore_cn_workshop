@@ -191,7 +191,7 @@ tasks-api Lambda**：
 ```
 写入：SPA ──▶ Runtime（invoke，链路与前面完全一致）
                  │ ① 沙箱内存里没有该会话时，按 seq 回灌 chat_messages（含工具轮）
-                 │ ② 流结束后把本轮新增的消息增量写回
+                 │ ② 正文结束后注册 tracked async task，后台增量写回
                  ▼
              lambda.invoke ──▶ VPC 内 db Lambda（pg8000 直连）──▶ Aurora
              （Runtime 自身不挂 VPC；中国区没有 RDS Data API，两个分区统一走这条链路）
@@ -209,9 +209,10 @@ tasks-api Lambda**：
 - **存全量 Strands message**。`chat_messages.content` 是消息原样 JSON（含
   `toolUse` / `toolResult`），回灌保真；前端回看用的是另一列 `display_text`
   （text block 拼接），纯工具轮该列为 NULL，读接口过滤掉。
-- **落库绝不阻断聊天**。任何 DB 异常只打日志，SSE 流照常返回；没有
-  `DB_LAMBDA_NAME` 环境变量时（例如本地裸跑）整体降级为纯内存历史，
-  行为等同这个功能上线之前。
+- **落库绝不阻断聊天**。正文结束后，Runtime 用 AgentCore tracked async task
+  在后台经 db Lambda 落库并让 `/ping` 保持 `HealthyBusy`；SSE 不等待数据库或
+  Mem0，及时 EOF。任何 DB 异常只打日志；没有 `DB_LAMBDA_NAME` 环境变量时
+  （例如本地裸跑）整体降级为纯内存历史，行为等同这个功能上线之前。
 - **回灌会修尾**。库里若存着不完整的轮次（例如上次落库中途失败，工具调用没有
   对应结果），回灌时把这段尾巴丢掉并顺手从表里删除——留着它们会占住后续消息的
   `seq`，被唯一索引静默挡掉。这样交给模型的消息序列始终合法。
@@ -283,9 +284,10 @@ Runtime（分析 Agent + mem0，公网）                VPC 内
 - **会话首轮检索一次，整会话缓存**：记忆注入 system prompt 后本会话内不再
   变化——保证主模型 prompt cache 前缀稳定（每轮检索会把缓存全部打穿）。
   本会话新学到的偏好下个新会话生效。
-- **每轮结束自动沉淀**：流结束后本轮问答交 mem0 做 LLM 事实提取（与既有
-  记忆去重/合并），SSE 流关闭因此变晚——典型几秒，最坏 `MEM0_ADD_TIMEOUT`
-  （默认 20s，正文已送达，仅输入框解锁变晚；连续失败自动熔断）。
+- **每轮结束自动沉淀**：正文结束后，本轮问答由 AgentCore tracked async task
+  交给 mem0 做 LLM 事实提取（与既有记忆去重/合并）。SSE 先正常关闭、输入框立即
+  解锁；后台任务用 `HealthyBusy` 保证 microVM 不会提前冻结。提取最坏
+  `MEM0_ADD_TIMEOUT`（默认 20s），连续失败自动熔断。
 - **永不阻断对话**：mem0 未配置/Lambda 不可达/集群冷恢复/提取失败，只降级为
   "本轮或本进程无记忆"，日志（CloudWatch，前缀 `[mem0]`）可查原因。
 
@@ -501,9 +503,10 @@ Lambda 调用许可要等函数存在才能建，脚本因此先用 `ApiEnabled=
   具体报错——embedding 维度与表不符（`MEM0_EMBEDDER_DIMS` 和建表时不一致，
   换 `MEM0_COLLECTION` 重建）、提取模型输出非法 JSON（换个模型）都在此列。
   记忆链路任何故障都不影响正常对话。
-- **每轮回答完输入框要多等几秒才解锁**：正常——流结束后 mem0 在做本轮的
-  记忆提取（LLM 调用），必须等它写完 Runtime 才能安全冻结沙箱。典型几秒、
-  最坏 `MEM0_ADD_TIMEOUT`（默认 20s）；提取连续失败 3 次会自动熔断停付。
+- **正文已经显示完但输入框迟迟不解锁，最后出现 network error**：不正常。先查
+  Runtime 日志的 `[finalize]` 与 `[mem0]`；正文结束后 SSE 应立即关闭，历史落库和
+  记忆提取都在 AgentCore tracked async task 中继续。即使 Mem0 等满
+  `MEM0_ADD_TIMEOUT`，也不应再拖住浏览器连接。
 - **想清空某用户的长期记忆**：直接删行即可——经 db Lambda 执行
   `DELETE FROM mem0_ltm WHERE payload->>'user_id' = '<用户名>'`
   （invoke 形态同上文「验证」节的直查示例：

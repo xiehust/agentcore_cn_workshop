@@ -89,8 +89,8 @@ export default function App() {
     refreshSessions();
   }, [refreshSessions]);
 
-  // Runtime 是在 SSE 流结束之后才把这轮消息写库的，收到「会话有动静」时立刻拉一次
-  // 可能还看不到最后一条，1.5 秒后补一拍，列表的时间与条数才是最终值。
+  // Runtime 在正文结束时把本轮消息交给 tracked async task 落库；SSE 会先 EOF，
+  // 因此立刻刷新可能还看不到最后一条，1.5 秒后补一拍追上最终状态。
   const onSessionsChanged = useCallback(() => {
     refreshSessions();
     setTimeout(refreshSessions, 1500);

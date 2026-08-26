@@ -53,6 +53,11 @@
   持久化整体短路，行为等同纯内存旧版（本地裸跑依赖这一点）。SQL 经
   `{"op":"execute","args":{"sql","params"}}` 协议 lambda.invoke 执行——
   RDS Data API 已退役（中国区没有）。
+- 流尾一致性：模型正文结束后先更新进程内 `_HISTORY`，再注册 AgentCore tracked
+  async task 执行 `_persist_new`；SSE 不等待 db Lambda。SDK 在任务期间通过
+  `/ping` 报 `HealthyBusy`，保证响应关闭后 microVM 不冻结后台写入。固定大小的
+  persistence executor 按调度顺序处理，各 session 的分片锁保证
+  `_PERSISTED_SEQ` 单调前进。
 - IAM：Runtime 执行角色对 db Lambda 与记忆 Lambda 的 `lambda:InvokeFunction`
   （deploy.sh 步骤 8 的 `DataPlaneLambdas` 语句）；tasks-api / runner 的
   `InvokeDbLambda` 在 part2-tasks.yaml。
@@ -66,14 +71,14 @@
 | 注册的 id 已属于其他用户 | 409 |
 | 读/改/删他人会话或不存在的会话 | 404（不泄漏存在性） |
 | Runtime 回灌时 Aurora 冷恢复超 ~20 秒 | 按空历史继续（丢上下文不挂请求） |
-| Runtime 落库任何异常 | 打日志放行，SSE 流不受影响；游标不前移，下轮靠唯一索引 + DO NOTHING 兜重复 |
+| Runtime 后台落库任何异常 | 打日志并完成 tracked task，SSE 已正常结束；游标不前移，下轮靠唯一索引 + DO NOTHING 兜重复 |
 | 单条消息 JSON >300KB | 裁剪 toolUse 入参/超长 text 但保留 toolUseId 配对；含工具块且仍超限则跳过该条落库 |
 | 库里存在不完整轮次尾巴（上次中途失败） | 回灌时截掉并 DELETE 残行——不删会占住 seq，新消息被唯一索引静默丢弃 |
 | 回灌失败（load 抛异常） | 空历史继续，且该 microVM 内后续不再落库（已接受的退化，数据保持故障前完整前缀） |
 
 ### 5. Good/Base/Bad Cases
 
-- Good：门户发消息 → 流结束落库 → 强停 runtime session → 同 id 追问
+- Good：门户发消息 → SSE 正常结束 → 等后台落库完成 → 强停 runtime session → 同 id 追问
   「刚才那个漏斗」→ 回灌后回答接得上（已实测：强停后答出前文的 41.7%）。
 - Base：本地 `python main.py` 裸跑（无 DB_LAMBDA_NAME env）→ 纯内存多轮，无报错无落库。
 - Bad：前端自己写消息进库（丢工具轮，回灌失真）；Lambda 信前端传的 user_name
@@ -86,6 +91,8 @@
   都带 `user_name` 过滤、软删是 UPDATE、messages 响应不含 `content` 列。
 - 真实库端到端：注册幂等且不覆盖重命名；跨用户四路 404；落库→清内存→回灌
   逐字段一致（含 toolUse/toolResult）；超大消息裁剪后配对仍在。
+- 后台收尾：慢 Mem0 不延迟 SSE EOF；上一轮 Mem0 未结束时下一轮历史仍能先落库；
+  submit/worker 异常都必须 `complete_async_task`，不能把 `/ping` 永久留在 busy。
 - 门户 E2E（Playwright）：发消息 → 刷新 → 列表可见 → 点开恢复（chart 渲染）→
   重命名（`window.prompt`）→ 删除（`window.confirm`）。
 - 回灌验收：强停 runtime session（见下面 Wrong vs Correct）后追问前文。

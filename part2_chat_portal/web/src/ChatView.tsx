@@ -131,7 +131,9 @@ export default function ChatView({
         .catch((e: Error) => console.warn("会话注册失败，历史列表暂不显示该会话", e));
     }
     const sid = sessionId;
-    const appendDelta = (delta: string) =>
+    let receivedDelta = false;
+    const appendDelta = (delta: string) => {
+      if (delta) receivedDelta = true;
       setMessages((m) => {
         if (liveSessionRef.current !== sid || m.length === 0) return m;
         const next = [...m];
@@ -141,20 +143,30 @@ export default function ChatView({
         };
         return next;
       });
+    };
     try {
       const token = await getToken();
       abortRef.current = new AbortController();
       await streamChat(text, sid, token, appendDelta, abortRef.current.signal);
     } catch (e) {
       if ((e as Error).name !== "AbortError") {
+        console.warn("分析流异常结束", e);
         setMessages((m) => {
           if (liveSessionRef.current !== sid || m.length === 0) return m;
           const next = [...m];
-          next[next.length - 1] = {
-            role: "assistant",
-            content: `分析请求失败：${(e as Error).message}`,
-            error: true,
-          };
+          if (receivedDelta) {
+            const warning = "\n\n> ⚠️ 连接在响应结束前中断，以上内容可能不完整。请按需重新发送。";
+            next[next.length - 1] = {
+              ...next[next.length - 1],
+              content: next[next.length - 1].content + warning,
+            };
+          } else {
+            next[next.length - 1] = {
+              role: "assistant",
+              content: `分析请求失败：${(e as Error).message}`,
+              error: true,
+            };
+          }
           return next;
         });
       }

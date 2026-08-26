@@ -92,7 +92,7 @@ MEM0_EMBEDDER_PASS_DIMS = os.getenv("MEM0_EMBEDDER_PASS_DIMS", "").lower() == "t
 
 SEARCH_TIMEOUT_S = _env_num("MEM0_SEARCH_TIMEOUT", 3.0, float)
 # 正常一次 add = 2 次 LLM 调用 + embedding + 数次 Lambda RPC，典型 7~12s；
-# 20s 留足余量。这个预算同时是 SSE 流关闭的最坏追加延迟，不宜放大
+# 20s 留足余量。这个预算决定 tracked async task 和专用线程的占用上限，不宜放大
 ADD_TIMEOUT_S = _env_num("MEM0_ADD_TIMEOUT", 20.0, float)
 RECALL_LIMIT = 8
 # memorize 连续失败熔断阈值：达到即进程级禁用（microVM 空闲 ~15 分钟会被
@@ -467,9 +467,9 @@ def _memorize_sync(user_id: str, prompt: str, reply: str) -> int:
 async def memorize(user_id: str | None, prompt: str, reply: str) -> None:
     """把本轮对话交给 mem0 提取写回（ADD/UPDATE/DELETE 由 mem0 决策）。
 
-    在 SSE 流结束、会话历史落库之后调用；必须 await（microVM 在响应后可能
-    冻结，fire-and-forget 会丢写）。预算 MEM0_ADD_TIMEOUT 秒（默认 20s，
-    也是 SSE 流关闭的最坏追加延迟），超时/异常只打日志；连续失败
+    由 main.py 的 AgentCore tracked async task 在历史落库之后 await；该 task
+    通过 HealthyBusy 防止响应结束后 microVM 冻结，而 SSE 不等待本函数。预算
+    MEM0_ADD_TIMEOUT 秒（默认 20s），超时/异常只打日志；连续失败
     _ADD_FAIL_LIMIT 次触发进程级熔断，停止每轮白付预算。
     """
     global _add_fail_streak, _disabled_reason

@@ -82,12 +82,14 @@
 - **降级铁律**：记忆是增强功能。mem0 未安装/env 未配置/Lambda 不可达/
   Aurora 冷恢复/LLM 提取失败，任何一种只导致本轮或本进程无记忆，
   **绝不阻断 SSE 对话**。初始化失败进程级禁用（不反复重试拖慢请求）。
-- **写回必须 await**：`memorize` 串在流结束、`_persist_new` 之后——
-  microVM 在响应后可能冻结，fire-and-forget 会丢写。代价是 SSE 流关闭
-  延后（典型几秒，最坏 `MEM0_ADD_TIMEOUT`=20s；正文已送达，仅前端 busy
-  态解除变晚），连续失败 3 次熔断停付。写回前对缓存的 None 归属做一次
-  补查——前端注册会话（INSERT）与首轮 SELECT 并发，输掉竞态不能让整个
-  会话的记忆写入静默丢失。
+- **写回必须由 tracked async task await**：普通 fire-and-forget 会在响应后随
+  microVM 冻结而丢写；同步挂在 async generator 尾部又会让 SSE 长时间没有字节。
+  `main.py` 因此先用 `app.add_async_task` 注册后台收尾，历史落库完成后由独立
+  memory executor await `memorize`，最后在 `finally` 调
+  `complete_async_task`。任务期间 `/ping` 报 `HealthyBusy`，SSE 则立即 EOF。
+  写回仍受 `MEM0_ADD_TIMEOUT`=20s 和连续失败 3 次熔断约束。写回前对缓存的 None
+  归属做一次补查——前端注册会话（INSERT）与首轮 SELECT 并发，输掉竞态不能让
+  整个会话的记忆写入静默丢失。
 - **prompt cache 契约**：`_MEMORY_SECTION[session_id]` 一经写入（含空串）
   本会话不再变化；任何"每轮刷新记忆"的改动都会打穿主模型前缀缓存，
   改之前先想清楚。
@@ -125,7 +127,7 @@
 | embedding 实际维度 ≠ `MEM0_EMBEDDER_DIMS` | 初始化探测直接禁用，日志给出两种修法 |
 | session 查不到 user_name | recall 跳过；流尾 memorize 前弹掉 None 缓存补查一次（防注册竞态） |
 | recall 超 3s（Aurora 冷恢复） | 本会话无记忆注入，缓存空串不重试 |
-| memorize 超 20s / LLM 提取失败 | 本轮记忆丢弃；连续 3 次熔断进程级禁用（microVM 重建自愈） |
+| memorize 超 20s / LLM 提取失败 | 后台丢弃本轮记忆并完成 tracked task；SSE 不受影响；连续 3 次熔断进程级禁用（microVM 重建自愈） |
 | Lambda RPC 非 ok / FunctionError | 抛给 mem0 → recall/memorize 捕获降级 |
 | Lambda `_run` 重放 insert（已提交但响应丢失） | `ON CONFLICT (id) DO NOTHING` 吸收，不误报失败 |
 | 记忆线程池饱和（在途 ≥ 2） | 跳过本次操作，仅日志 |
