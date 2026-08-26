@@ -196,7 +196,7 @@ _MEMORY_LOCKS = tuple(threading.Lock() for _ in range(_FINALIZE_LOCK_SHARDS))
 
 # 单条消息 JSON 上限：lambda.invoke 请求 6MB，300KB 留足余量；超了降级存裁剪版
 _MAX_CONTENT_BYTES = 300 * 1024
-# 数据面 Lambda 的读超时：Aurora 冷恢复的等待在 Lambda 内部（上限 240s），
+# 数据面 Lambda 的读超时：数据库连接恢复在 Lambda 内部处理（上限 240s），
 # 回灌等不起那么久——宁可丢上下文不可挂请求，30 秒等不到就放弃
 _DB_READ_TIMEOUT_S = 30
 
@@ -229,7 +229,7 @@ def _db_execute(sql: str, parameters: list) -> list[dict]:
     """执行一条 SQL 并返回行（list[dict]，等价原 Data API formatRecordsAs=JSON）。
 
     经 lambda.invoke 调 VPC 内数据面 Lambda（pg8000 直连 Aurora，:name 占位符
-    原样支持）；集群冷恢复的退避在 Lambda 内部完成，这里只管超时放弃。
+    原样支持）；连接恢复在 Lambda 内部完成，这里只管超时放弃。
     """
     resp = _db_lambda().invoke(
         FunctionName=DB_LAMBDA_NAME,
@@ -397,8 +397,8 @@ def _memory_user(session_id: str) -> str | None:
     该列由 tasks-api Lambda 从已验证的 Keycloak JWT 写入（身份可信）——
     Runtime 自身拿不到用户身份，长期记忆按用户隔离只能走这条反查路径。
     确认无归属（chat_test.sh 的 smoke-* 会话未注册、本地裸跑无库）缓存
-    None 不再重查；查询异常（多为集群冷恢复）**不缓存**——流尾 memorize
-    再调时集群多半已被本轮对话唤醒，可以补上。best-effort，失败不阻断对话。
+    None 不再重查；查询异常**不缓存**——流尾 memorize 再调时数据面可能已经
+    恢复，可以补上。best-effort，失败不阻断对话。
     """
     if session_id in _SESSION_USER:
         return _SESSION_USER[session_id]
@@ -555,7 +555,7 @@ async def invoke(payload: dict, context=None):
         except asyncio.TimeoutError:
             # gather 里只有 wait_for 会抛 TimeoutError；token 任务此时已完成/
             # 将完成，重取一次命中 Identity token vault 缓存，代价可忽略
-            print("[mem0] 会话首轮记忆管道超时（多为集群冷恢复），本会话无记忆注入")
+            print("[mem0] 会话首轮记忆管道超时（数据面或模型端点瞬时不可用），本会话无记忆注入")
             token, memories = await _gateway_token(), []
         _MEMORY_SECTION[session_id] = _render_memory_section(memories)
     else:

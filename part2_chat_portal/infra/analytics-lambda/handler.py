@@ -36,8 +36,8 @@ def _credentials():
 
 
 def _connect():
-    """建立连接。集群 MinCapacity=0 空闲自动暂停，首个连接会触发冷恢复
-    （约 15 秒~1 分钟），失败后重试而不是直接报错。"""
+    """建立连接。集群 MinCapacity=0.5 保持 warm standby；维护或瞬时故障时
+    失败后重试而不是直接报错。"""
     user, password = _credentials()
     # Aurora PostgreSQL 强制 SSL；RDS CA 不在系统信任链里，demo 不做证书校验
     ctx = ssl.create_default_context()

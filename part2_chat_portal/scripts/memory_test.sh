@@ -94,7 +94,7 @@ EOF
 P=()
 while IFS= read -r _line; do P+=("$_line"); done <<<"$PAYLOADS"
 
-_expect_ok "$(_invoke "${P[0]}")" "create_col（含 pgvector 扩展，冷恢复可能需约 1 分钟）"
+_expect_ok "$(_invoke "${P[0]}")" "create_col（含 pgvector 扩展，瞬时故障时可能重试）"
 _expect_ok "$(_invoke "${P[1]}")" "insert（1 条 $DIMS 维向量）"
 
 R_SEARCH=$(_invoke "${P[2]}")

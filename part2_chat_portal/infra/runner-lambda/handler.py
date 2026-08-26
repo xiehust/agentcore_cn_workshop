@@ -69,7 +69,7 @@ def _execute(sql: str, parameters: list | None = None) -> list[dict]:
     """执行一条 SQL 并返回行（list[dict]，等价原 Data API formatRecordsAs=JSON）。
 
     经 lambda.invoke 调 VPC 内数据面 db Lambda（pg8000 直连 Aurora，:name
-    占位符与 ::TYPE cast 原样支持）；集群冷恢复的等待在 db Lambda 内部完成
+    占位符与 ::TYPE cast 原样支持）；连接恢复在 db Lambda 内部完成
     （上限 240s），这里只管超时放弃。
     """
     if not DB_LAMBDA_NAME:

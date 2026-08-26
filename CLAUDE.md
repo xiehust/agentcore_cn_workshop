@@ -61,7 +61,7 @@ E2E 浏览器验证用本机 Python 版 Playwright（`playwright` CLI 是 pip �
 ## 架构
 
 两个部分共用一套数仓：Part 1 的 CloudFormation 栈 `agentcore-workshop-aurora` 建
-VPC + Aurora Serverless v2（PostgreSQL，Min 0 ACU 空闲自动暂停）+ Secrets Manager
+VPC + Aurora Serverless v2（PostgreSQL，Min 0.5 ACU warm standby）+ Secrets Manager
 接口端点（端点随 VPC 归本栈，Part 1 写库 Lambda 与 Part 2 分析 Lambda 共用；同一
 VPC 同一服务只能有一个 Private DNS 端点，已有环境升级要先跑 Part 2 deploy 删旧
 端点、再跑 Part 1 deploy 建新的，Part 1 脚本有预检）。表全部由

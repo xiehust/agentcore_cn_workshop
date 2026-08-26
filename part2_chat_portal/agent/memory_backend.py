@@ -183,7 +183,7 @@ try:
     # 共享 lambda client：Runtime 与 Lambda 走 AWS 内网 API，禁重试
     # （对齐 Part 1 aurora_tools.py：重试只会放大尾延迟；insert 有 UUID
     # 主键天然幂等，但 mem0 决策流程串行，宁可快速失败走降级）。
-    # read_timeout 120s < Lambda timeout 300s：Aurora 深度冷恢复时放弃本次
+    # read_timeout 120s < Lambda timeout 300s：数据面长时间不可用时放弃本次
     # 记忆操作（Agent 侧还有更短的 wait_for 预算）。
     _lambda_client = None
 
@@ -429,7 +429,7 @@ def _recall_sync(user_id: str, query: str) -> list[str]:
 async def recall(user_id: str | None, query: str) -> list[str]:
     """按用户语义检索长期记忆，按相关度排序返回记忆文本。
 
-    预算 MEM0_SEARCH_TIMEOUT 秒（Aurora 冷恢复必超时 → 空结果）；任何异常
+    预算 MEM0_SEARCH_TIMEOUT 秒（数据面或模型端点超时 → 空结果）；任何异常
     返回 []。调用方（main.py）只在会话首轮调用，结果缓存整个会话。
     """
     if not user_id or _disabled_reason is not None:
@@ -441,7 +441,7 @@ async def recall(user_id: str | None, query: str) -> list[str]:
         logger.info("[mem0] recall user=%s 命中 %d 条", user_id, len(memories))
         return memories
     except asyncio.TimeoutError:
-        logger.warning("[mem0] recall 超时（%.0fs，可能撞上集群冷恢复），本会话无记忆注入", SEARCH_TIMEOUT_S)
+        logger.warning("[mem0] recall 超时（%.0fs，数据面或模型端点瞬时不可用），本会话无记忆注入", SEARCH_TIMEOUT_S)
         return []
     except Exception as e:
         logger.warning("[mem0] recall 失败: %s: %s", type(e).__name__, e)

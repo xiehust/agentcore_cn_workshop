@@ -80,7 +80,7 @@
 ### 4. Contracts
 
 - **降级铁律**：记忆是增强功能。mem0 未安装/env 未配置/Lambda 不可达/
-  Aurora 冷恢复/LLM 提取失败，任何一种只导致本轮或本进程无记忆，
+  数据面瞬时故障/LLM 提取失败，任何一种只导致本轮或本进程无记忆，
   **绝不阻断 SSE 对话**。初始化失败进程级禁用（不反复重试拖慢请求）。
 - **写回必须由 tracked async task await**：普通 fire-and-forget 会在响应后随
   microVM 冻结而丢写；同步挂在 async generator 尾部又会让 SSE 长时间没有字节。
@@ -126,7 +126,7 @@
 | mem0ai 未安装 / 注册失败 | import 不抛错，进程级禁用 |
 | embedding 实际维度 ≠ `MEM0_EMBEDDER_DIMS` | 初始化探测直接禁用，日志给出两种修法 |
 | session 查不到 user_name | recall 跳过；流尾 memorize 前弹掉 None 缓存补查一次（防注册竞态） |
-| recall 超 3s（Aurora 冷恢复） | 本会话无记忆注入，缓存空串不重试 |
+| recall 超 3s（数据面或模型端点超时） | 本会话无记忆注入，缓存空串不重试 |
 | memorize 超 20s / LLM 提取失败 | 后台丢弃本轮记忆并完成 tracked task；SSE 不受影响；连续 3 次熔断进程级禁用（microVM 重建自愈） |
 | Lambda RPC 非 ok / FunctionError | 抛给 mem0 → recall/memorize 捕获降级 |
 | Lambda `_run` 重放 insert（已提交但响应丢失） | `ON CONFLICT (id) DO NOTHING` 吸收，不误报失败 |

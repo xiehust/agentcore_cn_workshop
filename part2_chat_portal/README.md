@@ -288,7 +288,7 @@ Runtime（分析 Agent + mem0，公网）                VPC 内
   交给 mem0 做 LLM 事实提取（与既有记忆去重/合并）。SSE 先正常关闭、输入框立即
   解锁；后台任务用 `HealthyBusy` 保证 microVM 不会提前冻结。提取最坏
   `MEM0_ADD_TIMEOUT`（默认 20s），连续失败自动熔断。
-- **永不阻断对话**：mem0 未配置/Lambda 不可达/集群冷恢复/提取失败，只降级为
+- **永不阻断对话**：mem0 未配置/Lambda 不可达/数据面瞬时故障/提取失败，只降级为
   "本轮或本进程无记忆"，日志（CloudWatch，前缀 `[mem0]`）可查原因。
 
 完整契约（RPC 协议、表结构、降级矩阵、mem0 版本锁定原因）见
@@ -470,8 +470,8 @@ Lambda 调用许可要等函数存在才能建，脚本因此先用 `ApiEnabled=
   start-dev + `--import-realm`（realm 配置烧进镜像，重启自动恢复）；若容器
   收不到 `X-Forwarded-Proto` 导致 issuer 变 http，deploy.sh 会自动设置
   `KC_HOSTNAME` 强制 https。
-- **Aurora 冷恢复**：集群 MinCapacity=0 空闲自动暂停，首次连接会触发恢复
-  （15 秒~1 分钟）；首个问题偶尔偏慢属正常现象。冷恢复重连收敛在 db Lambda
+- **Aurora warm standby**：集群 MinCapacity=0.5，空闲时仍保留最小容量，
+  不进入自动暂停，避免首个问题等待冷恢复。连接重试仍收敛在 db Lambda
   内部（上限 240 秒 < 其 Lambda 超时 300 秒），各调用方按自己等得起的时长设
   invoke 超时：tasks-api 55 秒、runner 70 秒，Runtime 侧的会话历史读写收紧到
   30 秒——回灌等不起一分钟，超时就按空历史继续，宁可丢上下文也不挂住请求。
@@ -494,12 +494,13 @@ Lambda 调用许可要等函数存在才能建，脚本因此先用 `ApiEnabled=
 - **登录后调用返回 403**：确认前端拿到的 token audience 是 `analysis-runtime`
   （jwt.io 解码看 `aud`），以及 Runtime 的 authorizer discovery URL 与 Keycloak
   地址一致（Keycloak 重建后需重跑 deploy.sh 同步）。
-- **工具调用报数据库超时**：多为 Aurora 冷恢复中，重问一次即可。
+- **工具调用报数据库超时**：默认集群不会自动暂停；先查 Aurora 与 db Lambda
+  状态，恢复后重问。
 - **长期记忆不生效（换会话后不记得偏好）**：按顺序查 Runtime 的 CloudWatch
   日志里 `[mem0]` 前缀的行——`长期记忆禁用` 说明 `MEM0_LLM_MODEL` /
   `MEM0_LLM_BASE_URL` / `MEM0_LLM_API_KEY` / `MEM0_EMBEDDER_MODEL` 没配齐
-  （export 后重跑 deploy.sh）；`recall 超时` 多为 Aurora 冷恢复（0 ACU 唤醒
-  要几十秒），该会话检索被放弃且不重试，新开会话即可；`memorize 失败` 看
+  （export 后重跑 deploy.sh）；`recall 超时` 说明记忆数据面或模型端点瞬时不可用，
+  该会话检索被放弃且不重试，新开会话即可；`memorize 失败` 看
   具体报错——embedding 维度与表不符（`MEM0_EMBEDDER_DIMS` 和建表时不一致，
   换 `MEM0_COLLECTION` 重建）、提取模型输出非法 JSON（换个模型）都在此列。
   记忆链路任何故障都不影响正常对话。

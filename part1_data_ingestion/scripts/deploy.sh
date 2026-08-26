@@ -149,7 +149,7 @@ aws cloudformation deploy \
   --stack-name "$STACK_NAME" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region "$REGION" \
-  --parameter-overrides "WriterFunctionName=$WRITER_NAME"
+  --parameter-overrides "WriterFunctionName=$WRITER_NAME" "MinCapacityACU=0.5"
 
 POLICY_ARN=$(_stack_output AgentWriterInvokePolicyArn)
 CLUSTER_ARN=$(_stack_output ClusterArn)
@@ -171,7 +171,7 @@ pip install -q pg8000 -t "$WRITER_BUILD_DIR" >/dev/null
 rm -f "$DEPLOY_DIR/writer-lambda.zip"
 (cd "$WRITER_BUILD_DIR" && zip -qr "$DEPLOY_DIR/writer-lambda.zip" .)
 
-# timeout 300 秒：覆盖 handler 内最长 240 秒的冷恢复重连 + 语句执行
+# timeout 300 秒：覆盖 handler 内最长 240 秒的连接恢复 + 语句执行
 WRITER_ENV="Variables={DB_HOST=$CLUSTER_ENDPOINT,DB_NAME=$DATABASE,DB_SECRET_ARN=$SECRET_ARN}"
 if aws lambda get-function --function-name "$WRITER_NAME" --region "$REGION" >/dev/null 2>&1; then
   aws lambda update-function-code --function-name "$WRITER_NAME" --region "$REGION" \
@@ -205,7 +205,7 @@ fi
 
 echo "==> [3/6] 创建数据表（invoke 写库 Lambda 的 setup_tables）..."
 # DDL 全是 IF NOT EXISTS 系语句，幂等可重跑。新建函数首次调用可能撞 ENI 就绪
-# 延迟，集群空闲暂停时还要等冷恢复（handler 内最长等 240 秒），所以带重试。
+# 延迟或数据库瞬时不可用（handler 内最长等 240 秒），所以带重试。
 SETUP_OUT="$DEPLOY_DIR/setup_tables_out.json"
 for attempt in $(seq 1 5); do
   if aws lambda invoke --function-name "$WRITER_NAME" --region "$REGION" \

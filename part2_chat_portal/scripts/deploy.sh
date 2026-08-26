@@ -169,7 +169,7 @@ fi
 # Runtime 落库每轮报错，与其部署完再排查，不如现在快速失败。
 # 中国区没有 RDS Data API，预检经 Part 1 写库 Lambda 的只读 check_tables op
 #（此刻 Part 2 自己的 db Lambda 还没部署）；--cli-read-timeout 310 对齐其
-# 内部 240s 冷恢复重连。
+# 内部 240s 连接恢复。
 CHECK_PAYLOAD='{"op": "check_tables", "args": {"tables": ["chat_sessions", "chat_messages"]}}'
 _check_tables() {
   rm -f /tmp/check_tables_out.json /tmp/check_tables_invoke_err
@@ -409,7 +409,7 @@ else
   echo "    已创建 Lambda: $MEMORY_LAMBDA_NAME"
 fi
 
-# 初始化 pgvector 扩展并预建记忆表（集群冷恢复最长约 4 分钟，读超时给足；
+# 初始化 pgvector 扩展并预建记忆表（维护或瞬时故障时读超时给足；
 # 记忆是增强功能，初始化失败只警告不阻断——create_col 会在首次使用时兜底建表）
 echo "    初始化 pgvector 扩展与记忆表（$MEM0_COLLECTION, vector($MEM0_EMBEDDER_DIMS)）..."
 SETUP_PAYLOAD="{\"op\": \"setup\", \"args\": {\"collection\": \"$MEM0_COLLECTION\", \"dims\": $MEM0_EMBEDDER_DIMS}}"

@@ -17,8 +17,8 @@
   RDS Data API，此为可移植形态），本函数自身不进 VPC；db Lambda 直连时不设
   只读参数，也就不受分析链路那个只读会话（default_transaction_read_only=on）
   的限制。
-- 集群 MinCapacity=0 会空闲自动暂停，首次查询触发冷恢复——等待下沉在 db Lambda
-  内部（上限 240s），_execute 只管自身超时（55s），等不到就放弃报错。
+- 集群 MinCapacity=0.5 保持 warm standby；连接恢复下沉在 db Lambda 内部
+  （上限 240s），_execute 只管自身超时（55s），等不到就放弃报错。
 - 只依赖 boto3/botocore（Lambda runtime 自带），zip 里就一个文件。
 - Live View 的 presigned URL 必须由服务端签（SigV4 凭证不下发浏览器）。
 """
@@ -92,7 +92,7 @@ def _execute(sql: str, parameters: list | None = None) -> list[dict]:
     """执行一条 SQL 并返回行（list[dict]，等价原 Data API formatRecordsAs=JSON）。
 
     经 lambda.invoke 调 VPC 内数据面 db Lambda（pg8000 直连 Aurora，:name
-    占位符与 ::TYPE cast 原样支持）；集群冷恢复的等待在 db Lambda 内部完成
+    占位符与 ::TYPE cast 原样支持）；连接恢复在 db Lambda 内部完成
     （上限 240s），这里只管超时放弃。
     """
     if not DB_LAMBDA_NAME:
@@ -752,7 +752,7 @@ def list_user_memories(user_name: str) -> dict:
 
     读路径：lambda.invoke 记忆向量 Lambda 的 list op，payload 里的 data 即
     记忆文本（键形约定见 .trellis/spec/backend/mem0-long-term-memory.md）。
-    记忆是增强功能：Lambda 未配置/不可达/集群冷恢复时降级返回空列表 +
+    记忆是增强功能：Lambda 未配置/不可达/数据面瞬时故障时降级返回空列表 +
     degraded 标记，不给门户抛 500。
     """
     if not MEMORY_LAMBDA_NAME:

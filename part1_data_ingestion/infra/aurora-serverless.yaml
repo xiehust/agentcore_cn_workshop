@@ -15,8 +15,9 @@ Parameters:
     Default: product_hunting
   MinCapacityACU:
     Type: Number
-    Default: 0
-    Description: 0 = 空闲自动暂停（冷恢复约 15 秒~1 分钟，写库 Lambda 已做重试）
+    Default: 0.5
+    MinValue: 0.5
+    Description: 最小 0.5 ACU，保持 warm standby，不进入自动暂停
   MaxCapacityACU:
     Type: Number
     Default: 2

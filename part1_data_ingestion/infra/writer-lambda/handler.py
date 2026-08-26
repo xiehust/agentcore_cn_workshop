@@ -52,9 +52,8 @@ def _credentials():
 
 
 def _connect():
-    """建立连接。集群 MinCapacity=0 空闲自动暂停，首个连接会触发冷恢复
-    （约 15 秒~1 分钟），失败后重试而不是直接报错。等待上限 240 秒——
-    这份「等冷恢复」的职责原先在 Agent 进程里，现在下沉到本函数
+    """建立连接。集群 MinCapacity=0.5 保持 warm standby；维护或瞬时故障时
+    失败重试而不是直接报错。等待上限 240 秒——这份连接恢复职责下沉到本函数
     （Lambda timeout 300s，Agent 侧 read_timeout 310s）。
 
     timeout=10 是 socket 超时，pg8000 连上后不会重置它，所以后续每条语句的

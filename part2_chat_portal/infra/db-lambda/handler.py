@@ -21,7 +21,7 @@ to_char 格式串里的引号内冒号——已实测）。
 
 请求协议（event）：
     {"op": "execute", "args": {"sql": "...", "params": {"name": "value", ...},
-     "deadline_s": 45}}   # 可选：执行应用 SQL 前的健康检查/冷恢复预算（秒）
+     "deadline_s": 45}}   # 可选：执行应用 SQL 前的健康检查/连接恢复预算（秒）
 响应：
     {"status": "ok", "rows": [...]} / {"status": "error", "error": "..."}
 """
@@ -57,7 +57,7 @@ def _deadline(deadline_s: float) -> float:
 
 
 def _connect(deadline: float):
-    """在绝对截止点前建立连接；冷恢复重试不会重置整次调用的预算。"""
+    """在绝对截止点前建立连接；恢复重试不会重置整次调用的预算。"""
     user, password = _credentials()
     # Aurora PostgreSQL 强制 SSL；RDS CA 不在系统信任链里，demo 不做证书校验
     ctx = ssl.create_default_context()
@@ -130,7 +130,7 @@ def op_execute(args: dict):
     if not sql.strip():
         raise ValueError("缺少 sql")
     params = args.get("params") or {}
-    # 应用 SQL 开始前的探活/冷恢复预算由调用方限定，缺省 240s
+    # 应用 SQL 开始前的探活/连接恢复预算由调用方限定，缺省 240s
     try:
         deadline_s = float(args.get("deadline_s") or 240)
     except (TypeError, ValueError):

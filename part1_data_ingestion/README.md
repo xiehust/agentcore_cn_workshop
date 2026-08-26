@@ -71,8 +71,8 @@ bash scripts/deploy.sh
 
 | 步骤 | 内容 | 说明 |
 |------|------|------|
-| 1 | CloudFormation 部署 Aurora Serverless v2 | 自建 VPC + 私有子网 + Aurora（Min 0 ACU 自动暂停）+ Secrets Manager 接口端点 + 写库 Lambda 角色 + IAM 策略。VPC 与端点由本栈拥有，Part 2 的分析 Lambda 共用 |
-| 2 | 打包并部署写库 Lambda | 挂私有子网 + client 安全组，pg8000 直连集群 5432；zip 里含 `handler.py`、`setup_tables.sql` 与 pg8000 依赖；超时 300 秒（覆盖集群冷恢复） |
+| 1 | CloudFormation 部署 Aurora Serverless v2 | 自建 VPC + 私有子网 + Aurora（Min 0.5 ACU，保持 warm standby）+ Secrets Manager 接口端点 + 写库 Lambda 角色 + IAM 策略。VPC 与端点由本栈拥有，Part 2 的分析 Lambda 共用 |
+| 2 | 打包并部署写库 Lambda | 挂私有子网 + client 安全组，pg8000 直连集群 5432；zip 里含 `handler.py`、`setup_tables.sql` 与 pg8000 依赖；超时 300 秒（覆盖连接恢复） |
 | 3 | 建表 | `aws lambda invoke` 触发写库 Lambda 的 `setup_tables`：业务表 `selection_verdicts`（判定记录）、`product_candidates`（候选档案），以及 Part 2 门户用的五张表（任务管理三表 + 会话历史两表，见下节）。DDL 逐条幂等执行 |
 | 4 | 创建自定义 Browser 与 Browser Profile | browser 开启 Web Bot Auth（请求签名，减少验证码，预览功能）；profile 跨会话保留 cookies/localStorage。均按名字幂等，重复执行会复用 |
 | 5 | `agentcore configure && agentcore launch` | direct_code_deploy 直接部署代码到 Runtime（无需 Docker），并注入 `WRITER_LAMBDA_NAME`、browser/profile ID 等环境变量 |
@@ -234,10 +234,9 @@ agentcore invoke -l '{"prompt": "..."}'
   数据库客户端也无需 Data API，部署链路同样零 Data API 依赖。DDL 全是
   `IF NOT EXISTS` 系语句，重跑安全。**新增 DDL 时不要引入 dollar-quoted 块
   （`$$ ... $$`）**——handler 按分号拆句执行，函数体会被切碎。
-- **冷启动首次写库会不会超时**：集群 Min 0 ACU 空闲自动暂停，冷恢复约
-  15 秒~1 分钟。超时链是对齐好的：handler 内连接重试上限 240 秒 <
-  Lambda 超时 300 秒 < Agent 侧 boto3 `read_timeout` 310 秒，且 Agent 侧关掉
-  了 boto3 重试（等待只在一处自旋，也避免超时后重复写入）。
+- **首次写库会不会等冷恢复**：默认 Min 0.5 ACU，集群保持 warm standby，
+  不会因空闲自动暂停。连接重试与超时链仍保留，覆盖手工维护、故障恢复等瞬时
+  不可用：handler 240 秒 < Lambda 300 秒 < Agent 侧 `read_timeout` 310 秒。
 - **Browser Profile 何时保存**：每次调用结束时（`invoke` 的 finally）自动把
   会话 cookies/localStorage 存回 profile，下次会话启动时恢复。不想复用状态
   就部署时不传 `BROWSER_PROFILE_ID`。
