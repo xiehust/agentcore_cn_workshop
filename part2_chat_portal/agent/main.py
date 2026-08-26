@@ -28,16 +28,16 @@
 import asyncio
 import json
 import os
-import re
-import time
+import threading
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.config import Config as BotoConfig
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
-from strands.models.openai_responses import OpenAIResponsesModel
+from strands.models.openai import OpenAIModel
 from strands.tools.mcp import MCPClient
 from strands_tools.code_interpreter import AgentCoreCodeInterpreter
 from mcp.client.streamable_http import streamablehttp_client
@@ -48,8 +48,12 @@ import memory_backend
 
 # ---- 配置（deploy.sh 注入） ----
 REGION = os.environ.get("AWS_REGION", "us-west-2")
+# 模型走任意 OpenAI 兼容的 Chat Completions 端点，三元组 env 注入：
+# 全球区默认 bedrock-mantle（其 /chat/completions 已实测可用，key 用 Bedrock
+# API key）；中国区没有 Bedrock，改 export 区内模型服务商的三元组即可
 MODEL_ID = os.environ.get("MODEL_ID", "openai.gpt-5.6-terra")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://bedrock-mantle.us-east-1.api.aws/openai/v1")
+# 兼容原部署习惯：AWS_BEARER_TOKEN_BEDROCK（Bedrock API key）可作为 key 来源
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
 # Gateway 的 MCP 端点 URL
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "")
@@ -59,10 +63,10 @@ IDENTITY_PROVIDER_NAME = os.environ.get("IDENTITY_PROVIDER_NAME", "")
 KC_TOKEN_URL = os.environ.get("KC_TOKEN_URL", "")
 KC_CLIENT_ID = os.environ.get("KC_CLIENT_ID", "analysis-agent")
 KC_CLIENT_SECRET = os.environ.get("KC_CLIENT_SECRET", "")
-# 会话历史持久化（RDS Data API，不挂 VPC；两个 ARN 缺一就整体降级为纯内存）
-AURORA_CLUSTER_ARN = os.environ.get("AURORA_CLUSTER_ARN", "")
-AURORA_SECRET_ARN = os.environ.get("AURORA_SECRET_ARN", "")
-AURORA_DATABASE = os.environ.get("AURORA_DATABASE", "product_hunting")
+# 会话历史持久化：经 VPC 内数据面 Lambda（pg8000 直连 Aurora）读写——
+# 中国区没有 RDS Data API，Runtime 自身也不挂 VPC，lambda.invoke 是两个分区
+# 通用的形态。缺该变量就整体降级为纯内存历史（本地裸跑依赖这一点）
+DB_LAMBDA_NAME = os.environ.get("DB_LAMBDA_NAME", "")
 
 app = BedrockAgentCoreApp()
 
@@ -94,19 +98,31 @@ SYSTEM_PROMPT = """你是跨境电商选品数据分析助手，运行在 Amazon
 """
 
 
-def _create_model() -> OpenAIResponsesModel:
-    """GPT-5.6 Terra 走 Bedrock 的 OpenAI 兼容端点（bedrock-mantle）。
-    优先显式 key（OPENAI_API_KEY / AWS_BEARER_TOKEN_BEDROCK，须是 Bedrock API
-    key）；未设置则用 Runtime IAM 角色自动铸 bearer token。"""
-    if OPENAI_API_KEY:
-        return OpenAIResponsesModel(
-            model_id=MODEL_ID,
-            client_args={"api_key": OPENAI_API_KEY, "base_url": OPENAI_BASE_URL},
+def _create_model() -> OpenAIModel:
+    """标准 OpenAI 兼容 Chat Completions：端点 + key + 模型名三元组。
+
+    统一 OpenAIModel（不再用 Responses API 专属的 OpenAIResponsesModel）——
+    两个分区同一形态：全球区指 bedrock-mantle（Bedrock API key），中国区指
+    区内模型服务商端点。IAM 铸 token 分支已删除（CN 无等价物），key 必填。
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError(
+            "缺少模型 API key：请设置 OPENAI_API_KEY（或 AWS_BEARER_TOKEN_BEDROCK，"
+            "使用 Bedrock API key 时），并确认 OPENAI_BASE_URL / MODEL_ID 与之配套"
         )
-    m = re.match(r"https://bedrock-mantle\.([a-z0-9-]+)\.api\.aws", OPENAI_BASE_URL)
-    return OpenAIResponsesModel(
+    # reasoning_effort：gpt-5.6-terra 经 /chat/completions 使用函数工具时必须
+    # 显式置 none（端点 400 明示，实测）。自定义端点缺省不发该参数（严格实现
+    # 可能拒绝未知参数），需要时用 MODEL_REASONING_EFFORT 显式指定
+    params: dict = {}
+    reasoning = os.environ.get("MODEL_REASONING_EFFORT")
+    if reasoning:
+        params["reasoning_effort"] = reasoning
+    elif "bedrock-mantle" in OPENAI_BASE_URL:
+        params["reasoning_effort"] = "none"
+    return OpenAIModel(
         model_id=MODEL_ID,
-        bedrock_mantle_config={"region": m.group(1) if m else REGION},
+        client_args={"api_key": OPENAI_API_KEY, "base_url": OPENAI_BASE_URL},
+        params=params or None,
     )
 
 
@@ -163,55 +179,71 @@ _MEMORY_SECTION: dict[str, str] = {}
 # session_id -> 会话归属用户（chat_sessions.user_name；None=查不到，不再重查）
 _SESSION_USER: dict[str, str | None] = {}
 
-# ---- 会话历史持久化（chat_messages 表，RDS Data API） ----
+# 流尾工作必须脱离 SSE 生命周期，否则历史落库或 mem0 变慢会让浏览器一直等 EOF。
+# 两个固定大小的池分开：记忆最长可等 MEM0_ADD_TIMEOUT，不能反过来占满历史落库
+# worker。AgentCore async task 从调度到两段工作全部结束一直保持 active，让 /ping
+# 报 HealthyBusy，避免响应结束后 microVM 把尚未完成的线程当空闲工作冻结。
+_PERSIST_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chat-persist")
+_MEMORY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chat-memory")
+# 固定分片锁避免 session->lock 字典随历史会话数永久增长。持久化与记忆分开加锁：
+# 同一会话的记忆按轮次串行，但后一轮历史落库无需等待前一轮最长 60s 的记忆提取。
+_FINALIZE_LOCK_SHARDS = 32
+_PERSIST_LOCKS = tuple(threading.Lock() for _ in range(_FINALIZE_LOCK_SHARDS))
+_MEMORY_LOCKS = tuple(threading.Lock() for _ in range(_FINALIZE_LOCK_SHARDS))
+
+# ---- 会话历史持久化（chat_messages 表，经 VPC 内数据面 Lambda） ----
 # 全部 best-effort：读失败按空历史继续，写失败只打日志，绝不影响 SSE 流。
 
-# 单条消息 JSON 上限：Data API 单参数 512KB，留余量；超了降级存裁剪版
+# 单条消息 JSON 上限：lambda.invoke 请求 6MB，300KB 留足余量；超了降级存裁剪版
 _MAX_CONTENT_BYTES = 300 * 1024
-# 冷恢复退避上限：回灌等不起 tasks-api 那样的 50 秒，宁可丢上下文不可挂请求
-_DB_DEADLINE_S = 20
+# 数据面 Lambda 的读超时：数据库连接恢复在 Lambda 内部处理（上限 240s），
+# 回灌等不起那么久——宁可丢上下文不可挂请求，30 秒等不到就放弃
+_DB_READ_TIMEOUT_S = 30
 
-_rds_client_cache = None
+_db_lambda_cache = None
 
 
 def _db_enabled() -> bool:
-    """两个 ARN 齐全才落库；本地 python main.py 裸跑时退化为纯内存历史。"""
-    return bool(AURORA_CLUSTER_ARN and AURORA_SECRET_ARN)
+    """配了数据面 Lambda 才落库；本地 python main.py 裸跑时退化为纯内存历史。"""
+    return bool(DB_LAMBDA_NAME)
 
 
-def _rds_client():
-    global _rds_client_cache
-    if _rds_client_cache is None:
-        _rds_client_cache = boto3.client("rds-data", region_name=REGION)
-    return _rds_client_cache
+def _db_lambda():
+    global _db_lambda_cache
+    if _db_lambda_cache is None:
+        # 禁重试：SQL 层有 ON CONFLICT/主键幂等兜底，但重试只会放大尾延迟
+        _db_lambda_cache = boto3.client(
+            "lambda", region_name=REGION,
+            config=BotoConfig(connect_timeout=5, read_timeout=_DB_READ_TIMEOUT_S,
+                              retries={"max_attempts": 0}),
+        )
+    return _db_lambda_cache
 
 
-def _p(name: str, value) -> dict:
-    """Data API 参数（统一转字符串，SQL 里按需 cast）。"""
-    return {"name": name, "value": {"stringValue": "" if value is None else str(value)}}
+def _p(name: str, value) -> tuple[str, str]:
+    """SQL 命名参数（统一转字符串，SQL 里按需 cast——与 Data API 时代同语义）。"""
+    return (name, "" if value is None else str(value))
 
 
 def _db_execute(sql: str, parameters: list) -> list[dict]:
-    """执行一条 SQL 并返回行。集群 MinCapacity=0 空闲暂停，冷恢复期退避重试。"""
-    deadline = time.time() + _DB_DEADLINE_S
-    while True:
-        try:
-            resp = _rds_client().execute_statement(
-                resourceArn=AURORA_CLUSTER_ARN,
-                secretArn=AURORA_SECRET_ARN,
-                database=AURORA_DATABASE,
-                sql=sql,
-                parameters=parameters,
-                formatRecordsAs="JSON",
-            )
-            return json.loads(resp.get("formattedRecords") or "[]")
-        except ClientError as e:
-            code = e.response.get("Error", {}).get("Code", "")
-            if (code == "DatabaseResumingException" or "resum" in str(e).lower()) \
-                    and time.time() < deadline:
-                time.sleep(3)
-                continue
-            raise
+    """执行一条 SQL 并返回行（list[dict]，等价原 Data API formatRecordsAs=JSON）。
+
+    经 lambda.invoke 调 VPC 内数据面 Lambda（pg8000 直连 Aurora，:name 占位符
+    原样支持）；连接恢复在 Lambda 内部完成，这里只管超时放弃。
+    """
+    resp = _db_lambda().invoke(
+        FunctionName=DB_LAMBDA_NAME,
+        Payload=json.dumps(
+            # deadline_s < read_timeout(30s)：调用方放弃时 Lambda 必已先放弃
+            # 连接、语句从未执行，保住「超时 = 零写入」的原子失败语义
+            {"op": "execute", "args": {"sql": sql, "params": dict(parameters), "deadline_s": 25}},
+            ensure_ascii=False,
+        ).encode("utf-8"),
+    )
+    body = json.loads(resp["Payload"].read())
+    if resp.get("FunctionError") or not isinstance(body, dict) or body.get("status") != "ok":
+        raise RuntimeError(f"db lambda execute 失败: {body}")
+    return body.get("rows") or []
 
 
 def _display_text(message: dict) -> str | None:
@@ -365,8 +397,8 @@ def _memory_user(session_id: str) -> str | None:
     该列由 tasks-api Lambda 从已验证的 Keycloak JWT 写入（身份可信）——
     Runtime 自身拿不到用户身份，长期记忆按用户隔离只能走这条反查路径。
     确认无归属（chat_test.sh 的 smoke-* 会话未注册、本地裸跑无库）缓存
-    None 不再重查；查询异常（多为集群冷恢复）**不缓存**——流尾 memorize
-    再调时集群多半已被本轮对话唤醒，可以补上。best-effort，失败不阻断对话。
+    None 不再重查；查询异常**不缓存**——流尾 memorize 再调时数据面可能已经
+    恢复，可以补上。best-effort，失败不阻断对话。
     """
     if session_id in _SESSION_USER:
         return _SESSION_USER[session_id]
@@ -396,6 +428,90 @@ def _render_memory_section(memories: list[str]) -> str:
         "以下是该用户在过去会话中沉淀的分析偏好与事实（按相关度排序）。"
         "回答时自然运用，不要逐条复述，也不要向用户提及记忆系统本身：\n" + lines
     )
+
+
+def _session_lock(locks: tuple, session_id: str):
+    """从固定分片里取同一 session 的串行锁；hash 碰撞只会多串行，不影响正确性。"""
+    return locks[hash(session_id) % len(locks)]
+
+
+def _complete_finalize(task_id: int, session_id: str) -> None:
+    """完成 AgentCore tracked task；统一收口，防止异常路径把 Runtime 永久留在 busy。"""
+    if not app.complete_async_task(task_id):
+        print(f"[finalize] async task 已不存在: session={session_id}")
+
+
+def _memorize_then_complete(
+    task_id: int,
+    session_id: str,
+    prompt: str,
+    reply_text: str,
+) -> None:
+    """后台记忆写回；在线程自己的 event loop 运行 async mem0 包装。"""
+    try:
+        with _session_lock(_MEMORY_LOCKS, session_id):
+            # 首轮反查可能早于前端注册 INSERT，把缓存的 None 弹掉后补查一次。
+            if _SESSION_USER.get(session_id) is None:
+                _SESSION_USER.pop(session_id, None)
+            user_id = _memory_user(session_id)
+            asyncio.run(memory_backend.memorize(user_id, prompt, reply_text))
+    except Exception as e:
+        # memory_backend 自身已降级兜底；这里再守住线程/event-loop 层的意外。
+        print(f"[finalize] 记忆写回异常: session={session_id} {type(e).__name__}: {e}")
+    finally:
+        _complete_finalize(task_id, session_id)
+
+
+def _persist_then_schedule_memory(
+    task_id: int,
+    session_id: str,
+    messages: list,
+    prompt: str,
+    reply_text: str,
+) -> None:
+    """先持久化本轮完整消息，再把慢 Mem0 阶段转交独立线程池。"""
+    try:
+        with _session_lock(_PERSIST_LOCKS, session_id):
+            _persist_new(session_id, messages)
+    except Exception as e:
+        # _persist_new 按条兜底；此处处理锁/线程等函数边界外的意外。
+        print(f"[finalize] 历史落库异常: session={session_id} {type(e).__name__}: {e}")
+
+    if not memory_backend.enabled() or not reply_text:
+        _complete_finalize(task_id, session_id)
+        return
+
+    try:
+        _MEMORY_EXECUTOR.submit(
+            _memorize_then_complete,
+            task_id,
+            session_id,
+            prompt,
+            reply_text,
+        )
+    except Exception as e:
+        print(f"[finalize] 记忆任务提交失败: session={session_id} {type(e).__name__}: {e}")
+        _complete_finalize(task_id, session_id)
+
+
+def _schedule_finalize(session_id: str, messages: list, prompt: str, reply_text: str) -> None:
+    """注册并调度流尾工作；调用返回后 async generator 可以立即结束。"""
+    task_id = app.add_async_task("chat_turn_finalize", {"session_id": session_id})
+    # Strands 的流式文本可能没有以换行结尾；先断行，避免回复正文与诊断前缀粘在
+    # 同一条 CloudWatch 事件里，导致按 [finalize] 检索时顺带暴露回答内容。
+    print(f"\n[finalize] 已调度后台收尾: session={session_id}")
+    try:
+        _PERSIST_EXECUTOR.submit(
+            _persist_then_schedule_memory,
+            task_id,
+            session_id,
+            messages,
+            prompt,
+            reply_text,
+        )
+    except Exception as e:
+        print(f"[finalize] 历史任务提交失败: session={session_id} {type(e).__name__}: {e}")
+        _complete_finalize(task_id, session_id)
 
 
 @app.entrypoint
@@ -439,7 +555,7 @@ async def invoke(payload: dict, context=None):
         except asyncio.TimeoutError:
             # gather 里只有 wait_for 会抛 TimeoutError；token 任务此时已完成/
             # 将完成，重取一次命中 Identity token vault 缓存，代价可忽略
-            print("[mem0] 会话首轮记忆管道超时（多为集群冷恢复），本会话无记忆注入")
+            print("[mem0] 会话首轮记忆管道超时（数据面或模型端点瞬时不可用），本会话无记忆注入")
             token, memories = await _gateway_token(), []
         _MEMORY_SECTION[session_id] = _render_memory_section(memories)
     else:
@@ -464,23 +580,12 @@ async def invoke(payload: dict, context=None):
             if "data" in event:
                 yield event["data"]
         _HISTORY[session_id] = agent.messages
-        # 落库放在流结束之后：本身是 best-effort，慢一点也不占用回答时延
-        await asyncio.to_thread(_persist_new, session_id, agent.messages)
-        # 长期记忆写回：本轮问答交 mem0 做 LLM 事实提取（与既有记忆去重/合并）。
-        # 必须 await——microVM 在响应结束后可能被冻结，fire-and-forget 会丢写；
-        # 代价是 SSE 流关闭最坏再晚 MEM0_ADD_TIMEOUT（默认 20s，正文已全部
-        # 送达，仅前端 busy 态解除变晚；连续失败有熔断兜底）。
-        # 归属带补查：首轮 SELECT 可能跑在前端注册会话的 INSERT 之前（两者并发）
-        # 而缓存下 None——流尾此刻行早已提交、集群也已被本轮唤醒，弹掉缓存
-        # 重查一次，否则整个会话的记忆写入都会静默丢失。真正未注册的会话
-        # （smoke-*）每轮只多付一次流后的 best-effort SELECT，不占回答时延。
-        # 本会话新沉淀的事实对当前会话不注入（上下文在场），下个新会话生效
-        if memory_backend.enabled():
-            if _SESSION_USER.get(session_id) is None:
-                _SESSION_USER.pop(session_id, None)
-            user_id = await asyncio.to_thread(_memory_user, session_id)
-            reply_text = _display_text(agent.messages[-1]) if agent.messages else None
-            await memory_backend.memorize(user_id, prompt, reply_text or "")
+        # 历史落库 + 长期记忆写回由 AgentCore tracked async task 承接。任务期间
+        # /ping 保持 HealthyBusy，既能让 SSE 立即 EOF，也不会在响应后丢掉后台写入。
+        # 快照与本轮回复在当前 Agent 生命周期内取好，后台不再访问 agent 对象。
+        messages = list(agent.messages)
+        reply_text = _display_text(messages[-1]) if messages else None
+        _schedule_finalize(session_id, messages, prompt, reply_text or "")
 
 
 if __name__ == "__main__":

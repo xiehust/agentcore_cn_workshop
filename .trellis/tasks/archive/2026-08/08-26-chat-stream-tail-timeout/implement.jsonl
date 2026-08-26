@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/chat-sessions-module.md", "reason": "会话历史持久化、db Lambda、游标与回灌完整性契约"}
+{"file": ".trellis/spec/backend/mem0-long-term-memory.md", "reason": "Mem0 写回时机、超时、线程池与降级契约"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Runtime SSE 与前端错误状态的跨层边界"}
+{"file": ".trellis/tasks/08-26-chat-stream-tail-timeout/research/root-cause.md", "reason": "线上时间线和 AgentCore async task API 证据"}

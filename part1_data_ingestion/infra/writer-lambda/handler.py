@@ -13,7 +13,7 @@ analytics Lambda 同构（Gateway -> Lambda(VPC) -> Aurora），共同验证
 子网无 IGW/NAT）。
 
 请求协议（event）：
-    {"op": "save_verdict" | "save_candidate" | "setup_tables",
+    {"op": "save_verdict" | "save_candidate" | "setup_tables" | "check_tables",
      "args": {…工具入参原样…},
      "run_id": "uuid 或 null"}
 响应：
@@ -52,9 +52,8 @@ def _credentials():
 
 
 def _connect():
-    """建立连接。集群 MinCapacity=0 空闲自动暂停，首个连接会触发冷恢复
-    （约 15 秒~1 分钟），失败后重试而不是直接报错。等待上限 240 秒——
-    这份「等冷恢复」的职责原先在 Agent 进程里，现在下沉到本函数
+    """建立连接。集群 MinCapacity=0.5 保持 warm standby；维护或瞬时故障时
+    失败重试而不是直接报错。等待上限 240 秒——这份连接恢复职责下沉到本函数
     （Lambda timeout 300s，Agent 侧 read_timeout 310s）。
 
     timeout=10 是 socket 超时，pg8000 连上后不会重置它，所以后续每条语句的
@@ -208,6 +207,28 @@ def save_candidate(args: dict, run_id: str | None) -> dict:
     return {"status": "ok", "detail": args.get("product_name_cn")}
 
 
+def check_tables(args: dict, _run_id: str | None) -> dict:
+    """只读预检：确认给定表是否都已存在（Part 2 部署脚本用——中国区没有
+    RDS Data API，预检不能再走 aws rds-data，改为 invoke 本函数）。
+
+    入参 args: {"tables": ["chat_sessions", ...]}
+    响应 detail: {"expected": N, "found": M, "missing": [...]}
+    """
+    tables = [str(t) for t in (args.get("tables") or []) if str(t).strip()]
+    if not tables:
+        return {"status": "error", "error": "缺少 tables 入参"}
+    rows = _run(
+        "SELECT tablename FROM pg_tables WHERE tablename = ANY(:names)",
+        names=tables,
+    )
+    found = {r[0] for r in (rows or [])}
+    missing = [t for t in tables if t not in found]
+    return {
+        "status": "ok",
+        "detail": {"expected": len(tables), "found": len(found), "missing": missing},
+    }
+
+
 def setup_tables(_args: dict, _run_id: str | None) -> dict:
     """建表：执行随部署包一起打进来的 setup_tables.sql（不吃入参，签名对齐 OPS 分发）。
 
@@ -228,6 +249,7 @@ OPS = {
     "save_verdict": save_verdict,
     "save_candidate": save_candidate,
     "setup_tables": setup_tables,
+    "check_tables": check_tables,
 }
 
 

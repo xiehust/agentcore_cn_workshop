@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/chat-sessions-module.md", "reason": "检查 db Lambda 持久化顺序、seq 连续性和最终一致性"}
+{"file": ".trellis/spec/backend/mem0-long-term-memory.md", "reason": "检查记忆失败不阻断 SSE 及熔断语义"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "检查前后端流错误语义一致"}
+{"file": ".trellis/tasks/08-26-chat-stream-tail-timeout/research/root-cause.md", "reason": "用已确认故障时间线验证修复针对根因"}

@@ -32,12 +32,10 @@ import uuid
 import boto3
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
-from botocore.exceptions import ClientError
+from botocore.config import Config
 
 REGION = os.environ.get("AWS_REGION", "us-west-2")
-CLUSTER_ARN = os.environ.get("AURORA_CLUSTER_ARN", "")
-SECRET_ARN = os.environ.get("AURORA_SECRET_ARN", "")
-DATABASE = os.environ.get("AURORA_DATABASE", "product_hunting")
+DB_LAMBDA_NAME = os.environ.get("DB_LAMBDA_NAME", "")
 PART1_RUNTIME_ARN = os.environ.get("PART1_RUNTIME_ARN", "")
 
 # 文本增量节流：攒够 FLUSH_CHARS 或者遇到换行且距上次 flush 超过 FLUSH_SECONDS
@@ -45,45 +43,54 @@ PART1_RUNTIME_ARN = os.environ.get("PART1_RUNTIME_ARN", "")
 FLUSH_CHARS = 400
 FLUSH_SECONDS = 2.0
 
-_rds = None
+_db_lambda_client = None
+_runtime_client = None
 
 
 # ---------------------------------------------------------------- 数据访问 ----
 
-def _rds_client():
-    global _rds
-    if _rds is None:
-        _rds = boto3.client("rds-data", region_name=REGION)
-    return _rds
+def _db_lambda():
+    """数据面 db Lambda 专用 client：read_timeout=70s + 禁重试。
+
+    runner 自身 timeout 900s，但等 DB 不该占掉消费 SSE 的预算；事件写失败
+    已被 emit 的 try/except 兜底，等不到就放弃。
+    """
+    global _db_lambda_client
+    if _db_lambda_client is None:
+        _db_lambda_client = boto3.client(
+            "lambda", region_name=REGION,
+            config=Config(connect_timeout=5, read_timeout=70,
+                          retries={"max_attempts": 0}),
+        )
+    return _db_lambda_client
 
 
 def _execute(sql: str, parameters: list | None = None) -> list[dict]:
-    """执行一条 SQL，返回行（list[dict]）。集群冷恢复时退避重试。"""
-    kwargs: dict = {
-        "resourceArn": CLUSTER_ARN,
-        "secretArn": SECRET_ARN,
-        "database": DATABASE,
-        "sql": sql,
-        "formatRecordsAs": "JSON",
-    }
-    if parameters:
-        kwargs["parameters"] = parameters
-    deadline = time.time() + 50
-    while True:
-        try:
-            resp = _rds_client().execute_statement(**kwargs)
-            return json.loads(resp.get("formattedRecords") or "[]")
-        except ClientError as e:
-            code = e.response.get("Error", {}).get("Code", "")
-            if (code == "DatabaseResumingException" or "resum" in str(e).lower()) \
-                    and time.time() < deadline:
-                time.sleep(5)
-                continue
-            raise
+    """执行一条 SQL 并返回行（list[dict]，等价原 Data API formatRecordsAs=JSON）。
+
+    经 lambda.invoke 调 VPC 内数据面 db Lambda（pg8000 直连 Aurora，:name
+    占位符与 ::TYPE cast 原样支持）；连接恢复在 db Lambda 内部完成
+    （上限 240s），这里只管超时放弃。
+    """
+    if not DB_LAMBDA_NAME:
+        raise RuntimeError("缺少 DB_LAMBDA_NAME 环境变量")
+    resp = _db_lambda().invoke(
+        FunctionName=DB_LAMBDA_NAME,
+        Payload=json.dumps(
+            # deadline_s < read_timeout(70s)：保住「超时 = 零写入」原子失败语义
+            {"op": "execute", "args": {"sql": sql, "params": dict(parameters or []), "deadline_s": 60}},
+            ensure_ascii=False,
+        ).encode("utf-8"),
+    )
+    body = json.loads(resp["Payload"].read())
+    if resp.get("FunctionError") or not isinstance(body, dict) or body.get("status") != "ok":
+        raise RuntimeError(f"db lambda execute 失败: {body}")
+    return body.get("rows") or []
 
 
-def _p(name: str, value) -> dict:
-    return {"name": name, "value": {"stringValue": "" if value is None else str(value)}}
+def _p(name: str, value) -> tuple[str, str]:
+    """SQL 命名参数（统一转字符串，SQL 里按需 cast / NULLIF——与 Data API 时代同语义）。"""
+    return (name, "" if value is None else str(value))
 
 
 # ---------------------------------------------------------------- 事件写入 ----
@@ -128,6 +135,19 @@ def _build_runtime_prompt(country: str | None, prompt: str) -> str:
     return f"{directive}\n\n{prompt}"
 
 
+def _runtime():
+    """AgentCore 数据面 client：摄入任务可运行 2~5 分钟，不能用 SDK 默认 60s 读超时。"""
+    global _runtime_client
+    if _runtime_client is None:
+        _runtime_client = boto3.client(
+            "bedrock-agentcore",
+            region_name=REGION,
+            config=Config(connect_timeout=5, read_timeout=870,
+                          retries={"max_attempts": 0}),
+        )
+    return _runtime_client
+
+
 def _invoke_runtime_stream(session_id: str, payload: dict):
     """调 Part 1 Runtime 并返回 SSE 的按行迭代器。
 
@@ -137,7 +157,7 @@ def _invoke_runtime_stream(session_id: str, payload: dict):
     """
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     try:
-        client = boto3.client("bedrock-agentcore", region_name=REGION)
+        client = _runtime()
     except Exception as e:
         print(f"[runner] boto3 无 bedrock-agentcore 数据面模型，改用 SigV4 直连: {e}")
         return _invoke_runtime_stream_signed(session_id, body)
@@ -154,10 +174,16 @@ def _invoke_runtime_stream(session_id: str, payload: dict):
 
 
 def _invoke_runtime_stream_signed(session_id: str, body: bytes):
-    """SigV4 直连数据面端点的兜底实现，返回按行迭代器。"""
+    """SigV4 直连数据面端点的兜底实现，返回按行迭代器。
+
+    端点不走 boto3 解析：本路径本身就是「boto3 缺 bedrock-agentcore 服务模型」
+    时才会走的（数据面与控制面模型同批发布，缺一个多半两个都缺），所以按
+    REGION 前缀推导分区域名后缀（cn-* -> amazonaws.com.cn），不依赖任何服务模型。
+    """
     escaped = urllib.parse.quote(PART1_RUNTIME_ARN, safe="")
+    dns_suffix = "amazonaws.com.cn" if REGION.startswith("cn-") else "amazonaws.com"
     url = (
-        f"https://bedrock-agentcore.{REGION}.amazonaws.com"
+        f"https://bedrock-agentcore.{REGION}.{dns_suffix}"
         f"/runtimes/{escaped}/invocations?qualifier=DEFAULT"
     )
     headers = {

@@ -19,12 +19,9 @@ agentcore invoke '{"prompt": "从 eBay 英国站搜索 desk organizer 选品，�
 # 示例 5：亚马逊站点（需先配置住宅代理，否则会被 503 拦截，见 README 常见问题）
 # agentcore invoke '{"prompt": "从亚马逊英国站搜索 desk organizer，对第 1 个非广告商品做选品判定并入库"}'
 
-# 验证入库结果（RDS Data API 查询，同步返回结果）：
-# CLUSTER_ARN/SECRET_ARN 从 CloudFormation 输出获取：
-#   aws cloudformation describe-stacks --stack-name agentcore-workshop-aurora \
-#     --region us-west-2 --query "Stacks[0].Outputs"
-# aws rds-data execute-statement \
-#   --resource-arn <ClusterArn> --secret-arn <SecretArn> \
-#   --database product_hunting \
-#   --sql "SELECT verdict, reason, product_title FROM selection_verdicts ORDER BY created_at DESC LIMIT 10" \
-#   --region us-west-2
+# 验证入库结果（经 VPC 内 db Lambda 查询，同步返回结果。RDS Data API 已
+# 整体退役——中国区无此服务；db Lambda 随 Part 2 的 deploy.sh 部署）：
+# aws lambda invoke --function-name agentcore-workshop-db --region "$AWS_REGION" \
+#   --cli-binary-format raw-in-base64-out \
+#   --payload '{"op":"execute","args":{"sql":"SELECT verdict, reason, product_title FROM selection_verdicts ORDER BY created_at DESC LIMIT 10","params":{}}}' \
+#   /dev/stdout

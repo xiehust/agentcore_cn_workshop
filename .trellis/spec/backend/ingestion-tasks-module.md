@@ -104,8 +104,8 @@ if task["status"] != "active" and not portal_run_id:
   read-only 会话（`default_transaction_read_only=on`），不要借它写任务表。
   新增数仓访问点看 [数据库访问约定](./database-guidelines.md) 选路径——Part 1
   已改走 VPC 内写库 Lambda（中国区没有 Data API），本模块的迁移是后续任务。
-- **Aurora Min 0 ACU 冷恢复**：所有 Data API 调用包退避重试
-  （`DatabaseResumingException` 或消息含 `resum`，deadline ≈50s）。
+- **Aurora Min 0.5 ACU warm standby**：默认不自动暂停；任务链路仍保留连接
+  超时与失败重试，覆盖维护和瞬时故障。
 - **Runtime session id ≥33 字符**：`"ingest-run-" + uuid4` = 47 字符。
 - **Live View presign 只在服务端做**（botocore `SigV4QueryAuth`，service
   `bedrock-agentcore`，`GET {data-plane}/browser-streams/{id}/sessions/{sid}/live-view`，

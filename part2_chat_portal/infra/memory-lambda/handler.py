@@ -79,8 +79,8 @@ def _credentials():
 
 
 def _connect():
-    """建立连接。集群 MinCapacity=0 空闲自动暂停，首个连接触发冷恢复
-    （约 15 秒~1 分钟），失败重试而不是直接报错，等待上限 240 秒
+    """建立连接。集群 MinCapacity=0.5 保持 warm standby；维护或瞬时故障时
+    失败重试而不是直接报错，等待上限 240 秒
     （< Lambda timeout 300s，Agent 侧 read_timeout 120s 会先放弃——
     记忆是增强功能，Agent 侧超时只是本轮无记忆，不影响对话）。"""
     user, password = _credentials()

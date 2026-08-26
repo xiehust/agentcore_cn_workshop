@@ -139,3 +139,34 @@ Replaced the browser-dependent country datalist with a controlled accessible edi
 ### Status
 
 [OK] **Completed**
+
+
+## Session 7: 修复 Chat Portal 流尾超时
+
+**Date**: 2026-08-26
+**Task**: 修复 Chat Portal 流尾超时
+**Branch**: `feat/cn-portability`
+
+### Summary
+
+将历史落库和 Mem0 写回迁移到 AgentCore tracked async task，保留 db Lambda 数据面并修复前端部分流错误覆盖。
+
+### Main Changes
+
+- Runtime 正文后立即 EOF，后台按历史落库再记忆写回执行并保持 HealthyBusy。
+- 前端保留已收到正文并追加连接中断提示；零增量失败维持整轮错误。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `48d324a` | (see git log) |
+
+### Testing
+
+- [OK] 3 个流尾测试、14 个 infra 测试、Python 编译、前端构建、浏览器双错误路径通过。
+- [OK] Runtime v16：最后正文到 EOF 9ms，db Lambda 落库成功，tracked task 5.38s 后完成。
+
+### Status
+
+[OK] **Completed**

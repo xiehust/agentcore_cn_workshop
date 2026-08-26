@@ -7,7 +7,7 @@
 设计说明：
 - 写路径是 boto3 lambda.invoke -> 写库 Lambda（挂 Aurora 同 VPC）->
   pg8000 直连集群，本模块只做「组 payload + 调 Lambda + 翻译结果」的薄壳，
-  SQL、参数归一化、冷恢复重试都在 infra/writer-lambda/handler.py 里。
+  SQL、参数归一化、连接重试都在 infra/writer-lambda/handler.py 里。
   Runtime 仍不挂 VPC（计算留在公网），执行角色只需要对写库 Lambda 的
   lambda:InvokeFunction，不接触数据库凭证。
 - 为什么不用 RDS Data API：中国区没有该服务，本 workshop 后续要整体移植
@@ -16,8 +16,8 @@
 - SQL 一律使用参数化，避免拼接注入（在写库 Lambda 侧）。
 - 两张表都带可空的 run_id 列：Part 2 门户发起的任务会通过 set_current_run_id
   注入，命令行调用不注入（写 NULL），互不影响。
-- 集群 MinCapacity=0 会空闲自动暂停，首次写库触发冷恢复（约 15 秒~1 分钟）：
-  等待与重连在写库 Lambda 内完成（上限 240 秒，Lambda timeout 300 秒），
+- 集群 MinCapacity=0.5 保持 warm standby；维护或瞬时故障时的等待与重连仍在
+  写库 Lambda 内完成（上限 240 秒，Lambda timeout 300 秒），
   本模块只把 boto3 的 read_timeout 放宽到 310 秒并禁用重试，避免两侧都自旋。
 - 表结构见 infra/setup_tables.sql。
 """
@@ -54,7 +54,7 @@ def set_current_run_id(run_id: str | None) -> None:
 def _lambda_client():
     """惰性创建 lambda 客户端（避免 import 阶段就要求凭证）。
 
-    read_timeout 略大于写库 Lambda 的 300 秒超时：冷恢复等待由 Lambda 承担，
+    read_timeout 略大于写库 Lambda 的 300 秒超时：连接等待由 Lambda 承担，
     这里等它返回就好；关掉 boto3 重试，避免超时后重复写入。
     """
     global _client

@@ -4,7 +4,7 @@
 
     SPA（Keycloak 用户 token）
       -> HTTP API（JWT authorizer 校验 issuer + aud=analysis-runtime）
-      -> 本函数（不进 VPC，RDS Data API 读写任务表）
+      -> 本函数（不进 VPC，lambda.invoke → VPC 内 db Lambda（pg8000 直连）读写任务表）
          ├─ 一次性任务/手动重跑：异步 Invoke runner Lambda
          ├─ 定期任务：EventBridge Scheduler 建/改/删 schedule
          ├─ Live View：GetBrowserSession 确认会话在线 + SigV4 presign 直播流
@@ -13,9 +13,12 @@
              消息内容由 Part 2 Runtime 落库，本函数只读）
 
 设计说明：
-- 走 RDS Data API（和 Part 1 的 aurora_tools.py 同款），不进 VPC，也就不受
-  分析链路那个只读会话（default_transaction_read_only=on）的限制。
-- 集群 MinCapacity=0 会空闲自动暂停，首次查询触发冷恢复，_execute 内置退避重试。
+- 数据访问走 lambda.invoke → VPC 内 db Lambda（pg8000 直连 Aurora；中国区没有
+  RDS Data API，此为可移植形态），本函数自身不进 VPC；db Lambda 直连时不设
+  只读参数，也就不受分析链路那个只读会话（default_transaction_read_only=on）
+  的限制。
+- 集群 MinCapacity=0.5 保持 warm standby；连接恢复下沉在 db Lambda 内部
+  （上限 240s），_execute 只管自身超时（55s），等不到就放弃报错。
 - 只依赖 boto3/botocore（Lambda runtime 自带），zip 里就一个文件。
 - Live View 的 presigned URL 必须由服务端签（SigV4 凭证不下发浏览器）。
 """
@@ -23,7 +26,6 @@
 import json
 import os
 import re
-import time
 import urllib.parse
 import uuid
 
@@ -34,9 +36,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 REGION = os.environ.get("AWS_REGION", "us-west-2")
-CLUSTER_ARN = os.environ.get("AURORA_CLUSTER_ARN", "")
-SECRET_ARN = os.environ.get("AURORA_SECRET_ARN", "")
-DATABASE = os.environ.get("AURORA_DATABASE", "product_hunting")
+DB_LAMBDA_NAME = os.environ.get("DB_LAMBDA_NAME", "")
 RUNNER_FUNCTION_NAME = os.environ.get("RUNNER_FUNCTION_NAME", "")
 RUNNER_FUNCTION_ARN = os.environ.get("RUNNER_FUNCTION_ARN", "")
 SCHEDULE_GROUP = os.environ.get("SCHEDULE_GROUP", "agentcore-workshop-ingestion")
@@ -87,47 +87,57 @@ def _memory_client():
 
 # ---------------------------------------------------------------- 数据访问 ----
 
-def _execute(sql: str, parameters: list | None = None) -> list[dict]:
-    """执行一条 SQL 并返回行（list[dict]）。
+_db_lambda_client = None
 
-    用 formatRecordsAs=JSON 让 Data API 直接返回列名->值的 JSON，省掉手工
-    拆 stringValue/longValue。集群从暂停中恢复时退避重试（约 50 秒内）。
+
+def _db_lambda():
+    """数据面 db Lambda 专用 client：独立超时 + 禁重试。
+
+    不复用 _client("lambda")（默认配置，runner 的异步触发还在用它）：对 db
+    Lambda 的同步 invoke 需要 read_timeout=55s——tasks-api 自身 timeout 60s，
+    等不到就放弃报错，而不是被 Lambda 硬杀。
     """
-    if not CLUSTER_ARN or not SECRET_ARN:
-        raise RuntimeError("缺少 AURORA_CLUSTER_ARN / AURORA_SECRET_ARN 环境变量")
-
-    kwargs: dict = {
-        "resourceArn": CLUSTER_ARN,
-        "secretArn": SECRET_ARN,
-        "database": DATABASE,
-        "sql": sql,
-        "formatRecordsAs": "JSON",
-    }
-    if parameters:
-        kwargs["parameters"] = parameters
-
-    deadline = time.time() + 50
-    while True:
-        try:
-            resp = _client("rds-data").execute_statement(**kwargs)
-            records = resp.get("formattedRecords") or "[]"
-            return json.loads(records)
-        except ClientError as e:
-            code = e.response.get("Error", {}).get("Code", "")
-            if (code == "DatabaseResumingException" or "resum" in str(e).lower()) \
-                    and time.time() < deadline:
-                time.sleep(5)
-                continue
-            raise
+    global _db_lambda_client
+    if _db_lambda_client is None:
+        _db_lambda_client = boto3.client(
+            "lambda", region_name=REGION,
+            config=Config(connect_timeout=5, read_timeout=55,
+                          retries={"max_attempts": 0}),
+        )
+    return _db_lambda_client
 
 
-def _p(name: str, value) -> dict:
-    """构造 Data API 参数（统一转字符串，SQL 里按需 cast / NULLIF）。"""
-    return {"name": name, "value": {"stringValue": "" if value is None else str(value)}}
+def _execute(sql: str, parameters: list | None = None) -> list[dict]:
+    """执行一条 SQL 并返回行（list[dict]，等价原 Data API formatRecordsAs=JSON）。
+
+    经 lambda.invoke 调 VPC 内数据面 db Lambda（pg8000 直连 Aurora，:name
+    占位符与 ::TYPE cast 原样支持）；连接恢复在 db Lambda 内部完成
+    （上限 240s），这里只管超时放弃。
+    """
+    if not DB_LAMBDA_NAME:
+        raise RuntimeError("缺少 DB_LAMBDA_NAME 环境变量")
+    resp = _db_lambda().invoke(
+        FunctionName=DB_LAMBDA_NAME,
+        Payload=json.dumps(
+            # deadline_s < read_timeout(55s)：调用方放弃时 Lambda 必已先放弃
+            # 连接、语句从未执行——避免「前端 500 但任务几分钟后冒出来」的幽灵写
+            {"op": "execute", "args": {"sql": sql, "params": dict(parameters or []), "deadline_s": 45}},
+            ensure_ascii=False,
+        ).encode("utf-8"),
+    )
+    body = json.loads(resp["Payload"].read())
+    if resp.get("FunctionError") or not isinstance(body, dict) or body.get("status") != "ok":
+        raise RuntimeError(f"db lambda execute 失败: {body}")
+    return body.get("rows") or []
+
+
+def _p(name: str, value) -> tuple[str, str]:
+    """SQL 命名参数（统一转字符串，SQL 里按需 cast / NULLIF——与 Data API 时代同语义）。"""
+    return (name, "" if value is None else str(value))
 
 
 def _json_field(raw):
-    """JSONB 列在 formattedRecords 里是字符串，解析成对象返回给前端。"""
+    """JSONB 列（SQL 里已用 ::text 收口成字符串）解析成对象返回给前端。"""
     if raw is None or raw == "":
         return None
     if isinstance(raw, (dict, list)):
@@ -565,15 +575,24 @@ def get_live_view(run_id: str) -> dict:
         # 老版本 boto3 里可能没有 bedrock-agentcore 数据面模型，跳过状态校验直接签
         pass
 
+    # 数据面端点优先从 boto3 SDK 解析（aws / aws-cn 分区后缀不同）；
+    # 老版本 boto3 缺 bedrock-agentcore 模型时按 REGION 前缀手拼兜底
+    #（与上面状态校验的"跳过直接签"兜底、runner 的 SigV4 兜底同一处置）
+    try:
+        endpoint = _client("bedrock-agentcore").meta.endpoint_url.rstrip("/")
+    except Exception:
+        dns_suffix = "amazonaws.com.cn" if REGION.startswith("cn-") else "amazonaws.com"
+        endpoint = f"https://bedrock-agentcore.{REGION}.{dns_suffix}"
+    host = urllib.parse.urlparse(endpoint).netloc
     url = (
-        f"https://bedrock-agentcore.{REGION}.amazonaws.com"
+        f"{endpoint}"
         f"/browser-streams/{urllib.parse.quote(browser_id, safe='')}"
         f"/sessions/{urllib.parse.quote(session_id, safe='')}/live-view"
     )
     credentials = boto3.Session().get_credentials().get_frozen_credentials()
     request = AWSRequest(
         method="GET", url=url,
-        headers={"host": f"bedrock-agentcore.{REGION}.amazonaws.com"},
+        headers={"host": host},
     )
     SigV4QueryAuth(
         credentials=credentials, service_name="bedrock-agentcore",
@@ -686,7 +705,7 @@ def get_chat_messages(session_id: str, user_name: str, params: dict) -> dict:
     """会话回看：只回展示用字段，纯工具轮（display_text IS NULL）过滤掉。
 
     完整的 Strands message（content 列）只给 Runtime 回灌用，不下发前端。
-    单页 200 条 + after_seq 游标：Data API 单次结果有 1MB 上限，长会话靠
+    单页 200 条 + after_seq 游标：Lambda 响应有 6MB 上限，长会话靠
     has_more 继续拉，避免静默截断。
     """
     if _get_chat_session(session_id, user_name) is None:
@@ -752,7 +771,7 @@ def list_user_memories(user_name: str) -> dict:
 
     读路径：lambda.invoke 记忆向量 Lambda 的 list op，payload 里的 data 即
     记忆文本（键形约定见 .trellis/spec/backend/mem0-long-term-memory.md）。
-    记忆是增强功能：Lambda 未配置/不可达/集群冷恢复时降级返回空列表 +
+    记忆是增强功能：Lambda 未配置/不可达/数据面瞬时故障时降级返回空列表 +
     degraded 标记，不给门户抛 500。
     """
     if not MEMORY_LAMBDA_NAME:

@@ -92,7 +92,7 @@ MEM0_EMBEDDER_PASS_DIMS = os.getenv("MEM0_EMBEDDER_PASS_DIMS", "").lower() == "t
 
 SEARCH_TIMEOUT_S = _env_num("MEM0_SEARCH_TIMEOUT", 3.0, float)
 # 正常一次 add = 2 次 LLM 调用 + embedding + 数次 Lambda RPC，典型 7~12s；
-# 20s 留足余量。这个预算同时是 SSE 流关闭的最坏追加延迟，不宜放大
+# 20s 留足余量。这个预算决定 tracked async task 和专用线程的占用上限，不宜放大
 ADD_TIMEOUT_S = _env_num("MEM0_ADD_TIMEOUT", 20.0, float)
 RECALL_LIMIT = 8
 # memorize 连续失败熔断阈值：达到即进程级禁用（microVM 空闲 ~15 分钟会被
@@ -178,12 +178,12 @@ try:
         collection_name: str = "mem0_ltm"
         embedding_model_dims: int = 1024
         function_name: str = "agentcore-workshop-memory"
-        region: str = "us-west-2"
+        region: str = REGION  # 单点取自 AWS_REGION，不留第二份硬编码默认
 
     # 共享 lambda client：Runtime 与 Lambda 走 AWS 内网 API，禁重试
     # （对齐 Part 1 aurora_tools.py：重试只会放大尾延迟；insert 有 UUID
     # 主键天然幂等，但 mem0 决策流程串行，宁可快速失败走降级）。
-    # read_timeout 120s < Lambda timeout 300s：Aurora 深度冷恢复时放弃本次
+    # read_timeout 120s < Lambda timeout 300s：数据面长时间不可用时放弃本次
     # 记忆操作（Agent 侧还有更短的 wait_for 预算）。
     _lambda_client = None
 
@@ -429,7 +429,7 @@ def _recall_sync(user_id: str, query: str) -> list[str]:
 async def recall(user_id: str | None, query: str) -> list[str]:
     """按用户语义检索长期记忆，按相关度排序返回记忆文本。
 
-    预算 MEM0_SEARCH_TIMEOUT 秒（Aurora 冷恢复必超时 → 空结果）；任何异常
+    预算 MEM0_SEARCH_TIMEOUT 秒（数据面或模型端点超时 → 空结果）；任何异常
     返回 []。调用方（main.py）只在会话首轮调用，结果缓存整个会话。
     """
     if not user_id or _disabled_reason is not None:
@@ -441,7 +441,7 @@ async def recall(user_id: str | None, query: str) -> list[str]:
         logger.info("[mem0] recall user=%s 命中 %d 条", user_id, len(memories))
         return memories
     except asyncio.TimeoutError:
-        logger.warning("[mem0] recall 超时（%.0fs，可能撞上集群冷恢复），本会话无记忆注入", SEARCH_TIMEOUT_S)
+        logger.warning("[mem0] recall 超时（%.0fs，数据面或模型端点瞬时不可用），本会话无记忆注入", SEARCH_TIMEOUT_S)
         return []
     except Exception as e:
         logger.warning("[mem0] recall 失败: %s: %s", type(e).__name__, e)
@@ -467,9 +467,9 @@ def _memorize_sync(user_id: str, prompt: str, reply: str) -> int:
 async def memorize(user_id: str | None, prompt: str, reply: str) -> None:
     """把本轮对话交给 mem0 提取写回（ADD/UPDATE/DELETE 由 mem0 决策）。
 
-    在 SSE 流结束、会话历史落库之后调用；必须 await（microVM 在响应后可能
-    冻结，fire-and-forget 会丢写）。预算 MEM0_ADD_TIMEOUT 秒（默认 20s，
-    也是 SSE 流关闭的最坏追加延迟），超时/异常只打日志；连续失败
+    由 main.py 的 AgentCore tracked async task 在历史落库之后 await；该 task
+    通过 HealthyBusy 防止响应结束后 microVM 冻结，而 SSE 不等待本函数。预算
+    MEM0_ADD_TIMEOUT 秒（默认 20s），超时/异常只打日志；连续失败
     _ADD_FAIL_LIMIT 次触发进程级熔断，停止每轮白付预算。
     """
     global _add_fail_streak, _disabled_reason

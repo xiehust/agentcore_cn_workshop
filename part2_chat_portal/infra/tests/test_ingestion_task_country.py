@@ -29,11 +29,7 @@ def _response_body(response: dict) -> dict:
 
 
 def _parameter_values(call) -> dict[str, str]:
-    parameters = call.args[1]
-    return {
-        item["name"]: item["value"]["stringValue"]
-        for item in parameters
-    }
+    return dict(call.args[1])
 
 
 class TasksApiCountryTests(unittest.TestCase):
@@ -170,6 +166,16 @@ class RunnerCountryTests(unittest.TestCase):
         self.assertIn("不得回退到其他国家/站点", prompt)
         self.assertTrue(prompt.endswith(original_prompt))
         self.assertNotIn("ebay.", prompt)
+
+    def test_runtime_client_allows_long_streams_without_sdk_retries(self):
+        RUNNER._runtime_client = None
+        with patch.object(RUNNER.boto3, "client", return_value=MagicMock()) as client:
+            RUNNER._runtime()
+
+        config = client.call_args.kwargs["config"]
+        self.assertEqual(config.connect_timeout, 5)
+        self.assertEqual(config.read_timeout, 870)
+        self.assertEqual(config.retries["max_attempts"], 0)
 
     def test_runtime_invocation_uses_stored_country_for_portal_and_scheduler(self):
         task = {

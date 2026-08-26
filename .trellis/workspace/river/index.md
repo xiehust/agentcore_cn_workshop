@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 6
-- **Last Active**: 2026-08-13
+- **Total Sessions**: 7
+- **Last Active**: 2026-08-26
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~141 | Active |
+| `journal-1.md` | ~172 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 7 | 2026-08-26 | 修复 Chat Portal 流尾超时 | `48d324a` | `feat/cn-portability` |
 | 6 | 2026-08-13 | Fix Chrome country combobox dropdown | `84d5f3e` | `main` |
 | 5 | 2026-08-13 | Add extensible country selection to ingestion tasks | `ec5184e` | `main` |
 | 4 | 2026-08-13 | Add eBay US ingestion skill | `bb8295a` | `main` |
