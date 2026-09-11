@@ -1,0 +1,2459 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+########################################
+# AgentCore Workshop CloudLab Template (China-compatible)
+# 单栈 = VS Code IDE Server + Workshop 数仓基础环境：
+#   - IDE：小 VPC(公有) + EC2 code-server + ALB + Secrets 密码 + SSM 引导
+#     + 最小权限 IAM 角色（从 openclaw cloudlab-template-china.yaml 抽离并收敛）
+#   - 基础环境：私有 VPC + Aurora Serverless v2(PostgreSQL) + Secrets 接口端点
+#     + 写库 Lambda 角色/调用策略（合并自 part1 的 aurora-serverless.yaml，
+#     输出键保持一致，workshop 脚本可直接读取）
+#   - 一键销毁：删除本栈时，CleanupOnDelete 自定义资源先自动清理脚本在栈外
+#     创建的资源（agentcore-workshop-* Lambda、AgentCore Runtime/Browser/
+#     Gateway/Identity、part2 的 3 个子栈、ECR 仓库、SDK 角色、残留 ENI），
+#     然后再删栈内资源。
+# 全球区 / 中国区（cn-north-1, cn-northwest-1）通用：
+# 分区/域名全部使用 ${AWS::Partition} / ${AWS::URLSuffix}，无 CloudFront。
+########################################
+Description: >
+  AgentCore CN Workshop CloudLab - single stack with browser-based VS Code IDE
+  (code-server on EC2 behind ALB, least-privilege IAM) plus the workshop data
+  warehouse base (private VPC + Aurora Serverless v2 + Secrets Manager endpoint).
+  Deleting this stack also sweeps all workshop resources created by the step
+  scripts (one-click teardown).
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  # 资产分发走 CloudFront（ide/publish-assets.sh 发布）。Lambda 的 Code 只认
+  # 同区域 S3，故栈内 AssetFetch 自定义资源先把 zip 从 CDN 拉进自建中转桶
+  AssetBaseUrl:
+    Type: String
+    Default: https://dbr8mrv63fpuw.cloudfront.net
+    Description: CloudFront base URL serving workshop assets (published by ide/publish-assets.sh)
+
+  WorkshopAssetsKey:
+    Type: String
+    Default: workshop-assets.tar.gz
+    Description: Asset path of the workshop code bundle (tar.gz, extracted to /home/ec2-user/environment)
+
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    Description: CIDR allowed to reach the IDE ALB (tighten to your office/VPN CIDR for least exposure)
+
+  IdeInstanceType:
+    Type: String
+    Default: t3.large
+    Description: EC2 instance type for the IDE (t3.large recommended for docker builds + npm)
+
+  IdeVolumeSize:
+    Type: Number
+    Default: 50
+    MinValue: 30
+    MaxValue: 200
+    Description: IDE EBS volume size in GB
+
+  IdeAmiParameterStoreName:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+    Description: AL2023 x86_64 AMI via SSM public parameter (works in all partitions)
+
+  CodeServerVersion:
+    Type: String
+    Default: "4.91.1"
+    Description: code-server version (used to derive the GitHub rpm URL when CodeServerRpmUrl is empty)
+
+  CodeServerRpmUrl:
+    Type: String
+    Default: ""
+    Description: >
+      Optional override URL for the code-server rpm. Leave empty to download from
+      GitHub releases. In China regions set this to an in-region mirror, e.g.
+      https://dqz9mdd9dvd79.cloudfront.net/tools/code-server.rpm
+
+  IdeVpcCIDR:
+    Type: String
+    Default: 10.40.0.0/16
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    Description: CIDR for the IDE VPC (workshop data VPC is fixed at 10.20.0.0/16)
+
+  # --- Workshop 数仓（与 part1 aurora-serverless.yaml 参数一致） ---
+  DatabaseName:
+    Type: String
+    Default: product_hunting
+  MinCapacityACU:
+    Type: Number
+    Default: 0.5
+    MinValue: 0.5
+    Description: 最小 0.5 ACU，保持 warm standby，不进入自动暂停
+  MaxCapacityACU:
+    Type: Number
+    Default: 2
+  WriterFunctionName:
+    Type: String
+    Default: agentcore-workshop-writer
+    Description: 写库 Lambda 的函数名（函数本体由步骤脚本打包创建，本栈只建角色与授权）
+
+  IdeAlbPort:
+    Type: Number
+    Default: 8889
+    MinValue: 1
+    MaxValue: 65535
+    Description: >
+      IDE 入口（ALB 监听）端口。默认 8889：中国区未备案账号被封 80/8080/443，
+      必须用非标准端口。全球区测试可传 80——部分企业办公网只放行 80/443 出站，
+      非标准端口会连不上。
+
+  PortalCertificateArn:
+    Type: String
+    Default: ""
+    Description: >
+      可选：ACM 证书 ARN。设置后 ALB 额外开 8443 HTTPS 监听器，把场景 2 的
+      Web 门户（IDE 实例上的 Vite dev server，5173）公网化——PKCE 登录要求
+      安全上下文，公网访问必须 HTTPS。自签证书导入 ACM 即可（浏览器一次告警）；
+      8443 是非标准端口，中国区未备案账号可用。留空则禁用（改用 SSM 端口转发）。
+
+  EnableHttpPortal:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      默认 true：创建一个 NLB（TCP:5173 直通实例 5173），把场景 2 门户以纯 HTTP
+      公网化——中国区免备案（非标准端口）、免证书告警的形态，跑完 03 即可用公网
+      URL 访问（03 会打印 HttpPortalUrl）。前端在非安全上下文自动退回无 PKCE 的
+      授权码流程；token 明文传输，仅限 workshop 演示。设为 false 可关闭公网门户
+      （仅保留 localhost 端口转发访问）。
+
+Conditions:
+  UseDefaultCodeServerUrl: !Equals [!Ref CodeServerRpmUrl, ""]
+  # 中国区（aws-cn）的接口端点 ServiceName 带 cn. 前缀
+  IsChinaPartition: !Equals [!Ref "AWS::Partition", aws-cn]
+  EnablePublicPortal: !Not [!Equals [!Ref PortalCertificateArn, ""]]
+  EnableHttpPortalCond: !Equals [!Ref EnableHttpPortal, "true"]
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ===========================================================================
+  # A. IDE - Networking (2 public subnets for the ALB; no NAT)
+  # ===========================================================================
+
+  IdeVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref IdeVpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ide-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ide-igw'
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref IdeVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref IdeVPC
+      CidrBlock: !Select [0, !Cidr [!Ref IdeVpcCIDR, 2, 12]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ide-public-a'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref IdeVPC
+      CidrBlock: !Select [1, !Cidr [!Ref IdeVpcCIDR, 2, 12]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ide-public-b'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref IdeVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ide-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ===========================================================================
+  # B. IDE - Security Groups
+  # ===========================================================================
+
+  IdeALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for IDE ALB
+      SecurityGroupIngress:
+        # 入口端口参数化：默认 8889（中国区未备案账号被封 80/8080/443，
+        # 非标准端口不受限，与 openclaw 中国区模板一致）；全球区可传 80
+        # 以兼容只放行 80/443 出站的办公网络
+        - Description: Allow HTTP to code-server from AllowedCidr
+          IpProtocol: tcp
+          FromPort: !Ref IdeAlbPort
+          ToPort: !Ref IdeAlbPort
+          CidrIp: !Ref AllowedCidr
+      SecurityGroupEgress:
+        - Description: Allow all outbound traffic
+          IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref IdeVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ide-alb-sg'
+
+  IdeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for IDE instance
+      SecurityGroupIngress:
+        - Description: Allow code-server from ALB only
+          IpProtocol: tcp
+          FromPort: 8889
+          ToPort: 8889
+          SourceSecurityGroupId: !Ref IdeALBSecurityGroup
+      SecurityGroupEgress:
+        - Description: Allow all outbound traffic
+          IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref IdeVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ide-sg'
+
+  # ===========================================================================
+  # C. IDE IAM Role - least privilege for the agentcore workshop deploy flow
+  #    Scoped to: CFN stacks agentcore-workshop-*, IAM roles agentcore-workshop-*
+  #    and AmazonBedrockAgentCoreSDK*, Lambda functions agentcore-workshop-*,
+  #    ECR repos agentcore-workshop*/bedrock-agentcore-*, scheduler group
+  #    agentcore-workshop-ingestion, bedrock-agentcore limited to this region.
+  #    Deliberately absent vs the openclaw template: eks, sqs, waf, efs, elb,
+  #    kms admin, pricing, events, autoscaling, ec2 RunInstances.
+  #    三个托管策略同时挂到 IDE 角色与 CleanupOnDelete Lambda 角色（删栈清扫用）。
+  # ===========================================================================
+
+  IdeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ide-role'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub 'ec2.${AWS::URLSuffix}'
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: ide-self
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadIdePassword
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  - !Ref IdePassword
+                  # 场景 2 外部托管模式要把 Keycloak 管理员密码同步进 secrets.env
+                  - !Ref KcAdminSecret
+              - Sid: ReadWorkshopAssets
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt AssetStagingBucket.Arn
+                  - !Sub '${AssetStagingBucket.Arn}/*'
+
+  CleanupLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-cleanup-role'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'lambda.${AWS::URLSuffix}'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cleanup-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  # --- 基础设施面：CloudFormation / EC2-VPC / RDS / SecretsManager / Logs / Scheduler ---
+  IdeWorkshopInfraPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${AWS::StackName}-workshop-infra'
+      Roles:
+        - !Ref IdeRole
+        - !Ref CleanupLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CfnWorkshopStacks
+            Effect: Allow
+            Action:
+              - cloudformation:CreateStack
+              - cloudformation:UpdateStack
+              - cloudformation:DeleteStack
+              - cloudformation:Describe*
+              - cloudformation:Get*
+              - cloudformation:List*
+              - cloudformation:CreateChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:TagResource
+              - cloudformation:UntagResource
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/agentcore-workshop-*/*'
+          - Sid: CfnValidate
+            Effect: Allow
+            Action:
+              - cloudformation:ValidateTemplate
+              - cloudformation:ListStacks
+            Resource: "*"
+          - Sid: Ec2VpcForWorkshopStacks
+            Effect: Allow
+            Action:
+              - ec2:Describe*
+              - ec2:CreateVpc
+              - ec2:DeleteVpc
+              - ec2:ModifyVpcAttribute
+              - ec2:CreateSubnet
+              - ec2:DeleteSubnet
+              - ec2:ModifySubnetAttribute
+              - ec2:CreateRouteTable
+              - ec2:DeleteRouteTable
+              - ec2:CreateRoute
+              - ec2:DeleteRoute
+              - ec2:AssociateRouteTable
+              - ec2:DisassociateRouteTable
+              - ec2:CreateInternetGateway
+              - ec2:DeleteInternetGateway
+              - ec2:AttachInternetGateway
+              - ec2:DetachInternetGateway
+              - ec2:CreateSecurityGroup
+              - ec2:DeleteSecurityGroup
+              - ec2:AuthorizeSecurityGroupIngress
+              - ec2:AuthorizeSecurityGroupEgress
+              - ec2:RevokeSecurityGroupIngress
+              - ec2:RevokeSecurityGroupEgress
+              - ec2:CreateVpcEndpoint
+              - ec2:DeleteVpcEndpoints
+              - ec2:ModifyVpcEndpoint
+              - ec2:DetachNetworkInterface
+              - ec2:DeleteNetworkInterface
+              - ec2:CreateTags
+              - ec2:DeleteTags
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref AWS::Region
+          - Sid: RdsForWorkshopStack
+            Effect: Allow
+            Action:
+              - rds:CreateDBCluster
+              - rds:DeleteDBCluster
+              - rds:ModifyDBCluster
+              - rds:CreateDBInstance
+              - rds:DeleteDBInstance
+              - rds:ModifyDBInstance
+              - rds:CreateDBSubnetGroup
+              - rds:DeleteDBSubnetGroup
+              - rds:Describe*
+              - rds:AddTagsToResource
+              - rds:RemoveTagsFromResource
+              - rds:ListTagsForResource
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref AWS::Region
+          # RDS 托管主密码（ManageMasterUserPassword）：RDS 以调用者身份在
+          # Secrets Manager 里创建/轮换 rds!* 前缀的密钥，需要这些写权限
+          - Sid: RdsManagedSecrets
+            Effect: Allow
+            Action:
+              - secretsmanager:CreateSecret
+              - secretsmanager:DeleteSecret
+              - secretsmanager:DescribeSecret
+              - secretsmanager:GetSecretValue
+              - secretsmanager:PutSecretValue
+              - secretsmanager:UpdateSecret
+              - secretsmanager:RotateSecret
+              - secretsmanager:UpdateSecretVersionStage
+              - secretsmanager:TagResource
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:rds!*'
+          # AgentCore Identity 的 OAuth2 credential provider 会以调用者权限
+          # 把 client secret 存进 Secrets Manager（bedrock-agentcore-identity! 前缀）
+          - Sid: AgentCoreIdentitySecrets
+            Effect: Allow
+            Action:
+              - secretsmanager:CreateSecret
+              - secretsmanager:DeleteSecret
+              - secretsmanager:DescribeSecret
+              - secretsmanager:GetSecretValue
+              - secretsmanager:PutSecretValue
+              - secretsmanager:UpdateSecret
+              - secretsmanager:TagResource
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:bedrock-agentcore-identity!*'
+          # 加密 Aurora（StorageEncrypted + RDS 托管主密码）需要解析/使用
+          # AWS 托管密钥 aws/rds 与 aws/secretsmanager：读操作放开，
+          # 授权/数据密钥操作用 kms:ViaService 收敛到本区域这两个服务
+          - Sid: KmsReadForDefaultKeys
+            Effect: Allow
+            Action:
+              - kms:DescribeKey
+              - kms:ListKeys
+              - kms:ListAliases
+            Resource: "*"
+          - Sid: KmsUseViaRdsAndSecrets
+            Effect: Allow
+            Action:
+              - kms:CreateGrant
+              - kms:GenerateDataKey
+              - kms:Decrypt
+              - kms:ReEncryptFrom
+              - kms:ReEncryptTo
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:ViaService:
+                  - !Sub 'rds.${AWS::Region}.${AWS::URLSuffix}'
+                  - !Sub 'secretsmanager.${AWS::Region}.${AWS::URLSuffix}'
+          - Sid: Logs
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:DeleteLogGroup
+              - logs:PutRetentionPolicy
+              - logs:TagResource
+              - logs:ListTagsForResource
+              - logs:Describe*
+              - logs:Get*
+              - logs:FilterLogEvents
+              - logs:StartQuery
+              - logs:StopQuery
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref AWS::Region
+          - Sid: SchedulerWorkshopGroup
+            Effect: Allow
+            Action:
+              - scheduler:CreateScheduleGroup
+              - scheduler:DeleteScheduleGroup
+              - scheduler:GetScheduleGroup
+              - scheduler:CreateSchedule
+              - scheduler:UpdateSchedule
+              - scheduler:DeleteSchedule
+              - scheduler:GetSchedule
+              - scheduler:TagResource
+              - scheduler:UntagResource
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule-group/agentcore-workshop-*'
+              - !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/agentcore-workshop-*'
+          - Sid: SchedulerList
+            Effect: Allow
+            Action:
+              - scheduler:ListSchedules
+              - scheduler:ListScheduleGroups
+            Resource: "*"
+          - Sid: Sts
+            Effect: Allow
+            Action:
+              - sts:GetCallerIdentity
+            Resource: "*"
+          - Sid: SsmPublicParameters
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/service/*'
+
+  # --- IAM 面：workshop 角色/策略 + PassRole ---
+  IdeWorkshopIamPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${AWS::StackName}-workshop-iam'
+      Roles:
+        - !Ref IdeRole
+        - !Ref CleanupLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: WorkshopRoles
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:GetRole
+              - iam:TagRole
+              - iam:UntagRole
+              - iam:UpdateAssumeRolePolicy
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:GetRolePolicy
+              - iam:ListRolePolicies
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:ListAttachedRolePolicies
+              - iam:ListInstanceProfilesForRole
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/agentcore-workshop-*'
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/AmazonBedrockAgentCoreSDK*'
+          - Sid: WorkshopPolicies
+            Effect: Allow
+            Action:
+              - iam:CreatePolicy
+              - iam:DeletePolicy
+              - iam:GetPolicy
+              - iam:GetPolicyVersion
+              - iam:ListPolicyVersions
+              - iam:CreatePolicyVersion
+              - iam:DeletePolicyVersion
+              - iam:TagPolicy
+              - iam:ListEntitiesForPolicy
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/agentcore-workshop-*'
+          - Sid: PassWorkshopRoles
+            Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/agentcore-workshop-*'
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/AmazonBedrockAgentCoreSDK*'
+            Condition:
+              StringEquals:
+                iam:PassedToService:
+                  - !Sub 'lambda.${AWS::URLSuffix}'
+                  - !Sub 'ecs-tasks.${AWS::URLSuffix}'
+                  - !Sub 'scheduler.${AWS::URLSuffix}'
+                  - !Sub 'codebuild.${AWS::URLSuffix}'
+                  - bedrock-agentcore.amazonaws.com
+          - Sid: ServiceLinkedRoles
+            Effect: Allow
+            Action:
+              - iam:CreateServiceLinkedRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/*'
+          - Sid: ListRoles
+            Effect: Allow
+            Action:
+              - iam:ListRoles
+              - iam:ListPolicies
+            Resource: "*"
+
+  # --- 应用面：Lambda / ECR / ECS / CloudMap / APIGW / AgentCore / CodeBuild / S3 / Bedrock ---
+  IdeWorkshopAppPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${AWS::StackName}-workshop-app'
+      Roles:
+        - !Ref IdeRole
+        - !Ref CleanupLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # ListFunctions 无资源级授权（清理钩子按前缀枚举删除时必需）
+          - Sid: LambdaList
+            Effect: Allow
+            Action:
+              - lambda:ListFunctions
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref AWS::Region
+          - Sid: WorkshopLambdas
+            Effect: Allow
+            Action:
+              - lambda:CreateFunction
+              - lambda:DeleteFunction
+              - lambda:GetFunction
+              - lambda:GetFunctionConfiguration
+              - lambda:UpdateFunctionCode
+              - lambda:UpdateFunctionConfiguration
+              - lambda:InvokeFunction
+              - lambda:AddPermission
+              - lambda:RemovePermission
+              - lambda:GetPolicy
+              - lambda:TagResource
+              - lambda:ListTags
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:agentcore-workshop-*'
+          - Sid: EcrAuth
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+            Resource: "*"
+          - Sid: EcrList
+            Effect: Allow
+            Action:
+              - ecr:DescribeRepositories
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref AWS::Region
+          - Sid: EcrWorkshopRepos
+            Effect: Allow
+            Action:
+              - ecr:CreateRepository
+              - ecr:DeleteRepository
+              - ecr:DescribeImages
+              - ecr:ListImages
+              - ecr:BatchDeleteImage
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:PutImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:TagResource
+              - ecr:ListTagsForResource
+              - ecr:PutLifecyclePolicy
+              - ecr:GetLifecyclePolicy
+              - ecr:SetRepositoryPolicy
+              - ecr:GetRepositoryPolicy
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/agentcore-workshop*'
+              - !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/bedrock-agentcore-*'
+          - Sid: EcsForKeycloak
+            Effect: Allow
+            Action:
+              - ecs:CreateCluster
+              - ecs:DeleteCluster
+              - ecs:DescribeClusters
+              - ecs:RegisterTaskDefinition
+              - ecs:DeregisterTaskDefinition
+              - ecs:DescribeTaskDefinition
+              - ecs:CreateService
+              - ecs:UpdateService
+              - ecs:DeleteService
+              - ecs:DescribeServices
+              - ecs:ListServices
+              - ecs:ListTasks
+              - ecs:DescribeTasks
+              - ecs:TagResource
+              - ecs:UntagResource
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref AWS::Region
+          - Sid: CloudMapForKeycloak
+            Effect: Allow
+            Action:
+              - servicediscovery:CreatePrivateDnsNamespace
+              - servicediscovery:DeleteNamespace
+              - servicediscovery:GetNamespace
+              - servicediscovery:ListNamespaces
+              - servicediscovery:CreateService
+              - servicediscovery:DeleteService
+              - servicediscovery:GetService
+              - servicediscovery:ListServices
+              - servicediscovery:GetOperation
+              - servicediscovery:TagResource
+              - servicediscovery:UntagResource
+              - servicediscovery:ListTagsForResource
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref AWS::Region
+          # TagResource/UntagResource 是独立动作名（不映射到 HTTP 动词），
+          # CFN 给带 Tags 的 API/Stage 建资源时必需
+          - Sid: ApiGatewayV2
+            Effect: Allow
+            Action:
+              - apigateway:GET
+              - apigateway:POST
+              - apigateway:PUT
+              - apigateway:PATCH
+              - apigateway:DELETE
+              - apigateway:TagResource
+              - apigateway:UntagResource
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis'
+              - !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/*'
+              - !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}::/vpclinks'
+              - !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}::/vpclinks/*'
+              - !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}::/tags/*'
+          - Sid: AgentCoreThisRegion
+            Effect: Allow
+            Action:
+              - bedrock-agentcore:*
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref AWS::Region
+          - Sid: StarterToolkitCodeBuild
+            Effect: Allow
+            Action:
+              - codebuild:CreateProject
+              - codebuild:UpdateProject
+              - codebuild:DeleteProject
+              - codebuild:BatchGetProjects
+              - codebuild:StartBuild
+              - codebuild:BatchGetBuilds
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/bedrock-agentcore-*'
+          # ListProjects 无资源级授权（清理钩子按前缀枚举删除时必需）
+          - Sid: CodeBuildList
+            Effect: Allow
+            Action:
+              - codebuild:ListProjects
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref AWS::Region
+          - Sid: StarterToolkitS3
+            Effect: Allow
+            Action:
+              - s3:CreateBucket
+              - s3:PutObject
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:GetBucketLocation
+              - s3:PutBucketVersioning
+              - s3:PutLifecycleConfiguration
+              - s3:GetLifecycleConfiguration
+              - s3:PutBucketTagging
+              - s3:GetBucketTagging
+              - s3:PutEncryptionConfiguration
+              - s3:GetEncryptionConfiguration
+              - s3:PutBucketPublicAccessBlock
+              - s3:GetBucketPublicAccessBlock
+              # 删除动作供清理钩子清扫 toolkit 的构建源码桶
+              - s3:DeleteObject
+              - s3:DeleteBucket
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::bedrock-agentcore-*'
+              - !Sub 'arn:${AWS::Partition}:s3:::bedrock-agentcore-*/*'
+          - Sid: BedrockModelAccess
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+              - bedrock:ListFoundationModels
+              - bedrock:GetFoundationModel
+            Resource: "*"
+
+  IdeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref IdeRole
+
+  # ===========================================================================
+  # D. IDE password (Secrets Manager)
+  # ===========================================================================
+
+  IdePassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-ide-password'
+      GenerateSecretString:
+        ExcludeCharacters: "\"@/\\"
+        ExcludePunctuation: true
+        GenerateStringKey: password
+        IncludeSpace: false
+        PasswordLength: 32
+        SecretStringTemplate: '{"password":""}'
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  # ===========================================================================
+  # E. IDE SSM bootstrap document
+  # ===========================================================================
+
+  IdeSSMDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: "2.2"
+        description: Bootstrap IDE instance with workshop tooling and code-server
+        mainSteps:
+          - action: aws:runShellScript
+            name: BootstrapIDE
+            inputs:
+              timeoutSeconds: 1500
+              runCommand:
+                - !Sub
+                  - |
+                    set -e
+                    exec > >(tee /var/log/ide-bootstrap.log) 2>&1
+                    echo "=== [1/6] system packages ==="
+                    dnf install -y git docker jq unzip zip tar gzip argon2 \
+                      python3.11 python3.11-pip make gcc || true
+                    # Node.js 20（Part 2 前端 Vite 要求 18+；AL2023 的 nodejs20 包带版本后缀二进制）
+                    if dnf install -y nodejs20 nodejs20-npm 2>/dev/null; then
+                      ln -sf /usr/bin/node-20 /usr/local/bin/node
+                      ln -sf /usr/bin/npm-20  /usr/local/bin/npm
+                      ln -sf /usr/bin/npx-20  /usr/local/bin/npx
+                    else
+                      dnf install -y nodejs npm
+                    fi
+
+                    echo "=== [2/6] docker + aws cli ==="
+                    systemctl enable --now docker
+                    usermod -aG docker ec2-user
+                    # AL2023 预装的 AWS CLI 版本偏旧，缺 bedrock-agentcore-control 的
+                    # 新子命令（如 list-browser-profiles），升级到最新版
+                    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+                    unzip -qo /tmp/awscliv2.zip -d /tmp
+                    /tmp/aws/install --update
+                    rm -rf /tmp/aws /tmp/awscliv2.zip
+
+                    echo "=== [3/6] code-server ==="
+                    if ! rpm -q code-server >/dev/null 2>&1; then
+                      curl -fsSL "${CodeServerUrl}" -o /tmp/code-server.rpm
+                      rpm -U /tmp/code-server.rpm
+                      rm -f /tmp/code-server.rpm
+                    fi
+
+                    echo "=== [4/6] workshop assets ==="
+                    # IDE 工作区（~/environment）只放 agentcore_cn_workshop；
+                    # 分步脚本复制进 workshop 的 scripts/ 下（IDE 文件树可见、可直接跑），
+                    # hands_on 完整包（手册/模板）放在工作区之外的家目录做参考
+                    mkdir -p /home/ec2-user/environment
+                    curl -fsSL --retry 5 --retry-delay 3 "${AssetBaseUrl}/${WorkshopAssetsKey}" -o /tmp/workshop-assets.tar.gz
+                    tar xzf /tmp/workshop-assets.tar.gz -C /home/ec2-user/environment --exclude='._*' agentcore_cn_workshop
+                    tar xzf /tmp/workshop-assets.tar.gz -C /home/ec2-user --exclude='._*' agentcore_cn_hands_on
+                    rm -f /tmp/workshop-assets.tar.gz
+                    mkdir -p /home/ec2-user/environment/agentcore_cn_workshop/scripts
+                    cp /home/ec2-user/agentcore_cn_hands_on/scripts/*.sh /home/ec2-user/environment/agentcore_cn_workshop/scripts/
+                    # 清理历史布局残留：工作区里的 hands_on 与 macOS AppleDouble 文件
+                    rm -rf /home/ec2-user/environment/agentcore_cn_hands_on
+                    find /home/ec2-user/environment /home/ec2-user/agentcore_cn_hands_on \
+                      -name '._*' -delete 2>/dev/null || true
+                    chown -R ec2-user:ec2-user /home/ec2-user/environment /home/ec2-user/agentcore_cn_hands_on
+                    chmod +x /home/ec2-user/environment/agentcore_cn_workshop/scripts/*.sh \
+                             /home/ec2-user/agentcore_cn_hands_on/scripts/*.sh \
+                             /home/ec2-user/agentcore_cn_hands_on/ide/*.sh || true
+
+                    echo "=== [4.5/6] python venv + agentcore CLI（预制，登录即可跑场景） ==="
+                    sudo -u ec2-user bash -c '
+                      cd /home/ec2-user/environment/agentcore_cn_workshop
+                      [ -x .venv/bin/pip ] || python3.11 -m venv .venv
+                      .venv/bin/pip -q install --upgrade pip
+                      .venv/bin/pip -q install bedrock-agentcore-starter-toolkit
+                    '
+
+                    echo "=== [5/6] shell env ==="
+                    tee /etc/profile.d/agentcore_env.sh <<'EOF'
+                    export PROMPT_COMMAND='export PS1="\u@agentcore-ide:\w$ "'
+                    export AWS_REGION=${AWS::Region}
+                    export AWS_DEFAULT_REGION=${AWS::Region}
+                    export BASE_STACK=${AWS::StackName}
+                    # 抑制 starter-toolkit 的「CLI no longer supported」迁移横幅
+                    export AGENTCORE_SUPPRESS_RECOMMENDATION=1
+                    EOF
+
+                    echo "=== [6/6] code-server config (as ec2-user) ==="
+                    PASSWORD_SECRET_VALUE=$(aws secretsmanager get-secret-value \
+                      --secret-id "${IdePassword}" \
+                      --query 'SecretString' --output text \
+                      --region ${AWS::Region})
+                    IDE_PASSWORD=$(echo "$PASSWORD_SECRET_VALUE" | jq -r '.password')
+                    HASHED_PASSWORD=$(echo -n "$IDE_PASSWORD" | argon2 saltItWithSalt -l 32 -e)
+                    sudo -u ec2-user mkdir -p /home/ec2-user/.config/code-server
+                    sudo -u ec2-user tee /home/ec2-user/.config/code-server/config.yaml <<EOF
+                    cert: false
+                    auth: password
+                    hashed-password: "$HASHED_PASSWORD"
+                    bind-addr: 0.0.0.0:8889
+                    disable-telemetry: true
+                    EOF
+                    systemctl enable --now code-server@ec2-user
+                    systemctl restart code-server@ec2-user
+
+                    echo "=== bootstrap done ==="
+                    node --version || true
+                    python3.11 --version
+                    docker --version
+                    git --version
+                  - CodeServerUrl: !If
+                      - UseDefaultCodeServerUrl
+                      - !Sub 'https://github.com/coder/code-server/releases/download/v${CodeServerVersion}/code-server-${CodeServerVersion}-amd64.rpm'
+                      - !Ref CodeServerRpmUrl
+
+  # ===========================================================================
+  # F. Bootstrap trigger (Lambda custom resource -> SSM send-command)
+  # ===========================================================================
+
+  BootstrapLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'lambda.${AWS::URLSuffix}'
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub '${AWS::StackName}-ide-bootstrap-lambda'
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${IdeSSMDocument}'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:DescribeInstanceInformation
+                  - ssm:ListCommands
+                Resource: "*"
+
+  BootstrapLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ide-bootstrap'
+      Handler: index.lambda_handler
+      Role: !GetAtt BootstrapLambdaRole.Arn
+      Runtime: python3.12
+      MemorySize: 256
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import traceback
+          import time
+
+          def lambda_handler(event, context):
+              responseData = {}
+              status = cfnresponse.SUCCESS
+
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, status, {'Success': 'Deleted'}, 'CustomResourcePhysicalID')
+                  return
+
+              try:
+                  ssm = boto3.client('ssm')
+                  instance_id = event['ResourceProperties']['InstanceId']
+                  ssm_document = event['ResourceProperties']['SsmDocument']
+
+                  # Wait for SSM agent to be ready (up to 5 minutes)
+                  for attempt in range(30):
+                      try:
+                          resp = ssm.describe_instance_information(
+                              Filters=[{'Key': 'InstanceIds', 'Values': [instance_id]}]
+                          )
+                          if resp['InstanceInformationList']:
+                              print(f'SSM agent ready after {attempt * 10}s')
+                              break
+                      except Exception:
+                          pass
+                      time.sleep(10)
+                  else:
+                      raise Exception(f'SSM agent not ready after 300s for {instance_id}')
+
+                  response = ssm.send_command(
+                      InstanceIds=[instance_id],
+                      DocumentName=ssm_document,
+                      TimeoutSeconds=1800
+                  )
+                  command_id = response['Command']['CommandId']
+
+                  # Wait up to 13 minutes (leave buffer for Lambda 15min limit)
+                  waiter = ssm.get_waiter('command_executed')
+                  waiter.wait(
+                      CommandId=command_id,
+                      InstanceId=instance_id,
+                      WaiterConfig={'Delay': 15, 'MaxAttempts': 52}
+                  )
+
+                  responseData = {'Success': f'Bootstrapped instance: {instance_id}'}
+              except Exception as e:
+                  status = cfnresponse.FAILED
+                  responseData = {'Error': traceback.format_exc()[-800:]}
+              finally:
+                  cfnresponse.send(event, context, status, responseData, 'CustomResourcePhysicalID')
+
+  BootstrapCustomResource:
+    Type: Custom::BootstrapIDE
+    Properties:
+      ServiceToken: !GetAtt BootstrapLambdaFunction.Arn
+      InstanceId: !Ref IdeInstance
+      SsmDocument: !Ref IdeSSMDocument
+
+  # ===========================================================================
+  # G. IDE EC2 instance + ALB
+  # ===========================================================================
+
+  IdeInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: PublicRoute
+    Properties:
+      ImageId: !Ref IdeAmiParameterStoreName
+      InstanceType: !Ref IdeInstanceType
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref IdeVolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref IdeSecurityGroup
+      IamInstanceProfile: !Ref IdeInstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ide'
+        - Key: Project
+          Value: agentcore-workshop
+
+  IdeALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8889
+      Protocol: HTTP
+      VpcId: !Ref IdeVPC
+      TargetType: instance
+      Targets:
+        - Id: !Ref IdeInstance
+          Port: 8889
+      HealthCheckEnabled: true
+      HealthCheckPath: /healthz
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '8889'
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      HealthCheckTimeoutSeconds: 5
+      HealthCheckIntervalSeconds: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ide-tg'
+
+  IdeALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref IdeALBSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      LoadBalancerAttributes:
+        # 空闲超时调大：门户对话是 SSE 流式，Agent 长思考间隙不被掐断
+        - Key: idle_timeout.timeout_seconds
+          Value: '300'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ide-alb'
+
+  IdeALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref IdeALB
+      Port: !Ref IdeAlbPort
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref IdeALBTargetGroup
+
+  # ===========================================================================
+  # G2. 可选：场景 2 Web 门户公网入口（HTTPS:8443 -> 实例 5173 的 Vite）
+  #     仅当 PortalCertificateArn 非空时创建。登录机制不变（Keycloak PKCE），
+  #     HTTPS 只是满足浏览器安全上下文要求。Vite 未启动时 ALB 返回 502 属预期。
+  # ===========================================================================
+
+  PortalALBSGIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: EnablePublicPortal
+    Properties:
+      GroupId: !Ref IdeALBSecurityGroup
+      Description: Allow HTTPS to scenario-2 web portal from AllowedCidr
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      CidrIp: !Ref AllowedCidr
+
+  PortalInstanceSGIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: EnablePublicPortal
+    Properties:
+      GroupId: !Ref IdeSecurityGroup
+      Description: Allow Vite dev server from ALB only
+      IpProtocol: tcp
+      FromPort: 5173
+      ToPort: 5173
+      SourceSecurityGroupId: !Ref IdeALBSecurityGroup
+
+  PortalTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: EnablePublicPortal
+    Properties:
+      Port: 5173
+      Protocol: HTTP
+      VpcId: !Ref IdeVPC
+      TargetType: instance
+      Targets:
+        - Id: !Ref IdeInstance
+          Port: 5173
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '5173'
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      HealthCheckTimeoutSeconds: 5
+      HealthCheckIntervalSeconds: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-portal-tg'
+
+  PortalListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: EnablePublicPortal
+    Properties:
+      LoadBalancerArn: !Ref IdeALB
+      Port: 8443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref PortalCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref PortalTargetGroup
+
+  # ===========================================================================
+  # G3. 可选：场景 2 门户的纯 HTTP 公网入口（NLB TCP:5173 -> 实例 5173）
+  #     中国区免备案（非标准端口）、免证书告警。前端在非安全上下文自动退回
+  #     无 PKCE 的授权码流程；token 明文传输，仅限 workshop 演示。
+  #     公网面收在 NLB 自己的安全组上（AllowedCidr）；实例安全组只信任
+  #     NLB 安全组——EC2 实例上永远不出现 0.0.0.0/0 规则。
+  # ===========================================================================
+
+  HttpPortalNLBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: EnableHttpPortalCond
+    Properties:
+      GroupDescription: Security group for scenario-2 HTTP portal NLB
+      SecurityGroupIngress:
+        - Description: Allow portal HTTP from AllowedCidr
+          IpProtocol: tcp
+          FromPort: 5173
+          ToPort: 5173
+          CidrIp: !Ref AllowedCidr
+      SecurityGroupEgress:
+        - Description: Allow all outbound traffic
+          IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref IdeVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-portal-nlb-sg'
+
+  HttpPortalInstanceSGIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: EnableHttpPortalCond
+    Properties:
+      GroupId: !Ref IdeSecurityGroup
+      Description: Allow Vite dev server from portal NLB only
+      IpProtocol: tcp
+      FromPort: 5173
+      ToPort: 5173
+      SourceSecurityGroupId: !Ref HttpPortalNLBSecurityGroup
+
+  HttpPortalNLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: EnableHttpPortalCond
+    Properties:
+      Scheme: internet-facing
+      Type: network
+      # NLB 横跨两个 AZ 但实例只在一个 AZ；必须开启跨区负载均衡，否则打到
+      # 无目标 AZ 节点的连接会超时（约半数请求失败）
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: "true"
+      SecurityGroups:
+        - !Ref HttpPortalNLBSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-portal-nlb'
+
+  HttpPortalTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: EnableHttpPortalCond
+    Properties:
+      Port: 5173
+      Protocol: TCP
+      VpcId: !Ref IdeVPC
+      TargetType: instance
+      Targets:
+        - Id: !Ref IdeInstance
+          Port: 5173
+      HealthCheckProtocol: TCP
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-portal-nlb-tg'
+
+  HttpPortalListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: EnableHttpPortalCond
+    Properties:
+      LoadBalancerArn: !Ref HttpPortalNLB
+      Port: 5173
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref HttpPortalTargetGroup
+
+  # ===========================================================================
+  # H. Workshop 数仓基础环境（合并自 part1 aurora-serverless.yaml，逻辑 ID 保持一致）
+  #    私有 VPC（无 IGW/NAT）：私网访问统一由挂进本 VPC 的 Lambda 承担。
+  # ===========================================================================
+
+  WorkshopVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: agentcore-workshop-vpc }]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WorkshopVpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: agentcore-workshop-private-a }]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WorkshopVpc
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: agentcore-workshop-private-b }]
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Aurora subnets (workshop)
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  # 集群安全组：仅允许持有 LambdaClientSecurityGroup 的客户端访问 5432
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora cluster access (workshop)
+      VpcId: !Ref WorkshopVpc
+
+  # Part 1 写库 Lambda 与 Part 2 analytics Lambda 都挂这个 SG（凭它访问集群 5432
+  # 与 Secrets 端点 443）。GroupDescription 保持与 workshop 原模板一字不差。
+  LambdaClientSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Client SG for in-VPC Lambda (part2)
+      VpcId: !Ref WorkshopVpc
+
+  DbIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref LambdaClientSecurityGroup
+
+  # Secrets Manager 接口端点：VPC 无 IGW/NAT，VPC 内 Lambda 取数据库凭证只能走这里
+  SecretsEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Secrets Manager VPC endpoint access (workshop)
+      VpcId: !Ref WorkshopVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaClientSecurityGroup
+
+  SecretsManagerVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref WorkshopVpc
+      ServiceName: !If [IsChinaPartition, !Sub "cn.com.amazonaws.${AWS::Region}.secretsmanager", !Sub "com.amazonaws.${AWS::Region}.secretsmanager"]
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref SecretsEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # Aurora Serverless v2（PostgreSQL）；不开 RDS Data API（中国区无此服务）
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: "17.10"
+      DatabaseName: !Ref DatabaseName
+      MasterUsername: postgres
+      ManageMasterUserPassword: true          # 密码托管在 Secrets Manager
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref MinCapacityACU
+        MaxCapacity: !Ref MaxCapacityACU
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds: [!Ref DbSecurityGroup]
+      StorageEncrypted: true
+      BackupRetentionPeriod: 1
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      PubliclyAccessible: false
+
+  # 写库 Lambda 的执行角色：VPC ENI 管理 + 读数据库 Secret
+  #（函数本体由步骤脚本打包创建，与 Part 2 的 analytics Lambda 同一模式）
+  WriterLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agentcore-workshop-writer-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+
+  # ---- 资产中转：CDN -> 本账号 S3（Lambda 的 Code 只认同区域 S3 桶） ----
+  AssetStagingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: agentcore-workshop
+
+  AssetFetchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'lambda.${AWS::URLSuffix}'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: fetch-assets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt AssetStagingBucket.Arn
+                  - !Sub '${AssetStagingBucket.Arn}/*'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  AssetFetchFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-asset-fetch'
+      Handler: index.handler
+      Role: !GetAtt AssetFetchRole.Arn
+      Runtime: python3.12
+      MemorySize: 512
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3, urllib.request
+          # cfnresponse 由 CFN 按「独立 import 语句」字面匹配注入，不能并进上一行
+          import cfnresponse
+          def handler(event, context):
+              p = event['ResourceProperties']; b = p['Bucket']; s3 = boto3.client('s3')
+              try:
+                  if event['RequestType'] == 'Delete':
+                      pg = s3.get_paginator('list_objects_v2')
+                      for page in pg.paginate(Bucket=b):
+                          objs = [{'Key': o['Key']} for o in page.get('Contents', [])]
+                          if objs: s3.delete_objects(Bucket=b, Delete={'Objects': objs})
+                  else:
+                      for k in p['Keys']:
+                          with urllib.request.urlopen(p['BaseUrl'].rstrip('/') + '/' + k, timeout=60) as r:
+                              s3.put_object(Bucket=b, Key=k, Body=r.read())
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, 'asset-fetch')
+              except Exception as e:
+                  print('failed:', e)
+                  # Delete 阶段清空失败不阻断删栈；Create/Update 失败必须让栈失败
+                  st = cfnresponse.SUCCESS if event['RequestType'] == 'Delete' else cfnresponse.FAILED
+                  cfnresponse.send(event, context, st, {}, 'asset-fetch', reason=str(e))
+
+  # BundleVersion 变更时自定义资源重跑（重新拉取全部 zip）
+  AssetFetch:
+    Type: Custom::AssetFetch
+    Properties:
+      ServiceToken: !GetAtt AssetFetchFunction.Arn
+      Bucket: !Ref AssetStagingBucket
+      BaseUrl: !Ref AssetBaseUrl
+      Keys:
+        - lambda/writer-lambda.zip
+        - lambda/db-lambda.zip
+        - lambda/analytics-lambda.zip
+        - lambda/memory-lambda.zip
+        - lambda/tasksapi-lambda.zip
+        - lambda/runner-lambda.zip
+
+  # ---- 数据面 Lambda 随栈预建（代码 zip 经 AssetFetch 从 CDN 拉进中转桶） ----
+  # 写库 Lambda：save_verdict/save_candidate/setup_tables/check_tables
+  WriterFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [SecretsManagerVpcEndpoint, AssetFetch]
+    Properties:
+      FunctionName: !Ref WriterFunctionName
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt WriterLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref AssetStagingBucket
+        S3Key: lambda/writer-lambda.zip
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroupIds: [!Ref LambdaClientSecurityGroup]
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          DB_NAME: !Ref DatabaseName
+          DB_SECRET_ARN: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+
+  # 通用数据面 Lambda（op=execute 任意 SQL）：数据验证/会话历史/任务表统一通道
+  DbFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [SecretsManagerVpcEndpoint, AssetFetch]
+    Properties:
+      FunctionName: agentcore-workshop-db
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt DbLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref AssetStagingBucket
+        S3Key: lambda/db-lambda.zip
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroupIds: [!Ref LambdaClientSecurityGroup]
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          DB_NAME: !Ref DatabaseName
+          DB_SECRET_ARN: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+
+  # ---- 建表自定义资源：栈创建时自动 invoke 写库 Lambda 的 setup_tables ----
+  SetupTablesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-writer-and-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource: !GetAtt WriterFunction.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  SetupTablesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-setup-tables'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt SetupTablesRole.Arn
+      Timeout: 900
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import boto3, json, time
+          import cfnresponse
+          from botocore.config import Config
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, 'setup-tables'); return
+              try:
+                  # 写库 Lambda 内部连库重试上限 240s，read_timeout 要盖过它
+                  lam = boto3.client('lambda', config=Config(read_timeout=310, retries={'max_attempts': 0}))
+                  fn = event['ResourceProperties']['FunctionName']
+                  ok = False; last = ''
+                  # 新建 VPC Lambda 的 ENI 就绪与数据库首连可能要几轮重试
+                  while context.get_remaining_time_in_millis() > 60000:
+                      try:
+                          r = lam.invoke(FunctionName=fn, Payload=b'{"op": "setup_tables"}')
+                          d = json.loads(r['Payload'].read() or b'{}')
+                          last = str(d)[:300]
+                          if isinstance(d, dict) and d.get('status') == 'ok':
+                              ok = True; break
+                      except Exception as e:
+                          last = str(e)[:300]
+                      print('retrying setup_tables:', last)
+                      time.sleep(20)
+                  cfnresponse.send(event, context,
+                                   cfnresponse.SUCCESS if ok else cfnresponse.FAILED,
+                                   {'detail': last}, 'setup-tables')
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'error': str(e)[:300]}, 'setup-tables')
+
+  SetupTablesResource:
+    Type: Custom::SetupTables
+    DependsOn:
+      - AuroraInstance
+      - DbIngressFromLambda
+    Properties:
+      ServiceToken: !GetAtt SetupTablesFunction.Arn
+      FunctionName: !Ref WriterFunction
+
+  # Part 1 Runtime 执行角色写数仓所需的全部权限：调写库 Lambda 即可
+  AgentWriterInvokePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: agentcore-workshop-agent-writer-invoke
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: InvokeWriterLambda
+            Effect: Allow
+            Action: [lambda:InvokeFunction]
+            Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${WriterFunctionName}
+
+  # ===========================================================================
+  # H2. Keycloak 基础设施（预建，随 base 栈创建/删除）
+  #     移植自 part2 的 keycloak-fargate.yaml：小型公有 VPC + Cloud Map(SRV) +
+  #     ECS Fargate + API Gateway HTTP API(免域名 HTTPS 入口)。
+  #     关键差异：
+  #     - 服务初始 DesiredCount=0（镜像由场景 2 构建推送后再拉起到 1 副本）；
+  #     - 管理员密码生成在 Secrets Manager（输出 ARN，场景 2 回写 secrets.env）；
+  #     - KC_HOSTNAME 同栈直接推导注入，消灭原独立栈的两阶段修正；
+  #     - ECR 仓库不入栈：任务定义按 URI 引用即可，仓库由场景 2 脚本按需创建
+  #       （可能先于本栈存在），删栈时由清理钩子扫掉。
+  # ===========================================================================
+
+  KcAdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-kc-admin-password'
+      GenerateSecretString:
+        ExcludeCharacters: "\"@/\\'"
+        ExcludePunctuation: true
+        GenerateStringKey: password
+        IncludeSpace: false
+        PasswordLength: 24
+        SecretStringTemplate: '{"password":""}'
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  KcVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.30.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: agentcore-workshop-keycloak-vpc }]
+
+  KcIgw:
+    Type: AWS::EC2::InternetGateway
+  KcIgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref KcVpc
+      InternetGatewayId: !Ref KcIgw
+
+  KcPublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref KcVpc
+      CidrBlock: 10.30.0.0/26
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+  KcPublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref KcVpc
+      CidrBlock: 10.30.0.64/26
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  KcPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref KcVpc
+  KcDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: KcIgwAttachment
+    Properties:
+      RouteTableId: !Ref KcPublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref KcIgw
+  KcSubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref KcPublicSubnetA, RouteTableId: !Ref KcPublicRouteTable }
+  KcSubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref KcPublicSubnetB, RouteTableId: !Ref KcPublicRouteTable }
+
+  KcVpcLinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: API Gateway VPC Link ENIs
+      VpcId: !Ref KcVpc
+
+  KcServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Keycloak Fargate task (ingress only from VPC Link)
+      VpcId: !Ref KcVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref KcVpcLinkSecurityGroup
+
+  # Cloud Map 服务发现（必须 SRV 记录：API Gateway 按实例端口转发，A 记录会 500）
+  KcDiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: agentcore-workshop.local
+      Vpc: !Ref KcVpc
+
+  KcDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: keycloak-srv
+      NamespaceId: !Ref KcDiscoveryNamespace
+      DnsConfig:
+        DnsRecords: [{ Type: SRV, TTL: 10 }]
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+
+  KcCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: agentcore-workshop
+
+  KcLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/agentcore-workshop-keycloak
+      RetentionInDays: 7
+
+  KcExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-kc-admin-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Ref KcAdminSecret
+
+  KcTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: agentcore-workshop-keycloak
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "1024"
+      Memory: "2048"
+      RuntimePlatform:
+        CpuArchitecture: ARM64          # 镜像由场景 2 按 arm64 构建
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt KcExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: keycloak
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/agentcore-workshop/keycloak:latest'
+          PortMappings: [{ ContainerPort: 8080, Protocol: tcp }]
+          Environment:
+            - { Name: KC_BOOTSTRAP_ADMIN_USERNAME, Value: admin }
+            # 同栈可直接推导公网入口，issuer 从一开始就是 https（免两阶段修正）
+            - Name: KC_HOSTNAME
+              Value: !Sub 'https://${KcHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+          Secrets:
+            - Name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              ValueFrom: !Sub '${KcAdminSecret}:password::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref KcLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: kc
+
+  KcService:
+    Type: AWS::ECS::Service
+    DependsOn: KcDefaultRoute
+    Properties:
+      # 不固定 ServiceName（服务发现配置变更触发替换时避免撞名）；
+      # DesiredCount=0：镜像在场景 2 才构建推送，届时脚本拉起到 1 副本
+      Cluster: !Ref KcCluster
+      LaunchType: FARGATE
+      DesiredCount: 0
+      TaskDefinition: !Ref KcTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED       # 仅出向拉镜像用；入向由 SG 限制
+          Subnets: [!Ref KcPublicSubnetA, !Ref KcPublicSubnetB]
+          SecurityGroups: [!Ref KcServiceSecurityGroup]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt KcDiscoveryService.Arn
+          Port: 8080
+
+  KcHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: agentcore-workshop-keycloak
+      ProtocolType: HTTP
+
+  KcVpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: agentcore-workshop-keycloak
+      SubnetIds: [!Ref KcPublicSubnetA, !Ref KcPublicSubnetB]
+      SecurityGroupIds: [!Ref KcVpcLinkSecurityGroup]
+
+  KcProxyIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref KcHttpApi
+      IntegrationType: HTTP_PROXY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref KcVpcLink
+      IntegrationUri: !GetAtt KcDiscoveryService.Arn
+      IntegrationMethod: ANY
+      PayloadFormatVersion: "1.0"
+
+  KcDefaultRouteApi:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref KcHttpApi
+      RouteKey: $default
+      Target: !Sub integrations/${KcProxyIntegration}
+
+  KcDefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref KcHttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  # ===========================================================================
+  # H3. Part 2 分析链路 + 任务管理基础设施（预建，随 base 栈创建/删除）
+  #     移植自 part2 的 part2-analytics.yaml / part2-tasks.yaml：
+  #     - 4 个 IAM 角色（analytics/memory/db Lambda + Gateway）
+  #     - 4 个 Lambda 函数本体（analytics/memory/tasks-api/runner；代码 zip 由
+  #       deploy-ide.sh 构建上传，场景脚本按"已存在则更新"复用）
+  #     - 任务管理：tasks-api/runner/scheduler 角色 + 调度组 + Tasks HTTP API
+  #       （JWT authorizer 的 issuer 由同栈 Keycloak 直接推导）
+  #     差异：runner 角色对 Runtime 的调用授权用账号内通配（场景 1 的
+  #     Runtime ARN 在建栈时尚不存在）；runner 的 PART1_RUNTIME_ARN 环境变量
+  #     由场景 2 脚本部署时回填。
+  # ===========================================================================
+
+  AnalyticsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agentcore-workshop-analytics-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+
+  MemoryLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agentcore-workshop-memory-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+
+  DbLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agentcore-workshop-db-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agentcore-workshop-gateway-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: invoke-analytics-lambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:agentcore-workshop-analytics
+
+  AnalyticsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [SecretsManagerVpcEndpoint, AssetFetch]
+    Properties:
+      FunctionName: agentcore-workshop-analytics
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt AnalyticsLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref AssetStagingBucket
+        S3Key: lambda/analytics-lambda.zip
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroupIds: [!Ref LambdaClientSecurityGroup]
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          DB_NAME: !Ref DatabaseName
+          DB_SECRET_ARN: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+
+  MemoryFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [SecretsManagerVpcEndpoint, AssetFetch]
+    Properties:
+      FunctionName: agentcore-workshop-memory
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt MemoryLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref AssetStagingBucket
+        S3Key: lambda/memory-lambda.zip
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroupIds: [!Ref LambdaClientSecurityGroup]
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          DB_NAME: !Ref DatabaseName
+          DB_SECRET_ARN: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+
+  ScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: agentcore-workshop-ingestion
+
+  SchedulerInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agentcore-workshop-ingestion-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: invoke-runner
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:agentcore-workshop-ingestion-runner
+
+  TasksApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agentcore-workshop-tasks-api-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: tasks-api-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeWorkerLambdas
+                Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:agentcore-workshop-ingestion-runner
+                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:agentcore-workshop-memory
+                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:agentcore-workshop-db
+              - Sid: ManageSchedules
+                Effect: Allow
+                Action:
+                  - scheduler:CreateSchedule
+                  - scheduler:UpdateSchedule
+                  - scheduler:DeleteSchedule
+                  - scheduler:GetSchedule
+                Resource: !Sub arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ScheduleGroup}/*
+              # 只放这一个角色，不加 iam:PassedToService 条件（Scheduler 的
+              # PassRole 请求不一定带该上下文键）
+              - Sid: PassSchedulerRole
+                Effect: Allow
+                Action: [iam:PassRole]
+                Resource: !GetAtt SchedulerInvokeRole.Arn
+              - Sid: BrowserLiveView
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetBrowserSession
+                  - bedrock-agentcore:ListBrowserSessions
+                  - bedrock-agentcore:ConnectBrowserLiveViewStream
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:browser/*
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:browser-custom/*
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:browser-profile/*
+
+  # runner 角色：建栈时场景 1 的 Runtime 还不存在，调用授权用账号内通配
+  #（原独立栈按具体 Runtime ARN 收敛；工作坊语境下账号内通配是可接受的放宽）
+  RunnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agentcore-workshop-ingestion-runner-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: invoke-part1-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [bedrock-agentcore:InvokeAgentRuntime]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*
+              - Sid: InvokeDbLambda
+                Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:agentcore-workshop-db
+              # 后台探测浏览器会话：ListBrowsers 是账号级列举（无资源级授权），
+              # 单列一条 Resource: "*"；会话查询/详情按 browser ARN 收敛
+              - Sid: ListBrowsersForLiveView
+                Effect: Allow
+                Action: [bedrock-agentcore:ListBrowsers]
+                Resource: "*"
+              - Sid: WatchBrowserSessionsForLiveView
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:ListBrowserSessions
+                  - bedrock-agentcore:GetBrowserSession
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:browser/*
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:browser-custom/*
+
+  TasksApiFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AssetFetch
+    Properties:
+      FunctionName: agentcore-workshop-tasks-api
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt TasksApiRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref AssetStagingBucket
+        S3Key: lambda/tasksapi-lambda.zip
+      Environment:
+        Variables:
+          DB_LAMBDA_NAME: agentcore-workshop-db
+          RUNNER_FUNCTION_NAME: agentcore-workshop-ingestion-runner
+          RUNNER_FUNCTION_ARN: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:agentcore-workshop-ingestion-runner
+          SCHEDULE_GROUP: !Ref ScheduleGroup
+          SCHEDULER_ROLE_ARN: !GetAtt SchedulerInvokeRole.Arn
+          MEMORY_LAMBDA_NAME: agentcore-workshop-memory
+          MEM0_COLLECTION: mem0_ltm
+          MEM0_EMBEDDER_DIMS: "1024"
+
+  RunnerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AssetFetch
+    Properties:
+      FunctionName: agentcore-workshop-ingestion-runner
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt RunnerRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref AssetStagingBucket
+        S3Key: lambda/runner-lambda.zip
+      Environment:
+        Variables:
+          DB_LAMBDA_NAME: agentcore-workshop-db
+          # 场景 1 的 Runtime ARN 建栈时未知，场景 2 脚本部署时回填
+          PART1_RUNTIME_ARN: ""
+
+  TasksHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: agentcore-workshop-tasks-api
+      Description: Workshop Part2 数据摄入任务管理 API
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: !Split
+          - ","
+          - !If
+            - EnablePublicPortal
+            - !If
+              - EnableHttpPortalCond
+              - !Sub "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5273,http://127.0.0.1:5273,https://${IdeALB.DNSName}:8443,http://${HttpPortalNLB.DNSName}:5173"
+              - !Sub "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5273,http://127.0.0.1:5273,https://${IdeALB.DNSName}:8443"
+            - !If
+              - EnableHttpPortalCond
+              - !Sub "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5273,http://127.0.0.1:5273,http://${HttpPortalNLB.DNSName}:5173"
+              - "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5273,http://127.0.0.1:5273"
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, POST, PATCH, DELETE, OPTIONS]
+        MaxAge: 3600
+
+  TasksApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref TasksHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt TasksApiFunction.Arn
+      PayloadFormatVersion: "2.0"
+      IntegrationMethod: POST
+
+  # JWT authorizer 与各方法路由由场景 2 脚本在 Keycloak 就绪后幂等创建
+  #（authorizer 创建时 API Gateway 会实际校验 issuer 的 discovery 端点，
+  #  Keycloak 0 副本待命阶段无法通过校验，故不能随栈预建）
+
+  TasksDefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref TasksHttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  TasksApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TasksApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${TasksHttpApi}/*
+
+  # ===========================================================================
+  # I. 一键销毁钩子：删除本栈时先清扫步骤脚本在栈外创建的资源。
+  #    删除顺序保障：CleanupCustomResource 显式依赖数仓 VPC 面资源与三个
+  #    托管策略——CFN 删除时先跑本自定义资源（清 Lambda/AgentCore/子栈/ECR/
+  #    SDK 角色 + 扫残留 ENI），之后才动 VPC/子网/SG/托管策略。
+  #    全程 best-effort（始终返回 SUCCESS）：个别资源清不掉时删栈继续，
+  #    失败点在栈事件里可见，重试删栈即可收敛。
+  # ===========================================================================
+
+  CleanupLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-cleanup-on-delete'
+      Handler: index.handler
+      Role: !GetAtt CleanupLambdaRole.Arn
+      Runtime: python3.12
+      MemorySize: 256
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3, time, traceback
+          import cfnresponse
+          STACKS=['agentcore-workshop-part2-tasks','agentcore-workshop-part2']
+          def w(f):
+              try: return f()
+              except Exception as e: print('skip:', e)
+          def handler(event, context):
+              if event['RequestType'] != 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, 'cleanup'); return
+              try:
+                  vpc = event['ResourceProperties']['VpcId']
+                  ec2 = boto3.client('ec2'); lam = boto3.client('lambda')
+                  sch = boto3.client('scheduler'); cf = boto3.client('cloudformation')
+                  for s in (w(lambda: sch.list_schedules(GroupName='agentcore-workshop-ingestion')['Schedules']) or []):
+                      w(lambda: sch.delete_schedule(Name=s['Name'], GroupName='agentcore-workshop-ingestion'))
+                  # 按前缀枚举删 workshop Lambda（含临时的）；跳过本栈自管的两个
+                  own = event['ResourceProperties'].get('StackName', '')
+                  for pg in (w(lambda: list(lam.get_paginator('list_functions').paginate())) or []):
+                      for fd in pg.get('Functions', []):
+                          f = fd['FunctionName']
+                          if f.startswith('agentcore-workshop') and not (own and f.startswith(own)):
+                              w(lambda: lam.delete_function(FunctionName=f))
+                              print('deleted lambda:', f)
+                  # 尽早发起子栈删除（keycloak 的 ECS 服务排空最耗时），后续步骤并行推进
+                  for s in STACKS: w(lambda: cf.delete_stack(StackName=s))
+                  try:
+                      b = boto3.client('bedrock-agentcore-control')
+                      for r in (w(lambda: b.list_agent_runtimes()['agentRuntimes']) or []):
+                          if r['agentRuntimeName'] in ('product_ingestion_agent','analysis_chat_agent'):
+                              w(lambda: b.delete_agent_runtime(agentRuntimeId=r['agentRuntimeId']))
+                      for g in (w(lambda: b.list_gateways()['items']) or []):
+                          if g['name'] == 'agentcore-workshop-analytics-gw':
+                              gid = g['gatewayId']
+                              for t in (w(lambda: b.list_gateway_targets(gatewayIdentifier=gid)['items']) or []):
+                                  w(lambda: b.delete_gateway_target(gatewayIdentifier=gid, targetId=t['targetId']))
+                              time.sleep(8); w(lambda: b.delete_gateway(gatewayIdentifier=gid))
+                      w(lambda: b.delete_oauth2_credential_provider(name='agentcore-workshop-keycloak'))
+                      for x in (w(lambda: b.list_browsers(type='CUSTOM')['browserSummaries']) or []):
+                          if x['name'] == 'product_hunting_browser': w(lambda: b.delete_browser(browserId=x['browserId']))
+                      for x in (w(lambda: b.list_browser_profiles()['profileSummaries']) or []):
+                          if x['name'] == 'product_hunting_profile': w(lambda: b.delete_browser_profile(profileId=x['profileId']))
+                  except Exception: print(traceback.format_exc())
+                  # 场景脚本在 Tasks API 上补建的路由/authorizer 引用着栈内
+                  # Integration，须先删掉 CFN 才能删 Integration
+                  try:
+                      ag = boto3.client('apigatewayv2')
+                      for a in (w(lambda: ag.get_apis()['Items']) or []):
+                          if a['Name'] == 'agentcore-workshop-tasks-api':
+                              aid = a['ApiId']
+                              for rt in (w(lambda: ag.get_routes(ApiId=aid)['Items']) or []):
+                                  w(lambda: ag.delete_route(ApiId=aid, RouteId=rt['RouteId']))
+                              for au in (w(lambda: ag.get_authorizers(ApiId=aid)['Items']) or []):
+                                  w(lambda: ag.delete_authorizer(ApiId=aid, AuthorizerId=au['AuthorizerId']))
+                  except Exception: print(traceback.format_exc())
+                  ecr = boto3.client('ecr')
+                  for r in (w(lambda: ecr.describe_repositories()['repositories']) or []):
+                      if r['repositoryName'].startswith(('agentcore-workshop','bedrock-agentcore-')):
+                          w(lambda: ecr.delete_repository(repositoryName=r['repositoryName'], force=True))
+                  # toolkit 的 CodeBuild 项目与构建源码桶
+                  cb = boto3.client('codebuild')
+                  for n in (w(lambda: cb.list_projects()['projects']) or []):
+                      if n.startswith('bedrock-agentcore-'):
+                          w(lambda: cb.delete_project(name=n)); print('deleted codebuild:', n)
+                  s3c = boto3.client('s3')
+                  acct = event['StackId'].split(':')[4]
+                  bkt = 'bedrock-agentcore-codebuild-sources-%s-%s' % (acct, boto3.session.Session().region_name)
+                  try:
+                      for page in s3c.get_paginator('list_objects_v2').paginate(Bucket=bkt):
+                          objs = [{'Key': o['Key']} for o in page.get('Contents', [])]
+                          if objs: s3c.delete_objects(Bucket=bkt, Delete={'Objects': objs})
+                      s3c.delete_bucket(Bucket=bkt); print('deleted bucket:', bkt)
+                  except Exception as e: print('skip:', e)
+                  iam = boto3.client('iam')
+                  names = [x['RoleName'] for x in (w(lambda: iam.list_roles(MaxItems=1000)['Roles']) or [])
+                           if x['RoleName'].startswith('AmazonBedrockAgentCoreSDK') or x['RoleName'] == 'agentcore-workshop-browser-role']
+                  for r in names:
+                      for p in (w(lambda: iam.list_attached_role_policies(RoleName=r)['AttachedPolicies']) or []):
+                          w(lambda: iam.detach_role_policy(RoleName=r, PolicyArn=p['PolicyArn']))
+                      for p in (w(lambda: iam.list_role_policies(RoleName=r)['PolicyNames']) or []):
+                          w(lambda: iam.delete_role_policy(RoleName=r, PolicyName=p))
+                      w(lambda: iam.delete_role(RoleName=r))
+                  # 等子栈删完再返回：子栈删除用本角色会话凭证，提前返回会
+                  # 因托管策略被删导致子栈 DELETE_FAILED
+                  def gone(s):
+                      try:
+                          return cf.describe_stacks(StackName=s)['Stacks'][0]['StackStatus'] == 'DELETE_COMPLETE'
+                      except Exception:
+                          return True
+                  while context.get_remaining_time_in_millis() > 240000:
+                      if all(gone(s) for s in STACKS): break
+                      print('waiting for child stacks to delete...'); time.sleep(15)
+                  # 清扫隐式创建的日志组（Runtime/CodeBuild/Lambda 删除时不带走
+                  # 各自的日志组）。放在子栈等待之后：此时全部 workshop 计算资源
+                  # 已停写，删了不会被重建。自己的日志组留给最后（还在写）
+                  lg = boto3.client('logs')
+                  own_lg = '/aws/lambda/' + context.function_name
+                  for pfx in ('/aws/bedrock-agentcore/', '/aws/codebuild/bedrock-agentcore-', '/aws/lambda/agentcore-workshop'):
+                      for page in (w(lambda: list(lg.get_paginator('describe_log_groups').paginate(logGroupNamePrefix=pfx))) or []):
+                          for g in page.get('logGroups', []):
+                              n = g['logGroupName']
+                              if n != own_lg:
+                                  w(lambda n=n: lg.delete_log_group(logGroupName=n)); print('deleted log group:', n)
+                  # 轮询清扫 Lambda ENI（异步回收）；端点/RDS 的 ENI 由 CFN 随
+                  # 各自资源删除，不等
+                  while context.get_remaining_time_in_millis() > 120000:
+                      en = [e for e in (w(lambda: ec2.describe_network_interfaces(
+                                Filters=[{'Name':'vpc-id','Values':[vpc]}])['NetworkInterfaces']) or [])
+                            if e.get('Description','').startswith('AWS Lambda VPC ENI')
+                            or e.get('InterfaceType') == 'lambda']
+                      if not en: break
+                      for e in en:
+                          if e['Status'] == 'available':
+                              w(lambda: ec2.delete_network_interface(NetworkInterfaceId=e['NetworkInterfaceId']))
+                      print(f'{len(en)} lambda ENI(s) remaining in {vpc}'); time.sleep(15)
+              except Exception: print(traceback.format_exc())
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, 'cleanup')
+
+  CleanupCustomResource:
+    Type: Custom::CleanupOnDelete
+    DependsOn:
+      - AuroraInstance
+      - SecretsManagerVpcEndpoint
+      - DbIngressFromLambda
+      - WriterLambdaRole
+      - AgentWriterInvokePolicy
+      - IdeWorkshopInfraPolicy
+      - IdeWorkshopIamPolicy
+      - IdeWorkshopAppPolicy
+    Properties:
+      ServiceToken: !GetAtt CleanupLambdaFunction.Arn
+      VpcId: !Ref WorkshopVpc
+      StackName: !Ref AWS::StackName
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  # --- IDE ---
+  IdeUrl:
+    Description: Browser IDE URL (login with the password from Secrets Manager)
+    Value: !Sub 'http://${IdeALB.DNSName}:${IdeAlbPort}/?folder=/home/ec2-user/environment'
+
+  IdePasswordCommand:
+    Description: CLI command to retrieve the IDE login password
+    Value: !Sub "aws secretsmanager get-secret-value --secret-id ${IdePassword} --region ${AWS::Region} --query SecretString --output text"
+
+  IdePasswordConsoleUrl:
+    Description: Console URL to view the IDE password secret
+    # 控制台域名与 API 端点后缀（URLSuffix）不同：全球区是
+    # <region>.console.aws.amazon.com，中国区是 console.amazonaws.cn
+    Value: !If
+      - IsChinaPartition
+      - !Sub 'https://console.amazonaws.cn/secretsmanager/secret?name=${AWS::StackName}-ide-password&region=${AWS::Region}'
+      - !Sub 'https://${AWS::Region}.console.aws.amazon.com/secretsmanager/secret?name=${AWS::StackName}-ide-password&region=${AWS::Region}'
+
+  IdeInstanceId:
+    Description: IDE EC2 instance id (for SSM session / port-forwarding)
+    Value: !Ref IdeInstance
+
+  PortalUrl:
+    Condition: EnablePublicPortal
+    Description: Public HTTPS URL of the scenario-2 web portal (Vite must be running on the instance; self-signed cert shows a one-time browser warning)
+    Value: !Sub 'https://${IdeALB.DNSName}:8443'
+
+  HttpPortalUrl:
+    Condition: EnableHttpPortalCond
+    Description: Public plain-HTTP URL of the scenario-2 web portal via NLB (no ICP / no cert warning; tokens travel in cleartext - workshop only)
+    Value: !Sub 'http://${HttpPortalNLB.DNSName}:5173'
+
+  PortForwardCommand:
+    Description: Run on your laptop to reach the Part 2 web frontend (Vite) as http://localhost:5173
+    Value: !Sub >-
+      aws ssm start-session --target ${IdeInstance} --region ${AWS::Region}
+      --document-name AWS-StartPortForwardingSession
+      --parameters '{"portNumber":["5173"],"localPortNumber":["5173"]}'
+
+  IdeRoleArn:
+    Description: Least-privilege IAM role attached to the IDE instance
+    Value: !GetAtt IdeRole.Arn
+
+  # --- Workshop 数仓（输出键与 part1 aurora-serverless.yaml 保持一致） ---
+  ClusterArn:
+    Value: !GetAtt AuroraCluster.DBClusterArn
+  SecretArn:
+    Value: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+  DatabaseName:
+    Value: !Ref DatabaseName
+  AgentWriterInvokePolicyArn:
+    Value: !Ref AgentWriterInvokePolicy
+  WriterLambdaRoleArn:
+    Value: !GetAtt WriterLambdaRole.Arn
+  WriterFunctionName:
+    Value: !Ref WriterFunctionName
+  VpcId:
+    Value: !Ref WorkshopVpc
+  PrivateSubnetIds:
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+  LambdaClientSecurityGroupId:
+    Value: !Ref LambdaClientSecurityGroup
+  ClusterEndpoint:
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+
+  # --- Keycloak（预建基础设施，场景 2 推镜像后拉起；输出键供 part2 deploy.sh 外部托管模式读取） ---
+  KeycloakUrl:
+    Value: !Sub 'https://${KcHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+  KeycloakClusterName:
+    Value: !Ref KcCluster
+  KeycloakServiceName:
+    Value: !GetAtt KcService.Name
+  KeycloakAdminSecretArn:
+    Value: !Ref KcAdminSecret
+
+  # --- Part 2 分析链路 + 任务管理（输出键与原 part2/part2-tasks 子栈一致，
+  #     供 part2 deploy.sh 外部托管模式直接读取） ---
+  AnalyticsLambdaRoleArn:
+    Value: !GetAtt AnalyticsLambdaRole.Arn
+  MemoryLambdaRoleArn:
+    Value: !GetAtt MemoryLambdaRole.Arn
+  DbLambdaRoleArn:
+    Value: !GetAtt DbLambdaRole.Arn
+  GatewayRoleArn:
+    Value: !GetAtt GatewayRole.Arn
+  TasksApiRoleArn:
+    Value: !GetAtt TasksApiRole.Arn
+  RunnerRoleArn:
+    Value: !GetAtt RunnerRole.Arn
+  ScheduleGroupName:
+    Value: !Ref ScheduleGroup
+  SchedulerInvokeRoleArn:
+    Value: !GetAtt SchedulerInvokeRole.Arn
+  ApiEndpoint:
+    Description: Tasks API 根地址（$default stage）
+    Value: !GetAtt TasksHttpApi.ApiEndpoint
+  TasksApiId:
+    Description: Tasks API 的 ApiId（场景 2 脚本据此补建 JWT authorizer 与路由）
+    Value: !Ref TasksHttpApi
+  TasksIntegrationId:
+    Value: !Ref TasksApiIntegration
