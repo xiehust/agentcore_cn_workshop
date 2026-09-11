@@ -1,3 +1,6 @@
+// HTTP 门户（非安全上下文）兼容垫片，必须最先加载（import 有提升，
+// 垫片代码不能直接写在本文件顶部，只能用独立模块保证顺序）
+import "./insecure-context-polyfill";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";

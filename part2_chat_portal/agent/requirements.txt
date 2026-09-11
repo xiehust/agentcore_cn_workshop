@@ -1,7 +1,10 @@
 bedrock-agentcore>=1.1.0
 strands-agents[openai]>=1.50.0
 strands-agents-tools[agent_core_code_interpreter]>=0.8.0
-mcp>=1.9.0
+# 上界锁 <2：mcp 2.2.0 把 streamablehttp_client 重命名为 streamable_http_client，
+# main.py 的旧名 import 会崩（容器起不来 → 调用报 424）；strands-agents 本身也要求
+# mcp<2.2。1.x 系列 API 稳定，保持在此区间
+mcp>=1.9.0,<2
 boto3>=1.43.0
 # 长期记忆（memory_backend.py）：向量操作走 VPC 内 Lambda，Runtime 侧不需要
 # psycopg/pgvector；上界锁 2.1——自定义向量后端触及 mem0 少量私有注册表

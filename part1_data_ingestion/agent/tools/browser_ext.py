@@ -15,13 +15,34 @@
 
 import logging
 import uuid
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from bedrock_agentcore.tools.browser_client import BrowserClient
 from playwright.async_api import Browser as PlaywrightBrowser
 from strands_tools.browser import AgentCoreBrowser
+from strands_tools.browser.models import EvaluateAction, GetTextAction
 
 logger = logging.getLogger(__name__)
+
+# 上游 0.8.x 的 get_text / evaluate 不截断返回内容（get_html 反而截到 1000），
+# 电商搜索/详情页整页文本可达几百 KB，一条工具结果就能撑爆模型上下文窗口，
+# 且随后的对话摘要自救也会因同一条巨型消息再次溢出，最终 SSE 断流
+#（IncompleteRead）。在子类统一钳制这两个无界 action 的返回大小。
+MAX_TOOL_RESULT_CHARS = 25_000
+
+
+def _clamp_result(result: Dict[str, Any], limit: int = MAX_TOOL_RESULT_CHARS) -> Dict[str, Any]:
+    for block in result.get("content") or []:
+        text = block.get("text")
+        if isinstance(text, str) and len(text) > limit:
+            block["text"] = (
+                text[:limit]
+                + f"\n\n[输出过长已截断：原始 {len(text)} 字符，仅保留前 {limit} 字符。"
+                "请改用更精确的 CSS 选择器分块提取，或用 evaluate 在页面内先筛出"
+                "所需字段再返回精简结果。]"
+            )
+            logger.info("浏览器工具结果已截断: %d -> %d 字符", len(text), limit)
+    return result
 
 # 会话默认分辨率：与门户 Live View 组件的 remoteWidth/remoteHeight 常量对齐，
 # 不一致会导致直播画面被裁切或出现黑边。
@@ -101,6 +122,14 @@ class ExtendedAgentCoreBrowser(AgentCoreBrowser):
             region=region, identifier=identifier, session_timeout=session_timeout
         )
         self.profile_id = profile_id
+
+    # get_text / evaluate 是仅有的两个无界大输出 action（见模块顶部说明）；
+    # 上游按 `self.get_text(action)` 实例方法分发，子类覆写即可全量拦截
+    def get_text(self, action: GetTextAction) -> Dict[str, Any]:
+        return _clamp_result(super().get_text(action))
+
+    def evaluate(self, action: EvaluateAction) -> Dict[str, Any]:
+        return _clamp_result(super().evaluate(action))
 
     async def create_browser_session(self) -> PlaywrightBrowser:
         if not self._playwright:

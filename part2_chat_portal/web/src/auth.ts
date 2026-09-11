@@ -12,7 +12,11 @@ export const keycloak = new Keycloak({
 export async function initAuth(): Promise<boolean> {
   return keycloak.init({
     onLoad: "login-required",
-    pkceMethod: "S256",
+    // PKCE S256 依赖 crypto.subtle，浏览器只在安全上下文（HTTPS/localhost）
+    // 提供；公网 HTTP 门户（NLB 非标准端口，中国区免备案形态）退回普通
+    // 授权码流程（realm 侧未强制 S256）。HTTP 下 token 明文传输，仅限
+    // workshop 演示，生产请走 HTTPS。
+    pkceMethod: window.isSecureContext ? "S256" : false,
     checkLoginIframe: false,
   });
 }

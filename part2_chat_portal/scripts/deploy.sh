@@ -77,7 +77,9 @@ if [ -n "${OPENAI_BASE_URL:-}" ]; then
 else
   echo "ℹ️  模型端点: bedrock-mantle 默认端点（Bedrock API key 认证）"
 fi
-AURORA_STACK="agentcore-workshop-aurora"
+# 数仓栈名可用环境变量覆盖：hands_on 的 CloudLab 单栈（IDE+数仓合一）输出键
+# 与原 aurora 栈一致，export AURORA_STACK=<栈名> 即可直接复用
+AURORA_STACK="${AURORA_STACK:-agentcore-workshop-aurora}"
 PART2_STACK="agentcore-workshop-part2"
 KC_STACK="agentcore-workshop-keycloak"
 KC_ECR_REPO="agentcore-workshop/keycloak"
@@ -245,7 +247,54 @@ docker build -q --platform linux/arm64 -t "$ECR_URI:latest" "$KC_BUILD_DIR"
 docker push -q "$ECR_URI:latest"
 echo "    镜像已推送: $ECR_URI:latest"
 
-# 1c. 部署 Keycloak 栈（ECS Fargate + Cloud Map + API Gateway HTTP API + VPC Link）
+# 1c. Keycloak 基础设施，两种形态自动选择：
+#     【外部托管】数仓栈（AURORA_STACK，如 CloudLab base 单栈）已预建 Keycloak
+#     基础设施（输出 KeycloakUrl 存在）——服务初始 0 副本，本脚本只负责推镜像后
+#     拉起到 1 副本；KC_HOSTNAME 已由栈内直出，无需两阶段修正。
+#     【独立栈】维持原逻辑：部署 agentcore-workshop-keycloak 栈。
+KC_EXTERNAL="0"
+KC_BASE_URL=$(_aurora_output KeycloakUrl 2>/dev/null || true)
+if [ -n "$KC_BASE_URL" ] && [ "$KC_BASE_URL" != "None" ]; then
+  KC_EXTERNAL="1"
+  # 外部托管形态下 part2/part2-tasks 的角色、调度组、Tasks API 也已随 base 栈
+  # 预建（输出键一致）——两个子栈的 cloudformation deploy 全部跳过，
+  # 输出直接从 base 栈读
+  PART2_STACK="$AURORA_STACK"
+  TASKS_STACK="$AURORA_STACK"
+  KC_URL="$KC_BASE_URL"
+  ECS_CLUSTER=$(_aurora_output KeycloakClusterName)
+  ECS_SERVICE=$(_aurora_output KeycloakServiceName)
+  DISCOVERY_URL="$KC_URL/realms/$KC_REALM/.well-known/openid-configuration"
+  echo "    复用预建的 Keycloak 基础设施（外部托管模式）: $KC_URL"
+  # 管理员密码在 base 栈的 Secrets Manager 里，回写 secrets.env 保持后续口径一致
+  KC_ADMIN_SECRET_ARN=$(_aurora_output KeycloakAdminSecretArn 2>/dev/null || true)
+  if [ -n "$KC_ADMIN_SECRET_ARN" ] && [ "$KC_ADMIN_SECRET_ARN" != "None" ]; then
+    KC_ADMIN_PASSWORD=$(aws secretsmanager get-secret-value --secret-id "$KC_ADMIN_SECRET_ARN" \
+      --region "$REGION" --query SecretString --output text \
+      | python3 -c "import sys,json;print(json.load(sys.stdin)['password'])")
+    if grep -q '^KC_ADMIN_PASSWORD=' "$SECRETS_FILE"; then
+      sed -i.bak "s|^KC_ADMIN_PASSWORD=.*|KC_ADMIN_PASSWORD=$KC_ADMIN_PASSWORD|" "$SECRETS_FILE"
+      rm -f "$SECRETS_FILE.bak"
+    else
+      echo "KC_ADMIN_PASSWORD=$KC_ADMIN_PASSWORD" >> "$SECRETS_FILE"
+    fi
+  fi
+  # 镜像刚推送：拉起到 1 副本并强制换新任务（首次拉起与 KC_REDEPLOY 同一路径）
+  aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+    --desired-count 1 --force-new-deployment --region "$REGION" >/dev/null
+  aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$REGION"
+  echo "    Keycloak 地址: $KC_URL，等待启动完成..."
+  for i in $(seq 1 40); do
+    if ISSUER=$(curl -sf "$DISCOVERY_URL" | python3 -c "import sys,json;print(json.load(sys.stdin)['issuer'])" 2>/dev/null); then
+      break
+    fi
+    [ "$i" -eq 40 ] && { echo "❌ 等待 Keycloak 启动超时: $DISCOVERY_URL"; exit 1; }
+    sleep 15
+  done
+fi
+
+if [ "$KC_EXTERNAL" != "1" ]; then
+# 1c-独立栈. 部署 Keycloak 栈（ECS Fargate + Cloud Map + API Gateway HTTP API + VPC Link）
 #     App Runner 自 2026-04-30 起不接受新客户，改用 Fargate；HTTPS 入口由
 #     API Gateway 提供（免域名的 execute-api 端点，无需 ALB）
 aws cloudformation deploy \
@@ -306,9 +355,61 @@ if [[ "$ISSUER" != https://* ]]; then
     sleep 15
   done
 fi
+fi  # KC_EXTERNAL（独立栈分支结束）
 echo "    Keycloak 就绪，issuer: $ISSUER"
 
+# 外部托管模式：补建 Tasks API 的 JWT authorizer 与各方法路由（幂等）。
+# 这两类资源依赖 Keycloak 在线（authorizer 创建时 API Gateway 会实际校验
+# issuer 的 discovery 端点），无法随 base 栈预建，故在此处收敛。
+if [ "$KC_EXTERNAL" = "1" ]; then
+  TASKS_API_ID=$(_aurora_output TasksApiId)
+  TASKS_INTEG_ID=$(_aurora_output TasksIntegrationId)
+  if [ -n "$TASKS_API_ID" ] && [ "$TASKS_API_ID" != "None" ]; then
+    echo "    同步 Tasks API 的 JWT authorizer 与路由..."
+    AUTH_ID=$(aws apigatewayv2 get-authorizers --api-id "$TASKS_API_ID" --region "$REGION" \
+      --query "Items[?Name=='keycloak-jwt'].AuthorizerId" --output text)
+    if [ -z "$AUTH_ID" ] || [ "$AUTH_ID" = "None" ]; then
+      AUTH_ID=$(aws apigatewayv2 create-authorizer --api-id "$TASKS_API_ID" --region "$REGION" \
+        --name keycloak-jwt --authorizer-type JWT \
+        --identity-source '$request.header.Authorization' \
+        --jwt-configuration "Audience=analysis-runtime,Issuer=$ISSUER" \
+        --query AuthorizerId --output text)
+      echo "    已创建 authorizer: $AUTH_ID"
+    else
+      # Keycloak 重建后 issuer 可能变化，保持同步
+      aws apigatewayv2 update-authorizer --api-id "$TASKS_API_ID" --region "$REGION" \
+        --authorizer-id "$AUTH_ID" \
+        --jwt-configuration "Audience=analysis-runtime,Issuer=$ISSUER" >/dev/null
+      echo "    复用 authorizer: $AUTH_ID（已同步 issuer）"
+    fi
+    EXISTING_ROUTES=$(aws apigatewayv2 get-routes --api-id "$TASKS_API_ID" --region "$REGION" \
+      --query 'Items[].RouteKey' --output text)
+    while IFS= read -r rk; do
+      if ! printf '%s' "$EXISTING_ROUTES" | grep -qF "$rk"; then
+        aws apigatewayv2 create-route --api-id "$TASKS_API_ID" --region "$REGION" \
+          --route-key "$rk" --authorization-type JWT --authorizer-id "$AUTH_ID" \
+          --target "integrations/$TASKS_INTEG_ID" >/dev/null
+        echo "    已创建路由: $rk"
+      fi
+    done <<'ROUTES'
+GET /tasks
+POST /tasks
+GET /tasks/{proxy+}
+POST /tasks/{proxy+}
+DELETE /tasks/{proxy+}
+GET /runs/{proxy+}
+GET /chat/{proxy+}
+POST /chat/{proxy+}
+PATCH /chat/{proxy+}
+DELETE /chat/{proxy+}
+ROUTES
+  fi
+fi
+
 echo "==> [2/10] 部署分析链路基础设施（CloudFormation）..."
+if [ "$KC_EXTERNAL" = "1" ]; then
+  echo "    外部托管模式：角色已随 base 栈预建，跳过子栈部署"
+else
 aws cloudformation deploy \
   --template-file "$PART2_DIR/infra/part2-analytics.yaml" \
   --stack-name "$PART2_STACK" \
@@ -322,6 +423,7 @@ aws cloudformation deploy \
     "AnalyticsFunctionName=$LAMBDA_NAME" \
     "MemoryFunctionName=$MEMORY_LAMBDA_NAME" \
     "DbFunctionName=$DB_LAMBDA_NAME"
+fi
 
 _part2_output() {
   aws cloudformation describe-stacks --stack-name "$PART2_STACK" --region "$REGION" \
@@ -662,7 +764,8 @@ if [ -z "$PART1_RUNTIME_ARN" ]; then
 else
   # 生产入口（如 CloudFront）通常在首次部署后另行建立。重跑 Part 2 时若没有
   # 显式传 TASKS_ALLOWED_ORIGINS，沿用栈里的现值，不能退回本地默认值。
-  if [ -z "$TASKS_ALLOWED_ORIGINS" ]; then
+  #（外部托管模式下 CORS 由 base 栈的 CFN 管理，本段跳过）
+  if [ -z "$TASKS_ALLOWED_ORIGINS" ] && [ "$KC_EXTERNAL" != "1" ]; then
     TASKS_ALLOWED_ORIGINS=$(aws cloudformation describe-stacks \
       --stack-name "$TASKS_STACK" --region "$REGION" \
       --query "Stacks[0].Parameters[?ParameterKey=='AllowedOrigins'].ParameterValue | [0]" \
@@ -703,7 +806,11 @@ else
     aws cloudformation describe-stacks --stack-name "$TASKS_STACK" --region "$REGION" \
       --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
   }
-  _deploy_tasks_stack "$TASKS_API_ENABLED"
+  if [ "$KC_EXTERNAL" = "1" ]; then
+    echo "    外部托管模式：任务管理角色/调度组/HTTP API 已随 base 栈预建，跳过子栈部署"
+  else
+    _deploy_tasks_stack "$TASKS_API_ENABLED"
+  fi
 
   TASKS_API_ROLE_ARN=$(_tasks_output TasksApiRoleArn)
   RUNNER_ROLE_ARN=$(_tasks_output RunnerRoleArn)
@@ -757,7 +864,8 @@ else
     "Variables={$DB_ENV,RUNNER_FUNCTION_NAME=$RUNNER_NAME,RUNNER_FUNCTION_ARN=$RUNNER_ARN,SCHEDULE_GROUP=$SCHEDULE_GROUP,SCHEDULER_ROLE_ARN=$SCHEDULER_ROLE_ARN,MEMORY_LAMBDA_NAME=$MEMORY_LAMBDA_NAME,MEM0_COLLECTION=$MEM0_COLLECTION,MEM0_EMBEDDER_DIMS=$MEM0_EMBEDDER_DIMS}"
 
   # 首轮：函数就绪后补建 HTTP API（路由 + JWT authorizer + 调用许可）
-  if [ "$TASKS_API_ENABLED" != "true" ]; then
+  #（外部托管模式下 API 已随 base 栈预建，无鸡生蛋问题）
+  if [ "$TASKS_API_ENABLED" != "true" ] && [ "$KC_EXTERNAL" != "1" ]; then
     echo "    函数已就绪，补建 Tasks HTTP API ..."
     _deploy_tasks_stack "true"
   fi
@@ -781,4 +889,3 @@ fi
 echo ""
 echo "   启动前端: cd $PART2_DIR/web && npm install && npm run dev"
 echo "   然后浏览器打开 http://localhost:5173（用上面的测试账号登录）"
-echo "   命令行冒烟测试: $SCRIPT_DIR/chat_test.sh '看下最近30天的选品漏斗'"

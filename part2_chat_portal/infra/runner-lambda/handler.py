@@ -24,6 +24,7 @@
 
 import json
 import os
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -37,6 +38,11 @@ from botocore.config import Config
 REGION = os.environ.get("AWS_REGION", "us-west-2")
 DB_LAMBDA_NAME = os.environ.get("DB_LAMBDA_NAME", "")
 PART1_RUNTIME_ARN = os.environ.get("PART1_RUNTIME_ARN", "")
+# 场景 1 创建的自定义 browser 名字（02_run_scenario1.sh 固定用此名）。后台探测
+# 线程据此解析 browserId，再列其活跃会话、抢在 agent 事件流之前绑定 Live View
+BROWSER_NAME = os.environ.get("BROWSER_NAME", "product_hunting_browser")
+# 探测轮询间隔（秒）：前端 RunDetail 每 3s 轮询，这里对齐
+BROWSER_WATCH_INTERVAL = 3.0
 
 # 文本增量节流：攒够 FLUSH_CHARS 或者遇到换行且距上次 flush 超过 FLUSH_SECONDS
 # 才落一条 log 事件，避免 2~5 分钟的运行把事件表刷爆
@@ -257,6 +263,83 @@ def _bind_browser(run_id: str, browser_id: str, session_id: str) -> None:
     )
 
 
+def _resolve_custom_browser_id(ctrl) -> str | None:
+    """按名字解析场景 1 自定义 browser 的 browserId（分页遍历 CUSTOM 类型）。"""
+    token = None
+    while True:
+        kw = {"type": "CUSTOM", "maxResults": 50}
+        if token:
+            kw["nextToken"] = token
+        resp = ctrl.list_browsers(**kw)
+        for b in resp.get("browserSummaries", []):
+            if b.get("name") == BROWSER_NAME:
+                return b.get("browserId")
+        token = resp.get("nextToken")
+        if not token:
+            return None
+
+
+def _watch_browser_session(events: EventWriter, run_id: str, started: float,
+                           browser_bound: threading.Event, stop_event: threading.Event) -> None:
+    """后台探测线程：轮询自定义 browser 的活跃会话，抢在 agent 事件流之前绑定。
+
+    为什么要独立线程：Part 1 的事件流常被上游整体缓冲到运行末尾才集中到达
+    （实测首个工具事件与浏览器会话事件都挤在结束前 1~2 秒），若「浏览器已就绪」
+    只挂在流事件上，门户 Live View 的可见窗口会收缩到运行结束前一瞬，前端 3s
+    轮询根本抓不到（见 web/src/tasks/RunDetail.tsx 的 running && browserReady）。
+    本线程用 ListBrowserSessions 直接查活跃会话并提前 _bind_browser，与事件流解耦。
+
+    只认本次运行开始后创建的 READY 会话，避免绑到上一轮遗留的活跃会话。
+    任何异常都吞掉（探测是增强，绝不影响任务本身）。
+    """
+    try:
+        ctrl = boto3.client("bedrock-agentcore-control", region_name=REGION,
+                            config=Config(connect_timeout=5, read_timeout=15,
+                                          retries={"max_attempts": 2}))
+        data = boto3.client("bedrock-agentcore", region_name=REGION,
+                            config=Config(connect_timeout=5, read_timeout=15,
+                                          retries={"max_attempts": 2}))
+    except Exception as e:
+        print(f"[runner] 浏览器探测线程初始化失败（跳过）: {type(e).__name__}: {e}")
+        return
+
+    browser_id: str | None = None
+    while not stop_event.is_set() and not browser_bound.is_set():
+        if browser_id is None:
+            try:
+                browser_id = _resolve_custom_browser_id(ctrl)
+            except Exception as e:
+                print(f"[runner] ListBrowsers 失败: {type(e).__name__}: {e}")
+            if browser_id is None:
+                if stop_event.wait(BROWSER_WATCH_INTERVAL):
+                    return
+                continue
+        try:
+            resp = data.list_browser_sessions(
+                browserIdentifier=browser_id, status="READY", maxResults=50
+            )
+        except Exception as e:
+            print(f"[runner] ListBrowserSessions 失败: {type(e).__name__}: {e}")
+            if stop_event.wait(BROWSER_WATCH_INTERVAL):
+                return
+            continue
+        best = None  # (createdAt_epoch, session_id)
+        for it in resp.get("items", []):
+            created = it.get("createdAt")
+            ts = created.timestamp() if created else 0.0
+            # 60s 回窗容忍时钟偏差，同时排除分钟级之前的旧会话
+            if ts >= started - 60 and (best is None or ts > best[0]):
+                best = (ts, it.get("sessionId"))
+        if best and best[1]:
+            _bind_browser(run_id, browser_id, best[1])
+            events.emit("browser", "云端浏览器会话已就绪",
+                        {"browser_id": browser_id, "session_id": best[1]})
+            browser_bound.set()
+            return
+        if stop_event.wait(BROWSER_WATCH_INTERVAL):
+            return
+
+
 def _collect_stats(run_id: str, duration_s: int) -> dict:
     """按 run_id 统计本次运行写进数仓的结果。"""
     stats: dict = {"candidates": 0, "verdicts": {}, "duration_s": duration_s}
@@ -292,10 +375,12 @@ def _finish_run(run_id: str, status: str, stats: dict, error: str = "") -> None:
     )
 
 
-def _consume(events: EventWriter, run_id: str, lines, deadline: float | None = None) -> None:
+def _consume(events: EventWriter, run_id: str, lines, deadline: float | None = None,
+             browser_bound: threading.Event | None = None) -> None:
     """消费 SSE 流：结构化事件直接落表，文本增量节流聚合成 log 事件。
 
     deadline 是本次消费的最晚时间（Lambda 超时前留出的收尾余量）。
+    browser_bound：后台探测线程已绑定过浏览器会话时置位，这里就不重复绑定/发事件。
     """
     buffer = ""
     last_flush = time.time()
@@ -336,10 +421,14 @@ def _consume(events: EventWriter, run_id: str, lines, deadline: float | None = N
             events.emit("tool", chunk.get("name") or "工具调用", chunk)
         elif kind == "browser_session":
             flush(force=True)
-            browser_id = chunk.get("browser_id") or ""
-            session_id = chunk.get("session_id") or ""
-            _bind_browser(run_id, browser_id, session_id)
-            events.emit("browser", "云端浏览器会话已就绪", chunk)
+            # 后台探测线程可能已抢先绑定，避免重复绑定与重复事件
+            if browser_bound is None or not browser_bound.is_set():
+                browser_id = chunk.get("browser_id") or ""
+                session_id = chunk.get("session_id") or ""
+                _bind_browser(run_id, browser_id, session_id)
+                events.emit("browser", "云端浏览器会话已就绪", chunk)
+                if browser_bound is not None:
+                    browser_bound.set()
         elif chunk.get("error"):
             flush(force=True)
             events.emit("error", str(chunk.get("error"))[:4096], chunk)
@@ -387,6 +476,17 @@ def lambda_handler(event, context):
     if callable(remaining):
         deadline = started + max(30.0, remaining() / 1000 - 40)
 
+    # 后台探测线程：抢在（常被缓冲到末尾的）agent 事件流之前绑定浏览器会话，
+    # 让门户 Live View 在整段运行期间可见（见 _watch_browser_session 说明）
+    browser_bound = threading.Event()
+    stop_watch = threading.Event()
+    watcher = threading.Thread(
+        target=_watch_browser_session,
+        args=(events, run_id, started, browser_bound, stop_watch),
+        daemon=True,
+    )
+    watcher.start()
+
     try:
         lines = _invoke_runtime_stream(session_id, {
             "prompt": _build_runtime_prompt(
@@ -395,7 +495,7 @@ def lambda_handler(event, context):
             ),
             "run_id": run_id,
         })
-        _consume(events, run_id, lines, deadline)
+        _consume(events, run_id, lines, deadline, browser_bound)
     except Exception as e:
         message = f"{type(e).__name__}: {e}"
         print(f"[runner] run {run_id} 失败: {message}")
@@ -403,6 +503,8 @@ def lambda_handler(event, context):
         stats = _collect_stats(run_id, int(time.time() - started))
         _finish_run(run_id, "failed", stats, message)
         return {"ok": False, "run_id": run_id, "error": message}
+    finally:
+        stop_watch.set()
 
     stats = _collect_stats(run_id, int(time.time() - started))
     _finish_run(run_id, "succeeded", stats)

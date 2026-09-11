@@ -20,11 +20,31 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const region = env.VITE_AWS_REGION || "us-west-2";
   const runtimeArn = env.VITE_RUNTIME_ARN || "";
+  // 公网门户地址（03 部署脚本按栈输出写入 .env.local）：dev server 起来后直接
+  // 打印，参与者不用回头翻部署日志找 URL
+  const publicPortalUrl = env.VITE_PUBLIC_PORTAL_URL || "";
   // 域名后缀按分区推导（中国区 .amazonaws.com.cn），区域来自 .env.local 单点配置
   const urlSuffix = region.startsWith("cn-") ? "amazonaws.com.cn" : "amazonaws.com";
   return {
     plugins: [
       react(),
+      ...(publicPortalUrl
+        ? [
+            {
+              name: "print-public-portal-url",
+              configureServer(server: import("vite").ViteDevServer) {
+                server.httpServer?.once("listening", () => {
+                  // 稍等一拍，排在 Vite 自己的 Local/Network 行之后打印
+                  setTimeout(() => {
+                    server.config.logger.info(
+                      `\n  ➜  公网门户地址: ${publicPortalUrl}\n     （浏览器直接打开即可登录；token 明文传输，仅限 workshop 演示）\n`,
+                    );
+                  }, 100);
+                });
+              },
+            },
+          ]
+        : []),
       // DCV 运行时按 baseUrl="/nice-dcv-web-client-sdk/dcvjs-esm" 去 fetch 解码器
       // worker（dcv/*-worker.js），worker 又 importScripts 同级的 lib/*。这些不经
       // 打包，得原样摆到站点根下的对应路径。stripBase 把源目录前缀剥掉，只保留
@@ -48,7 +68,15 @@ export default defineConfig(({ mode }) => {
       dedupe: ["react", "react-dom"],
     },
     server: {
+      // LiveView 懒加载链上挂着 alias 进来的 dcv.js（几 MB 单文件，不走依赖
+      // 预构建）。不预热的话，用户点开实况那一刻 dev server 才现场转换它，
+      // 慢链路下 Suspense 会卡在「加载实况组件…」几十秒起步。启动即预热。
+      warmup: { clientFiles: ["./src/tasks/LiveView.tsx"] },
       host: true, // 监听所有网卡，支持从转发端口 / 机器 IP 访问
+      // 放行任意 Host 头：公网门户经 ALB HTTPS(8443) 访问时 Host 是 ALB 域名，
+      // Vite 6 默认只认 localhost（Host 头校验，防 DNS rebinding）。dev server
+      // 本身不含敏感态，PKCE 登录仍由 Keycloak 保护，放行是安全的
+      allowedHosts: true,
       port: 5173,
       proxy: {
         "/api/invoke": {

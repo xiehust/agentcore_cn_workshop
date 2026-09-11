@@ -67,7 +67,7 @@
       "redirectUris": ["http://localhost:5173/*", "*"],
       "webOrigins": ["*"],
       "attributes": {
-        "pkce.code.challenge.method": "S256",
+        "_comment_pkce": "不强制 PKCE：安全上下文（HTTPS/localhost）下前端仍主动用 S256；公网 HTTP 门户（中国区免备案形态）没有 crypto.subtle，退回普通授权码流程",
         "post.logout.redirect.uris": "+"
       },
       "protocolMappers": [

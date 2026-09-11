@@ -1,6 +1,15 @@
 // 单次运行的详情：状态头 / 浏览器实况 / 进度时间线 / 关键日志 / 统计卡 / 明细表。
 // 运行中每 3 秒轮询 run 与 events（events 用 after_seq 游标增量追加），终态停轮询。
-import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
+import {
+  Component,
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   ArrowLeftIcon,
   CaretLeftIcon,
@@ -31,6 +40,32 @@ import { RunBadge } from "./StatusBadge";
 
 // DCV Web SDK 有 2MB+，懒加载别拖累首屏
 const LiveView = lazy(() => import("./LiveView"));
+
+// lazy chunk 加载失败（DCV SDK 拉不下来/被网络拦）时 Suspense 只会一直卡在
+// fallback 的「加载实况组件…」上，必须用 error boundary 接住并给出出路
+class LiveViewBoundary extends Component<
+  { children: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  render() {
+    if (this.state.failed) {
+      return (
+        <div className="live-hint">
+          <WarningCircleIcon size={16} />
+          实况组件加载失败（DCV 播放器资源未能拉取，常见于网络受限环境）。
+          <button className="ghost-btn tiny" onClick={() => this.setState({ failed: false })}>
+            重试
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 const PAGE_SIZE = 20;
 
@@ -154,15 +189,17 @@ export default function RunDetail({ runId, onBack }: { runId: string; onBack: ()
               <TerminalWindowIcon size={15} />
               云端浏览器实况
             </div>
-            <Suspense
-              fallback={
-                <div className="thinking">
-                  加载实况组件<span className="dots" />
-                </div>
-              }
-            >
-              <LiveView runId={runId} />
-            </Suspense>
+            <LiveViewBoundary>
+              <Suspense
+                fallback={
+                  <div className="thinking">
+                    加载实况组件<span className="dots" />
+                  </div>
+                }
+              >
+                <LiveView runId={runId} />
+              </Suspense>
+            </LiveViewBoundary>
           </section>
         )}
 
