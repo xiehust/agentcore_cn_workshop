@@ -2294,8 +2294,13 @@ Resources:
                       s3c.delete_bucket(Bucket=bkt); print('deleted bucket:', bkt)
                   except Exception as e: print('skip:', e)
                   iam = boto3.client('iam')
+                  # IAM 全局：SDK 角色名带区域段，必须按本栈区域过滤，否则会误删
+                  # 同账号其他区域 workshop 的 Runtime/CodeBuild 执行角色（实测）。
+                  # browser 执行角色是全局共享（信任策略区域通配），可能被其他
+                  # 区域引用，钩子不删；账号彻底清零时手动删除即可
+                  rgn = boto3.session.Session().region_name
                   names = [x['RoleName'] for x in (w(lambda: iam.list_roles(MaxItems=1000)['Roles']) or [])
-                           if x['RoleName'].startswith('AmazonBedrockAgentCoreSDK') or x['RoleName'] == 'agentcore-workshop-browser-role']
+                           if x['RoleName'].startswith('AmazonBedrockAgentCoreSDK') and rgn in x['RoleName']]
                   for r in names:
                       for p in (w(lambda: iam.list_attached_role_policies(RoleName=r)['AttachedPolicies']) or []):
                           w(lambda: iam.detach_role_policy(RoleName=r, PolicyArn=p['PolicyArn']))
