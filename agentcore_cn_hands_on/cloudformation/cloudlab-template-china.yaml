@@ -1386,7 +1386,9 @@ Resources:
   WriterLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: agentcore-workshop-writer-lambda-role
+      # IAM 名全局唯一：所有硬编码角色/策略名统一加区域后缀，避免同账号
+      # 第二个区域建栈时撞 AlreadyExists（CFN 早期验证直接拦截，实测）
+      RoleName: !Sub 'agentcore-workshop-writer-lambda-role-${AWS::Region}'
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -1611,7 +1613,7 @@ Resources:
   AgentWriterInvokePolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
-      ManagedPolicyName: agentcore-workshop-agent-writer-invoke
+      ManagedPolicyName: !Sub 'agentcore-workshop-agent-writer-invoke-${AWS::Region}'
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -1863,7 +1865,7 @@ Resources:
   AnalyticsLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: agentcore-workshop-analytics-lambda-role
+      RoleName: !Sub 'agentcore-workshop-analytics-lambda-role-${AWS::Region}'
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -1884,7 +1886,7 @@ Resources:
   MemoryLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: agentcore-workshop-memory-lambda-role
+      RoleName: !Sub 'agentcore-workshop-memory-lambda-role-${AWS::Region}'
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -1905,7 +1907,7 @@ Resources:
   DbLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: agentcore-workshop-db-lambda-role
+      RoleName: !Sub 'agentcore-workshop-db-lambda-role-${AWS::Region}'
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -1926,7 +1928,7 @@ Resources:
   GatewayRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: agentcore-workshop-gateway-role
+      RoleName: !Sub 'agentcore-workshop-gateway-role-${AWS::Region}'
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -1996,7 +1998,7 @@ Resources:
   SchedulerInvokeRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: agentcore-workshop-ingestion-scheduler-role
+      RoleName: !Sub 'agentcore-workshop-ingestion-scheduler-role-${AWS::Region}'
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -2017,7 +2019,7 @@ Resources:
   TasksApiRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: agentcore-workshop-tasks-api-role
+      RoleName: !Sub 'agentcore-workshop-tasks-api-role-${AWS::Region}'
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -2068,7 +2070,7 @@ Resources:
   RunnerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: agentcore-workshop-ingestion-runner-role
+      RoleName: !Sub 'agentcore-workshop-ingestion-runner-role-${AWS::Region}'
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

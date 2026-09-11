@@ -235,23 +235,30 @@ echo "    建表完成（selection_verdicts / product_candidates + Part 2 的五
 echo "==> [4/6] 创建自定义 Browser（Web Bot Auth）与 Browser Profile..."
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
-# 4a. 自定义 browser 的执行角色：Web Bot Auth 只要求信任策略，无需附加权限策略
+# 4a. 自定义 browser 的执行角色：Web Bot Auth 只要求信任策略，无需附加权限策略。
+# IAM 角色名全局唯一，SourceArn 必须区域通配（锁账号即可）——锁区域会让同账号
+# 第二个区域复用该角色时 CreateBrowser 校验失败；角色已存在时同样收敛信任
+# 策略，自愈旧版脚本创建的锁区域角色
+BROWSER_TRUST_POLICY="{
+  \"Version\": \"2012-10-17\",
+  \"Statement\": [{
+    \"Sid\": \"BedrockAgentCoreBuiltInTools\",
+    \"Effect\": \"Allow\",
+    \"Principal\": {\"Service\": \"bedrock-agentcore.amazonaws.com\"},
+    \"Action\": \"sts:AssumeRole\",
+    \"Condition\": {
+      \"StringEquals\": {\"aws:SourceAccount\": \"$ACCOUNT_ID\"},
+      \"ArnLike\": {\"aws:SourceArn\": \"arn:$PARTITION:bedrock-agentcore:*:$ACCOUNT_ID:*\"}
+    }
+  }]
+}"
 if ! aws iam get-role --role-name "$BROWSER_ROLE_NAME" >/dev/null 2>&1; then
   aws iam create-role --role-name "$BROWSER_ROLE_NAME" \
-    --assume-role-policy-document "{
-      \"Version\": \"2012-10-17\",
-      \"Statement\": [{
-        \"Sid\": \"BedrockAgentCoreBuiltInTools\",
-        \"Effect\": \"Allow\",
-        \"Principal\": {\"Service\": \"bedrock-agentcore.amazonaws.com\"},
-        \"Action\": \"sts:AssumeRole\",
-        \"Condition\": {
-          \"StringEquals\": {\"aws:SourceAccount\": \"$ACCOUNT_ID\"},
-          \"ArnLike\": {\"aws:SourceArn\": \"arn:$PARTITION:bedrock-agentcore:$REGION:$ACCOUNT_ID:*\"}
-        }
-      }]
-    }" >/dev/null
+    --assume-role-policy-document "$BROWSER_TRUST_POLICY" >/dev/null
   echo "    已创建 browser 执行角色: $BROWSER_ROLE_NAME"
+else
+  aws iam update-assume-role-policy --role-name "$BROWSER_ROLE_NAME" \
+    --policy-document "$BROWSER_TRUST_POLICY"
 fi
 BROWSER_ROLE_ARN=$(aws iam get-role --role-name "$BROWSER_ROLE_NAME" --query Role.Arn --output text)
 
