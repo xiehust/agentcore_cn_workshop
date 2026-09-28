@@ -660,8 +660,11 @@ RUNTIME_AUTH_CONFIG="{\"customJWTAuthorizer\": {\"discoveryUrl\": \"$DISCOVERY_U
 cd "$PART2_DIR/agent"
 # --disable-memory 禁用的是 AgentCore 托管 Memory；本 workshop 的长期记忆是
 # 自建 mem0（memory_backend.py + 记忆向量 Lambda），两者无关
+# 显式 direct_code_deploy：toolkit 0.3.13 起默认 container+CodeBuild，
+# 而 aws-cn 分区无 CodeBuild ARM_CONTAINER；直接代码部署也免本机 Docker
 agentcore configure --entrypoint main.py --name "$AGENT_NAME" --region "$REGION" \
   --requirements-file requirements.txt --non-interactive --disable-memory \
+  --deployment-type direct_code_deploy \
   --authorizer-config "$RUNTIME_AUTH_CONFIG"
 agentcore launch \
   --env GATEWAY_URL="$GATEWAY_URL" \

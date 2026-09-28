@@ -101,8 +101,11 @@ fi
 echo "==> [b] 部署数据摄入 Agent 到 AgentCore Runtime..."
 cd "$PART1_DIR/agent"
 # --disable-memory：本场景 Agent 无状态，历史数据都在 Aurora
+# 显式 direct_code_deploy：toolkit 0.3.13 起默认 container+CodeBuild，
+# 而 aws-cn 分区无 CodeBuild ARM_CONTAINER；直接代码部署也免本机 Docker
 agentcore configure --entrypoint main.py --name "$AGENT_NAME" --region "$REGION" \
-  --requirements-file requirements.txt --non-interactive --disable-memory
+  --requirements-file requirements.txt --non-interactive --disable-memory \
+  --deployment-type direct_code_deploy
 agentcore launch \
   --env WRITER_LAMBDA_NAME="$WRITER_NAME" \
   ${OPENAI_API_KEY:+--env OPENAI_API_KEY="$OPENAI_API_KEY"} \

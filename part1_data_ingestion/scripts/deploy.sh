@@ -309,9 +309,12 @@ cd "$PART1_DIR/agent"
 # configure：生成 .bedrock_agentcore.yaml（自动创建执行角色 / ECR 仓库）
 # --disable-memory：不自动创建 AgentCore Memory（本 demo 不用自带记忆，
 # Agent 每次调用无状态，历史数据都在 Aurora）
+# 显式 direct_code_deploy：toolkit 0.3.13 起默认 container+CodeBuild，
+# 而 aws-cn 分区无 CodeBuild ARM_CONTAINER；直接代码部署也免本机 Docker
 agentcore configure --entrypoint main.py --name "$AGENT_NAME" --region "$REGION" \
-  --requirements-file requirements.txt --non-interactive --disable-memory
-# launch：默认 direct_code_deploy 模式，直接把代码部署到 Runtime（本机无需 Docker）
+  --requirements-file requirements.txt --non-interactive --disable-memory \
+  --deployment-type direct_code_deploy
+# launch：direct_code_deploy 模式直接把代码部署到 Runtime（本机无需 Docker）
 #（MODEL_ID / OPENAI_BASE_URL 不设则用 main.py 内置默认值）
 agentcore launch \
   --env WRITER_LAMBDA_NAME="$WRITER_NAME" \
