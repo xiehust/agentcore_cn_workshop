@@ -25,6 +25,15 @@ export default defineConfig(({ mode }) => {
   const publicPortalUrl = env.VITE_PUBLIC_PORTAL_URL || "";
   // 域名后缀按分区推导（中国区 .amazonaws.com.cn），区域来自 .env.local 单点配置
   const urlSuffix = region.startsWith("cn-") ? "amazonaws.com.cn" : "amazonaws.com";
+  // dev 与 preview（构建产物本地预览）共用同一份 Runtime 数据面代理
+  const runtimeProxy = {
+    "/api/invoke": {
+      target: `https://bedrock-agentcore.${region}.${urlSuffix}`,
+      changeOrigin: true,
+      rewrite: () =>
+        `/runtimes/${encodeURIComponent(runtimeArn)}/invocations?qualifier=DEFAULT`,
+    },
+  };
   return {
     plugins: [
       react(),
@@ -78,14 +87,14 @@ export default defineConfig(({ mode }) => {
       // 本身不含敏感态，PKCE 登录仍由 Keycloak 保护，放行是安全的
       allowedHosts: true,
       port: 5173,
-      proxy: {
-        "/api/invoke": {
-          target: `https://bedrock-agentcore.${region}.${urlSuffix}`,
-          changeOrigin: true,
-          rewrite: () =>
-            `/runtimes/${encodeURIComponent(runtimeArn)}/invocations?qualifier=DEFAULT`,
-        },
-      },
+      proxy: runtimeProxy,
+    },
+    // vite preview（构建产物）与 dev server 行为对齐：同端口、同代理、放行 Host
+    preview: {
+      host: true,
+      allowedHosts: true,
+      port: 5173,
+      proxy: runtimeProxy,
     },
   };
 });
