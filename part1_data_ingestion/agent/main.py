@@ -53,6 +53,32 @@ SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 app = BedrockAgentCoreApp()
 
 
+def _sanitize_tool_schema(tool):
+    """剔除工具 schema 里的非标准 JSON Schema 键。
+
+    strands_tools 的 Code Interpreter schema 带 OpenAPI 专有的
+    `"format": "binary"`（FileContent.blob），严格校验的模型端点
+    （实测 Bedrock kimi-k3）会 400 拒绝整个请求，strands 将其吞成
+    空事件流——表象是 Agent 静默零输出。统一剥掉 format 键（JSON
+    Schema 中本为可选注解，对函数调用无语义损失）。
+    """
+    def strip(o):
+        if isinstance(o, dict):
+            return {k: strip(v) for k, v in o.items() if k != "format"}
+        if isinstance(o, list):
+            return [strip(x) for x in o]
+        return o
+
+    try:
+        spec = tool.tool_spec
+        js = spec.get("inputSchema", {}).get("json")
+        if js:
+            spec["inputSchema"]["json"] = strip(js)
+    except Exception:
+        pass
+    return tool
+
+
 def create_browser() -> ExtendedAgentCoreBrowser:
     """创建浏览器工具封装（底层是 AgentCore 托管的 Chromium + CDP，会话隔离）。
 
@@ -117,8 +143,8 @@ def create_agent(browser: ExtendedAgentCoreBrowser | None = None) -> Agent:
         conversation_manager=SummarizingConversationManager(summary_ratio=0.5),
         plugins=[skills_plugin],
         tools=[
-            browser.browser,                      # 浏览器工具
-            code_interpreter.code_interpreter,    # 沙箱代码执行工具
+            _sanitize_tool_schema(browser.browser),                    # 浏览器工具
+            _sanitize_tool_schema(code_interpreter.code_interpreter),  # 沙箱代码执行工具
             save_verdict,                         # 判定入库
             save_candidate,                       # 候选档案入库
         ],
