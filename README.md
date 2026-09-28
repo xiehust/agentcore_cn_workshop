@@ -63,9 +63,11 @@ Part 1 的核心思路是 **"Agent 框架不变，业务逻辑用 Skill 插拔"*
 
 ## 中国区移植说明
 
-AgentCore 在中国区（`cn-north-1` / `cn-northwest-1`）尚未上线。本 workshop
-先在海外区（`us-west-2`）用等效架构验证，**代码层面的移植改动已全部完成**：
-两个分区共用同一套代码，区域代码（`AWS_REGION`）是唯一开关。
+AgentCore 已在宁夏区（`cn-northwest-1`）上线（Runtime / Browser / Gateway /
+Identity / Code Interpreter 可用；**托管 Memory 暂未上线**——本仓库用自建
+mem0，不受影响）。本 workshop 先在海外区（`us-west-2`）用等效架构验证，
+再于宁夏区实测部署，两个分区共用同一套代码，区域代码（`AWS_REGION`）是
+唯一开关。
 
 **已完成、两分区通用的形态**：
 
@@ -82,10 +84,11 @@ AgentCore 在中国区（`cn-north-1` / `cn-northwest-1`）尚未上线。本 wo
   必须 `reasoning_effort=none`（端点硬约束），Agent 对默认 mantle 端点自动
   处理；自定义端点缺省不发该参数，可用 `MODEL_REASONING_EFFORT` 显式指定。
 - **分区/域名全模板化**：CloudFormation 统一 `${AWS::Partition}` /
-  `${AWS::URLSuffix}`（含 AWS 托管策略 ARN 与 VPC 端点服务名的
-  `cn.com.amazonaws` 前缀 Condition）；部署脚本按区域推导
-  `PARTITION` / `AWS_DOMAIN`，并在 cn-* 分支自动 export
-  `BEDROCK_AGENTCORE_CP_ENDPOINT` / `DP_ENDPOINT` 覆盖 SDK 内置端点。
+  `${AWS::URLSuffix}`；部署脚本按区域推导 `PARTITION` / `AWS_DOMAIN`，
+  并在 cn-* 分支自动 export `BEDROCK_AGENTCORE_CP_ENDPOINT` / `DP_ENDPOINT`
+  覆盖 SDK 内置端点。注意 cn 分区接口端点服务名**按服务不一致**
+  （execute-api/lambda 带 `cn.` 前缀，secretsmanager 实测两个 cn 区均为
+  `com.amazonaws` 前缀），已按实测写死。
 - **Gateway 零 VPC egress**：私网访问全部由 VPC 内 Lambda 承担，不依赖
   Gateway 的 VPC 出口能力。
 - **认证自部署 Keycloak**（中国区没有 Cognito）：OIDC 全链路不依赖海外托管服务。
@@ -93,13 +96,14 @@ AgentCore 在中国区（`cn-north-1` / `cn-northwest-1`）尚未上线。本 wo
   提取 LLM 与 embedding 走 OpenAI 兼容端点（`MEM0_*` 环境变量），中国区换
   端点即可。换 embedding 模型若维度变化，需换 `MEM0_COLLECTION` 重建向量表。
 
-**AgentCore 中国区上线后仍需处理的事项**：
+**中国区（宁夏）实测状态**：
 
-| 事项 | 说明 |
+| 事项 | 状态 |
 |--------|------|
-| Keycloak 基础镜像转存 | 镜像来自 `quay.io`，中国区构建前先转存到区内 ECR（`docker pull` → 区内 ECR push，deploy.sh 构建段配合改 build-arg） |
-| 出网可达性实测 | Browser 出网爬 eBay 等境外站点在中国区的链路质量与反爬挑战需实测；Web Bot Auth（预览特性）若中国区首发不含需降级 |
-| 上线验证清单 | Aurora PG 引擎小版本目录、starter-toolkit 对 aws-cn 的支持、Browser Live View（DCV 直播）是否随首发、`bedrock-agentcore.amazonaws.com` 服务 principal 写法——均以中国区实际发布为准逐项验证 |
+| Keycloak 基础镜像 | 已解决：CloudLab bootstrap 从区内资产 CDN 预载镜像 tar 并 `docker load`，场景 2 构建走本地缓存不访问 quay.io（预载失败自动回退直拉） |
+| 建栈资产区内化 | 已解决：代码包/Lambda zip/code-server rpm/AWS CLI/Keycloak 镜像统一走区内 CDN（`publish-assets.sh` cn 通道 + `deploy-ide.sh` 内置默认地址），并配 pip（TUNA）/npm（npmmirror）镜像源 |
+| 接口端点服务名 | 已实测修正：secretsmanager 在两个 cn 区均为 `com.amazonaws` 前缀（无 `cn.`） |
+| 出网可达性 | Browser 出网爬 eBay 等境外站点的链路质量以现场实测为准（跨境访问有波动，单商品 2~5 分钟属正常） |
 
 ## 目录结构
 

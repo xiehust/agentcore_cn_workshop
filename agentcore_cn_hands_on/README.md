@@ -36,15 +36,21 @@ agentcore_cn_hands_on/
 ## 快速开始
 
 ```bash
-# 操作员机器（全球区测试）
+# 操作员机器（全球区）
 cd ide && AWS_REGION=us-west-2 bash deploy-ide.sh
+# 操作员机器（中国区宁夏，资产区内 CDN 默认值已内置）
+cd ide && AWS_REGION=cn-northwest-1 bash deploy-ide.sh
 
 # 之后全部在 IDE Terminal 内：
 bash ~/environment/agentcore_cn_workshop/scripts/01_deploy_base.sh
-export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>   # 或中国区三元组
+export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>   # 全球区
+# 中国区改 OpenAI 兼容三元组：
+# export OPENAI_BASE_URL=<模型网关>/v1 OPENAI_API_KEY=<key> MODEL_ID=<模型名>
 bash ~/environment/agentcore_cn_workshop/scripts/02_run_scenario1.sh
 bash ~/environment/agentcore_cn_workshop/scripts/03_run_scenario2.sh
 ```
+
+学员视角的完整实验手册（中国区 · 宁夏）见 [中国区实验手册.md](中国区实验手册.md)。
 
 ## 来源说明
 

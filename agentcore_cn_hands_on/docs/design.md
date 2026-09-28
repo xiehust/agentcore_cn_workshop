@@ -129,3 +129,35 @@ CloudFront 必须绑定已备案域名，故不采用 CloudFront 方案。
    验证权限收敛正确，出现 AccessDenied 按最小增量补。
 3. 模型 key（`AWS_BEARER_TOKEN_BEDROCK`）为长期凭证，自动化会话不代为生成，
    到达该门槛时向用户请求提供；02/03 的部署段与 key 无关部分先行验证。
+
+### 中国区（宁夏 cn-northwest-1）资产分发与实测决策（2026-09）
+
+- **资产区内化**：中国区建栈从全球区 CloudFront 拉资产跨境慢且不稳，叠加
+  bootstrap waiter（约 13 分钟）极易超时回滚。改为区内 S3 + 中国区 CloudFront
+  分发（备案别名域，**中国区 CloudFront 默认域名 `*.cloudfront.cn` 被政策
+  禁止直接服务**，403）。HTTPS 证书过期时走 HTTP（资产为公开 workshop 代码，
+  可接受）。`publish-assets.sh` 增加 cn 通道；`deploy-ide.sh` 内置 cn 默认
+  `ASSET_BASE_URL` 并透传模板。
+- **大文件工具资产**（awscli zip / code-server rpm / Keycloak arm64 镜像 tar，
+  共约 420MB）不随每次发布：维护者在 jumphost 下载（github/quay 出口快），
+  用本地生成的 S3 presigned PUT URL 直传宁夏桶（us-west-2 → 宁夏实测
+  10~25MB/s）。
+- **Keycloak 基础镜像**：bootstrap cn 分支预载镜像 tar（`docker load`），
+  场景 2 `docker build` 命中本地 tag 后不再访问 quay.io；预载失败仅告警，
+  回退直拉。
+- **包管理镜像源**：bootstrap cn 分支写 `/etc/pip.conf`（TUNA）与
+  `~ec2-user/.npmrc`（npmmirror），覆盖建栈与场景脚本的全部 pip/npm 安装。
+- **实测修正的分区差异**：
+  - 接口端点服务名**按服务不一致**：secretsmanager 在 cn-north-1 /
+    cn-northwest-1 均为 `com.amazonaws.<region>.secretsmanager`（无 `cn.`
+    前缀），而 execute-api / lambda 带 `cn.` 前缀——原「中国区统一加前缀」
+    假设导致建栈 400，已按服务写死。
+  - IAM principal：`lambda.${AWS::URLSuffix}` 在 cn 展开为 `.com.cn` 不被
+    接受，统一硬编码 `lambda.amazonaws.com`（EC2 仍走 URLSuffix，cn 确为
+    `ec2.amazonaws.com.cn`）；`iam:PassedToService` 双写两种形态兜底。
+  - 测试账号开启账户级 IMDSv2 强制（httpTokensEnforced），IDE 实例经最小
+    LaunchTemplate 注入 `HttpTokens=required`（两分区通用的安全默认）。
+  - 宁夏区实测可用：Aurora PG 17.10 + db.serverless + 托管主密码、NLB 挂
+    安全组、EventBridge Scheduler、AgentCore Runtime/Browser/Gateway/
+    Identity/Code Interpreter（托管 Memory 未上线，本项目用自建 mem0
+    不受影响；原生 Bedrock 端点不存在，模型必须走 OpenAI 兼容网关）。
