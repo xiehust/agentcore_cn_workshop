@@ -1087,10 +1087,24 @@ Resources:
   # G. IDE EC2 instance + ALB
   # ===========================================================================
 
+  # 强制 IMDSv2（AWS::EC2::Instance 不直接支持 MetadataOptions，经 LaunchTemplate
+  # 注入）。部分账号（实测本 cn 账号）开了账户级 httpTokensEnforced，IMDSv1
+  # 启动请求直接 400；IMDSv2 对 AL2023/SSM/CLI v2 全兼容，两分区通用
+  IdeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+
   IdeInstance:
     Type: AWS::EC2::Instance
     DependsOn: PublicRoute
     Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref IdeLaunchTemplate
+        Version: !GetAtt IdeLaunchTemplate.LatestVersionNumber
       ImageId: !Ref IdeAmiParameterStoreName
       InstanceType: !Ref IdeInstanceType
       BlockDeviceMappings:
