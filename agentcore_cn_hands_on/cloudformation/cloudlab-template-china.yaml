@@ -1387,7 +1387,9 @@ Resources:
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref WorkshopVpc
-      ServiceName: !If [IsChinaPartition, !Sub "cn.com.amazonaws.${AWS::Region}.secretsmanager", !Sub "com.amazonaws.${AWS::Region}.secretsmanager"]
+      # 接口端点服务名在 cn 分区按服务不一致（execute-api/lambda 带 cn. 前缀），
+      # secretsmanager 在 cn-north-1 / cn-northwest-1 实测均为 com.amazonaws 前缀
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
       VpcEndpointType: Interface
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
       SecurityGroupIds: [!Ref SecretsEndpointSecurityGroup]

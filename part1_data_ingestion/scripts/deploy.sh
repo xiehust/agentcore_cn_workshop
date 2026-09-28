@@ -22,14 +22,17 @@ set -euo pipefail
 REGION="${AWS_REGION:-us-west-2}"
 # ---- 分区/域名推导：区域代码是唯一开关（us-west-2 / cn-northwest-1 ...） ----
 case "$REGION" in
-  cn-*) PARTITION="aws-cn"; AWS_DOMAIN="amazonaws.com.cn"; VPCE_PREFIX="cn.com.amazonaws"
+  cn-*) PARTITION="aws-cn"; AWS_DOMAIN="amazonaws.com.cn"
         # SDK/starter-toolkit 库内硬编码 .amazonaws.com 端点，中国区用官方
         # 环境变量覆盖（agentcore CLI 与 Runtime 内 SDK 都认这两个变量）
         export BEDROCK_AGENTCORE_CP_ENDPOINT="https://bedrock-agentcore-control.$REGION.$AWS_DOMAIN"
         export BEDROCK_AGENTCORE_DP_ENDPOINT="https://bedrock-agentcore.$REGION.$AWS_DOMAIN"
         ;;
-  *)    PARTITION="aws"; AWS_DOMAIN="amazonaws.com"; VPCE_PREFIX="com.amazonaws" ;;
+  *)    PARTITION="aws"; AWS_DOMAIN="amazonaws.com" ;;
 esac
+# 接口端点服务名前缀：cn 分区按服务不一致（execute-api/lambda 带 cn. 前缀），
+# 本脚本只用它探测 secretsmanager——该服务两个 cn 区实测均为 com.amazonaws 前缀
+VPCE_PREFIX="com.amazonaws"
 
 # ---- 模型三元组校验（fail-fast，不再静默丢弃） ----
 # 显式配了 OPENAI_BASE_URL：视为自定义端点，信任成对的 key（任意前缀——中国区

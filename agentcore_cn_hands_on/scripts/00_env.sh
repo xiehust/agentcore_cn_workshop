@@ -7,13 +7,16 @@
 REGION="${AWS_REGION:-us-west-2}"
 export AWS_REGION="$REGION"
 case "$REGION" in
-  cn-*) PARTITION="aws-cn"; AWS_DOMAIN="amazonaws.com.cn"; VPCE_PREFIX="cn.com.amazonaws"
+  cn-*) PARTITION="aws-cn"; AWS_DOMAIN="amazonaws.com.cn"
         # SDK/starter-toolkit 库内硬编码 .amazonaws.com 端点，中国区用官方环境变量覆盖
         export BEDROCK_AGENTCORE_CP_ENDPOINT="https://bedrock-agentcore-control.$REGION.$AWS_DOMAIN"
         export BEDROCK_AGENTCORE_DP_ENDPOINT="https://bedrock-agentcore.$REGION.$AWS_DOMAIN"
         ;;
-  *)    PARTITION="aws"; AWS_DOMAIN="amazonaws.com"; VPCE_PREFIX="com.amazonaws" ;;
+  *)    PARTITION="aws"; AWS_DOMAIN="amazonaws.com" ;;
 esac
+# 接口端点服务名前缀：cn 分区按服务不一致（execute-api/lambda 带 cn. 前缀），
+# 本仓库只用它探测 secretsmanager——该服务两个 cn 区实测均为 com.amazonaws 前缀
+VPCE_PREFIX="com.amazonaws"
 export PARTITION AWS_DOMAIN VPCE_PREFIX
 
 # ---- 目录定位 ----

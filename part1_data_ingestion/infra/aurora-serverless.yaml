@@ -26,10 +26,6 @@ Parameters:
     Default: agentcore-workshop-writer
     Description: 写库 Lambda 的函数名（函数本体由 deploy.sh 打包创建，本栈只建角色与授权）
 
-Conditions:
-  # 中国区（aws-cn）的接口端点 ServiceName 带 cn. 前缀
-  IsChinaPartition: !Equals [!Ref "AWS::Partition", aws-cn]
-
 Resources:
   # ---- 网络：私有 VPC（无 IGW/NAT；两个部分的 Lambda 直接挂进来） ----
   WorkshopVpc:
@@ -107,7 +103,9 @@ Resources:
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref WorkshopVpc
-      ServiceName: !If [IsChinaPartition, !Sub "cn.com.amazonaws.${AWS::Region}.secretsmanager", !Sub "com.amazonaws.${AWS::Region}.secretsmanager"]
+      # 接口端点服务名在 cn 分区按服务不一致（execute-api/lambda 带 cn. 前缀），
+      # secretsmanager 在 cn-north-1 / cn-northwest-1 实测均为 com.amazonaws 前缀
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
       VpcEndpointType: Interface
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
       SecurityGroupIds: [!Ref SecretsEndpointSecurityGroup]
