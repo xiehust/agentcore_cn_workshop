@@ -58,9 +58,15 @@ WORKSHOP_DIR="$ROOT_DIR/agentcore_cn_workshop"
 TEMPLATE="$HANDS_ON_DIR/cloudformation/cloudlab-template-china.yaml"
 
 if [ ! -d "$WORKSHOP_DIR" ]; then
-  echo "❌ 未找到 workshop 代码目录: $WORKSHOP_DIR"
-  echo "   请保证 agentcore_cn_workshop 与 agentcore_cn_hands_on 位于同一父目录下。"
-  exit 1
+  if [ -d "$ROOT_DIR/part1_data_ingestion" ]; then
+    # 仓库内直跑布局：本脚本位于 workshop 仓库自带的 agentcore_cn_hands_on/ 下
+    WORKSHOP_DIR="$ROOT_DIR"
+  else
+    echo "❌ 未找到 workshop 代码目录: $WORKSHOP_DIR"
+    echo "   支持两种布局：外层平铺（agentcore_cn_workshop 与 agentcore_cn_hands_on"
+    echo "   同一父目录）或在 workshop 仓库内直跑本脚本。"
+    exit 1
+  fi
 fi
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)

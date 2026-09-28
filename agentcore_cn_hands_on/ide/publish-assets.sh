@@ -61,8 +61,37 @@ ROOT_DIR="$(dirname "$HANDS_ON_DIR")"                        # 上级：包含�
 WORKSHOP_DIR="$ROOT_DIR/agentcore_cn_workshop"
 TEMPLATE="$HANDS_ON_DIR/cloudformation/cloudlab-template-china.yaml"
 
-[ -d "$WORKSHOP_DIR" ] || { echo "❌ 未找到 $WORKSHOP_DIR"; exit 1; }
 [ -f "$TEMPLATE" ] || { echo "❌ 未找到 $TEMPLATE"; exit 1; }
+
+# 两种运行布局：
+#   外层平铺布局：<父目录>/{agentcore_cn_workshop, agentcore_cn_hands_on}
+#   仓库内直跑布局：本脚本位于 workshop 仓库自带的 agentcore_cn_hands_on/ 下
+#     （此时 ROOT_DIR 本身就是 workshop 仓库，无平铺的兄弟目录）——
+#     用 rsync 搭出打包用的平铺结构，保证总包内容始终来自仓库当前状态
+PACK_ROOT="$ROOT_DIR"
+if [ ! -d "$WORKSHOP_DIR" ]; then
+  if [ -d "$ROOT_DIR/part1_data_ingestion" ]; then
+    STAGE="$(mktemp -d)"
+    rsync -a --exclude '.venv' --exclude 'node_modules' --exclude '.git' \
+      --exclude '.deploy' --exclude '__pycache__' --exclude '.DS_Store' \
+      --exclude '._*' --exclude '*.bedrock_agentcore.yaml' --exclude '.env.local' \
+      "$ROOT_DIR/" "$STAGE/agentcore_cn_workshop/"
+    rsync -a --exclude '.DS_Store' --exclude '._*' \
+      "$HANDS_ON_DIR/" "$STAGE/agentcore_cn_hands_on/"
+    PACK_ROOT="$STAGE"
+    WORKSHOP_DIR="$STAGE/agentcore_cn_workshop"
+    echo "==> 仓库内直跑布局：已 rsync 出打包结构（$STAGE）"
+  else
+    echo "❌ 未找到 $WORKSHOP_DIR"; exit 1
+  fi
+else
+  # 外层平铺布局：外层 hands_on 快照容易与仓库内版本漂移（发生过），告警提示
+  NESTED="$WORKSHOP_DIR/agentcore_cn_hands_on"
+  if [ -d "$NESTED" ] && ! diff -rq -x '.DS_Store' -x '._*' "$NESTED" "$HANDS_ON_DIR" >/dev/null 2>&1; then
+    echo "⚠️  外层 agentcore_cn_hands_on 与仓库内 $NESTED 内容不一致——"
+    echo "    总包将打包外层版本，请确认外层快照是最新的（或改到仓库内直跑本脚本）"
+  fi
+fi
 aws sts get-caller-identity --profile "$PROFILE" ${AWS_REGION_ARGS[@]+"${AWS_REGION_ARGS[@]}"} >/dev/null \
   || { echo "❌ profile '$PROFILE' 凭证不可用"; exit 1; }
 
