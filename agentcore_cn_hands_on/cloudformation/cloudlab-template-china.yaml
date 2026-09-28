@@ -916,7 +916,8 @@ Resources:
                       cd /home/ec2-user/environment/agentcore_cn_workshop
                       [ -x .venv/bin/pip ] || python3.11 -m venv .venv
                       .venv/bin/pip -q install --upgrade pip
-                      .venv/bin/pip -q install bedrock-agentcore-starter-toolkit
+                      # uv：starter-toolkit direct_code_deploy 模式打包依赖的硬前置
+                      .venv/bin/pip -q install bedrock-agentcore-starter-toolkit uv
                     '
 
                     # 中国区：预载 Keycloak 基础镜像（quay.io 区内极慢/不可达；本地已有

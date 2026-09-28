@@ -122,8 +122,10 @@ ensure_venv() {
   if ! "$WORKSHOP_DIR/.venv/bin/pip" show bedrock-agentcore-starter-toolkit >/dev/null 2>&1; then
     echo "==> 安装 bedrock-agentcore-starter-toolkit（agentcore CLI）..."
     pip install -q --upgrade pip
-    pip install -q bedrock-agentcore-starter-toolkit
+    pip install -q bedrock-agentcore-starter-toolkit uv
   fi
+  # uv：direct_code_deploy 模式打包依赖的硬前置（旧环境可能只装了 toolkit）
+  command -v uv >/dev/null 2>&1 || pip install -q uv
   # agentcore CLI 可用性自检（npm 有同名命令，识别依据：Python 版帮助里有 configure）
   if ! { agentcore --help >/tmp/.agentcore_help 2>/dev/null && grep -qE '\bconfigure\b' /tmp/.agentcore_help; }; then
     echo "❌ agentcore CLI 异常（PATH 里的可能是 npm 同名命令）。venv: $WORKSHOP_DIR/.venv"
