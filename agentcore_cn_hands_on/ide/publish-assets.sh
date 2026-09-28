@@ -53,7 +53,7 @@ else
   DIST_ID="${CDN_DIST_ID:-E1PJYVU6MI701Y}"
   AWS_REGION_ARGS=()
 fi
-echo "==> 发布通道: $TARGET（bucket=$BUCKET prefix=${PREFIX:-<无>} profile=$PROFILE）"
+echo "==> 发布通道: ${TARGET}（bucket=${BUCKET} prefix=${PREFIX:-<无>} profile=${PROFILE}）"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HANDS_ON_DIR="$(dirname "$SCRIPT_DIR")"                      # agentcore_cn_hands_on
@@ -80,7 +80,7 @@ if [ ! -d "$WORKSHOP_DIR" ]; then
       "$HANDS_ON_DIR/" "$STAGE/agentcore_cn_hands_on/"
     PACK_ROOT="$STAGE"
     WORKSHOP_DIR="$STAGE/agentcore_cn_workshop"
-    echo "==> 仓库内直跑布局：已 rsync 出打包结构（$STAGE）"
+    echo "==> 仓库内直跑布局：已 rsync 出打包结构（${STAGE}）"
   else
     echo "❌ 未找到 $WORKSHOP_DIR"; exit 1
   fi
@@ -97,9 +97,9 @@ aws sts get-caller-identity --profile "$PROFILE" ${AWS_REGION_ARGS[@]+"${AWS_REG
 
 echo "==> [1/4] 打包 workshop 代码总包（排除 .venv/.deploy/node_modules/.git 等本地产物）..."
 BUILD="$(mktemp -d)"
-trap 'rm -rf "$BUILD"' EXIT
+trap 'rm -rf "$BUILD" "${STAGE:-}"' EXIT
 # COPYFILE_DISABLE=1：禁止 macOS tar 写入 AppleDouble 元数据（._xxx 文件）
-COPYFILE_DISABLE=1 tar czf "$BUILD/workshop-assets.tar.gz" -C "$ROOT_DIR" \
+COPYFILE_DISABLE=1 tar czf "$BUILD/workshop-assets.tar.gz" -C "$PACK_ROOT" \
   --exclude='._*' \
   --exclude='.venv' \
   --exclude='.deploy' \
