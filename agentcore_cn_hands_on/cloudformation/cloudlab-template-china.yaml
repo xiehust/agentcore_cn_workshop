@@ -318,7 +318,7 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: !Sub 'lambda.${AWS::URLSuffix}'
+              Service: lambda.amazonaws.com  # cn 分区 Lambda principal 仍是 .com（勿用 URLSuffix）
             Action: sts:AssumeRole
       Policies:
         - PolicyName: cleanup-logs
@@ -581,11 +581,18 @@ Resources:
             Condition:
               StringEquals:
                 iam:PassedToService:
-                  - !Sub 'lambda.${AWS::URLSuffix}'
-                  - !Sub 'ecs-tasks.${AWS::URLSuffix}'
-                  - !Sub 'scheduler.${AWS::URLSuffix}'
-                  - !Sub 'codebuild.${AWS::URLSuffix}'
+                  # cn 分区各服务 principal 形态不一（多数仍是 .com，仅个别 .com.cn），
+                  # 双写两种形态兜底（StringEquals 列表是 OR，全球区多余项无害）
+                  - lambda.amazonaws.com
+                  - lambda.amazonaws.com.cn
+                  - ecs-tasks.amazonaws.com
+                  - ecs-tasks.amazonaws.com.cn
+                  - scheduler.amazonaws.com
+                  - scheduler.amazonaws.com.cn
+                  - codebuild.amazonaws.com
+                  - codebuild.amazonaws.com.cn
                   - bedrock-agentcore.amazonaws.com
+                  - bedrock-agentcore.amazonaws.com.cn
           - Sid: ServiceLinkedRoles
             Effect: Allow
             Action:
@@ -850,12 +857,29 @@ Resources:
                       dnf install -y nodejs npm
                     fi
 
+                    # 中国区：pip/npm 切国内镜像源（区内访问 pypi.org/registry.npmjs.org
+                    # 跨境慢且不稳，会拖垮 bootstrap 与场景脚本里的所有 pip/npm install）
+                    case "${AWS::Region}" in cn-*)
+                      echo "=== [1.5/6] cn package mirrors ==="
+                      tee /etc/pip.conf <<'PIPCONF'
+                    [global]
+                    index-url = https://pypi.tuna.tsinghua.edu.cn/simple
+                    PIPCONF
+                      echo "registry=https://registry.npmmirror.com" > /home/ec2-user/.npmrc
+                      chown ec2-user:ec2-user /home/ec2-user/.npmrc 2>/dev/null || true
+                    ;; esac
+
                     echo "=== [2/6] docker + aws cli ==="
                     systemctl enable --now docker
                     usermod -aG docker ec2-user
                     # AL2023 预装的 AWS CLI 版本偏旧，缺 bedrock-agentcore-control 的
-                    # 新子命令（如 list-browser-profiles），升级到最新版
-                    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+                    # 新子命令（如 list-browser-profiles），升级到最新版。
+                    # 中国区从区内资产镜像下载（awscli.amazonaws.com 是全球 CDN，跨境慢）
+                    case "${AWS::Region}" in
+                      cn-*) AWSCLI_URL="${AssetBaseUrl}/tools/awscli-exe-linux-x86_64.zip" ;;
+                      *)    AWSCLI_URL="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" ;;
+                    esac
+                    curl -fsSL --retry 5 --retry-delay 3 "$AWSCLI_URL" -o /tmp/awscliv2.zip
                     unzip -qo /tmp/awscliv2.zip -d /tmp
                     /tmp/aws/install --update
                     rm -rf /tmp/aws /tmp/awscliv2.zip
@@ -895,12 +919,26 @@ Resources:
                       .venv/bin/pip -q install bedrock-agentcore-starter-toolkit
                     '
 
+                    # 中国区：预载 Keycloak 基础镜像（quay.io 区内极慢/不可达；本地已有
+                    # 该 tag 时场景 2 的 docker build 走本地缓存，不再访问 quay.io）
+                    case "${AWS::Region}" in cn-*)
+                      echo "=== [4.7/6] keycloak base image (cn) ==="
+                      if ! docker image inspect quay.io/keycloak/keycloak:26.3 >/dev/null 2>&1; then
+                        curl -fsSL --retry 5 --retry-delay 3 "${AssetBaseUrl}/tools/keycloak-26.3-arm64.tar.gz" -o /tmp/kc.tar.gz \
+                          && gunzip -c /tmp/kc.tar.gz | docker load \
+                          && rm -f /tmp/kc.tar.gz \
+                          || echo "WARN: keycloak 镜像预载失败（不阻塞建栈；场景 2 将直接拉 quay.io）"
+                      fi
+                    ;; esac
+
                     echo "=== [5/6] shell env ==="
                     tee /etc/profile.d/agentcore_env.sh <<'EOF'
                     export PROMPT_COMMAND='export PS1="\u@agentcore-ide:\w$ "'
                     export AWS_REGION=${AWS::Region}
                     export AWS_DEFAULT_REGION=${AWS::Region}
                     export BASE_STACK=${AWS::StackName}
+                    # 资产镜像基址（排障/手动重拉资产用）
+                    export ASSET_BASE_URL=${AssetBaseUrl}
                     # 抑制 starter-toolkit 的「CLI no longer supported」迁移横幅
                     export AGENTCORE_SUPPRESS_RECOMMENDATION=1
                     EOF
@@ -945,7 +983,7 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: !Sub 'lambda.${AWS::URLSuffix}'
+              Service: lambda.amazonaws.com  # cn 分区 Lambda principal 仍是 .com（勿用 URLSuffix）
             Action: sts:AssumeRole
       Path: "/"
       Policies:
@@ -1427,7 +1465,7 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: !Sub 'lambda.${AWS::URLSuffix}'
+              Service: lambda.amazonaws.com  # cn 分区 Lambda principal 仍是 .com（勿用 URLSuffix）
             Action: sts:AssumeRole
       Policies:
         - PolicyName: fetch-assets
@@ -2247,7 +2285,11 @@ Resources:
                   # 尽早发起子栈删除（keycloak 的 ECS 服务排空最耗时），后续步骤并行推进
                   for s in STACKS: w(lambda: cf.delete_stack(StackName=s))
                   try:
-                      b = boto3.client('bedrock-agentcore-control')
+                      # cn 分区显式拼 endpoint：Lambda 运行时自带 botocore 偏旧时
+                      # 可能没有该服务的 endpoint 数据，w() 会把整段清理静默跳过
+                      region = context.invoked_function_arn.split(':')[3]
+                      ep = ('https://bedrock-agentcore-control.%s.amazonaws.com.cn' % region) if region.startswith('cn-') else None
+                      b = boto3.client('bedrock-agentcore-control', endpoint_url=ep) if ep else boto3.client('bedrock-agentcore-control')
                       for r in (w(lambda: b.list_agent_runtimes()['agentRuntimes']) or []):
                           if r['agentRuntimeName'] in ('product_ingestion_agent','analysis_chat_agent'):
                               w(lambda: b.delete_agent_runtime(agentRuntimeId=r['agentRuntimeId']))

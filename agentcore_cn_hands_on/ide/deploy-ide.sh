@@ -12,7 +12,11 @@
 #     IDE_INSTANCE_TYPE   实例类型（默认 t3.large）
 #     IDE_ALB_PORT        IDE 入口端口（默认 8889，中国区免备案必须非标准端口；
 #                         全球区可传 80 兼容只放行 80/443 出站的办公网络）
-#     CODE_SERVER_RPM_URL 中国区可指定区内可达的 code-server rpm 镜像地址
+#     ASSET_BASE_URL      资产 CDN 基址（透传模板 AssetBaseUrl）。中国区默认
+#                         http://cf.chenxqdu.people.a2z.org.cn/agentcore-workshop
+#                         （维护者私有分发环境，换环境请覆盖）；全球区留空用模板默认
+#     CODE_SERVER_RPM_URL 区内可达的 code-server rpm 镜像地址（中国区默认从
+#                         ASSET_BASE_URL/tools/ 派生）
 #     ENABLE_PUBLIC_PORTAL=1 公网化场景 2 的 Web 门户（HTTPS）：自动生成自签证书导入
 #                         ACM，ALB 加 8443 HTTPS 监听器转发实例 5173（浏览器一次
 #                         证书告警；8443 非标准端口，中国区免备案）
@@ -31,6 +35,16 @@ STACK_NAME="${WORKSHOP_STACK_NAME:-agentcore-workshop-base}"
 ALLOWED_CIDR="${ALLOWED_CIDR:-0.0.0.0/0}"
 IDE_INSTANCE_TYPE="${IDE_INSTANCE_TYPE:-t3.large}"
 CODE_SERVER_RPM_URL="${CODE_SERVER_RPM_URL:-}"
+ASSET_BASE_URL="${ASSET_BASE_URL:-}"
+CODE_SERVER_VERSION="${CODE_SERVER_VERSION:-4.91.1}"
+
+# 中国区：资产必须走区内 CDN（全球区 CloudFront 跨境慢且易致建栈超时回滚）。
+# 默认指向维护者私有分发环境，换环境用 ASSET_BASE_URL 覆盖
+case "$REGION" in cn-*)
+  ASSET_BASE_URL="${ASSET_BASE_URL:-http://cf.chenxqdu.people.a2z.org.cn/agentcore-workshop}"
+  [ -n "$CODE_SERVER_RPM_URL" ] || \
+    CODE_SERVER_RPM_URL="$ASSET_BASE_URL/tools/code-server-$CODE_SERVER_VERSION-amd64.rpm"
+;; esac
 
 case "$STACK_NAME" in
   agentcore-workshop*) ;;
@@ -81,6 +95,7 @@ echo "==> [3/4] 部署 CloudLab 栈（首次约 15-20 分钟，含 Aurora 建库
 # deploy 对未传参数会沿用栈上旧值，不显式传会出现"关不掉"的漂移）
 EXTRA_PARAMS=()
 [ -n "$CODE_SERVER_RPM_URL" ] && EXTRA_PARAMS+=("CodeServerRpmUrl=$CODE_SERVER_RPM_URL")
+[ -n "$ASSET_BASE_URL" ] && EXTRA_PARAMS+=("AssetBaseUrl=$ASSET_BASE_URL")
 EXTRA_PARAMS+=("IdeAlbPort=${IDE_ALB_PORT:-8889}")
 
 # 可选：公网门户证书（自签导入 ACM，按域名幂等复用）
