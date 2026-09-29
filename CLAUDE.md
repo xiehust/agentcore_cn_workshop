@@ -15,16 +15,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 常用命令
 
-区域是唯一开关：海外 `AWS_REGION=us-west-2`、中国 `cn-northwest-1`——部署脚本
-按区域自动推导分区（`arn:aws-cn`）、域名后缀（`.amazonaws.com.cn`）与 SDK 端点
-覆盖。模型统一标准 OpenAI 兼容 Chat Completions（三元组 env）：全球区默认
-bedrock-mantle，`export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>`（ABSK 前缀）；
-中国区/自定义端点 `export OPENAI_BASE_URL + OPENAI_API_KEY + MODEL_ID`。key 必填，
+区域是唯一开关：中国 `AWS_REGION=cn-northwest-1`（宁夏，已全量实测）、海外
+`us-west-2`——部署脚本按区域自动推导分区（`arn:aws-cn`）、域名后缀
+（`.amazonaws.com.cn`）与 SDK 端点覆盖。模型统一标准 OpenAI 兼容
+Chat Completions（三元组 env）：中国区/自定义端点
+`export OPENAI_BASE_URL + OPENAI_API_KEY + MODEL_ID`（宁夏无原生 Bedrock，
+必须三元组）；全球区默认 bedrock-mantle，
+`export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>`（ABSK 前缀）。key 必填，
 deploy.sh 做 fail-fast 校验（未配 BASE_URL 时 key 必须 ABSK；显式配了 BASE_URL
 则信任成对 key，但指向 localhost/私网 IP 直接拒绝——注意部署机环境卫生，公网
 残留 BASE_URL 仍会被原样采用）。gpt-5.6-terra 经 /chat/completions 用函数工具
 必须 `reasoning_effort=none`（端点硬约束），Agent 对默认 mantle 端点自动带上；
 自定义端点缺省不发该参数，需要时 `export MODEL_REASONING_EFFORT` 显式指定。
+部署走 `agentcore configure --deployment-type direct_code_deploy`（aws-cn 无
+CodeBuild ARM_CONTAINER，toolkit 0.3.13 起默认 container 模式在中国区必挂；
+该模式硬依赖本机 `uv`）。部分严格校验的模型端点（实测 Bedrock kimi 经 litellm
+网关）拒绝含 `"format": "binary"` 的工具 schema 且异常被 strands 吞成空流——
+两个 Agent 已内置 `_sanitize_tool_schema` 净化，自写新工具时注意同样处理。
 
 ```bash
 # Part 1：部署（Aurora + 写库 Lambda + 建表 + Browser/Profile + Runtime），幂等可重跑
@@ -141,5 +148,8 @@ Gateway → Lambda（挂 Aurora 同 VPC，pg8000 直连）→ Aurora
 
 ### 文档
 
-`实验手册.md`（部署+上手总览）→ 两个部分的 README（细节与 FAQ）。改部署行为时
-同步这三处。
+分层：`实验手册.md`（根，动手主线）→ `docs/`（设计类：`架构与设计.md`、
+`中国区移植说明.md`）→ 两个部分的 README（细节与 FAQ）。现场活动交付包
+`agentcore_cn_hands_on/` 另有学员版`中国区实验手册.md`、操作员`运行手册.md`
+与 `docs/design.md`（CloudLab 设计决策）。改部署行为时同步动手主线与对应
+README；改分区适配/架构时同步 docs/ 两篇。

@@ -63,53 +63,34 @@ Part 1 的核心思路是 **"Agent 框架不变，业务逻辑用 Skill 插拔"*
 
 ## 中国区移植说明
 
-AgentCore 已在宁夏区（`cn-northwest-1`）上线（Runtime / Browser / Gateway /
-Identity / Code Interpreter 可用；**托管 Memory 暂未上线**——本仓库用自建
-mem0，不受影响）。本 workshop 先在海外区（`us-west-2`）用等效架构验证，
-再于宁夏区实测部署，两个分区共用同一套代码，区域代码（`AWS_REGION`）是
-唯一开关。
+AgentCore 已在宁夏区（`cn-northwest-1`）上线，本 workshop 已在宁夏区完成
+**全量端到端实测**（2026-09）：Runtime / Browser / Gateway / Identity /
+Code Interpreter 可用，托管 Memory 暂未上线（本仓库长期记忆用自建 mem0，
+不受影响）。两个分区共用同一套代码，**区域代码（`AWS_REGION`）是唯一开关**。
 
-**已完成、两分区通用的形态**：
-
-- **数据面零 RDS Data API**（中国区没有该服务，已实证）：Part 1 走写库 Lambda；
-  Part 2 的会话历史（Runtime）、任务表（tasks-api / runner）统一经通用数据面
-  Lambda（`agentcore-workshop-db`，`op=execute` 协议、pg8000 直连），部署预检
-  走写库 Lambda 的 `check_tables`。集群 `EnableHttpEndpoint` 与
-  `AgentDataAccessPolicy` 已删除。
-- **模型统一标准 OpenAI 兼容端点 + key**：两个 Agent 都用 Strands `OpenAIModel`
-  （Chat Completions），`OPENAI_BASE_URL` / `OPENAI_API_KEY` / `MODEL_ID` 三元组
-  env 注入。全球区默认 bedrock-mantle（其 `/chat/completions` 已实测可用，
-  key 用 Bedrock API key）；中国区 export 区内模型服务商的三元组即可，
-  IAM 铸 token 路径已移除。gpt-5.6-terra 在 `/chat/completions` 上用函数工具
-  必须 `reasoning_effort=none`（端点硬约束），Agent 对默认 mantle 端点自动
-  处理；自定义端点缺省不发该参数，可用 `MODEL_REASONING_EFFORT` 显式指定。
-- **分区/域名全模板化**：CloudFormation 统一 `${AWS::Partition}` /
-  `${AWS::URLSuffix}`；部署脚本按区域推导 `PARTITION` / `AWS_DOMAIN`，
-  并在 cn-* 分支自动 export `BEDROCK_AGENTCORE_CP_ENDPOINT` / `DP_ENDPOINT`
-  覆盖 SDK 内置端点。注意 cn 分区接口端点服务名**按服务不一致**
-  （execute-api/lambda 带 `cn.` 前缀，secretsmanager 实测两个 cn 区均为
-  `com.amazonaws` 前缀），已按实测写死。
-- **Gateway 零 VPC egress**：私网访问全部由 VPC 内 Lambda 承担，不依赖
-  Gateway 的 VPC 出口能力。
-- **认证自部署 Keycloak**（中国区没有 Cognito）：OIDC 全链路不依赖海外托管服务。
-- **长期记忆自部署 mem0**：向量存 Aurora pgvector、经 VPC 内 Lambda 读写；
-  提取 LLM 与 embedding 走 OpenAI 兼容端点（`MEM0_*` 环境变量），中国区换
-  端点即可。换 embedding 模型若维度变化，需换 `MEM0_COLLECTION` 重建向量表。
-
-**中国区（宁夏）实测状态**：
-
-| 事项 | 状态 |
-|--------|------|
-| Keycloak 基础镜像 | 已解决：CloudLab bootstrap 从区内资产 CDN 预载镜像 tar 并 `docker load`，场景 2 构建走本地缓存不访问 quay.io（预载失败自动回退直拉） |
-| 建栈资产区内化 | 已解决：代码包/Lambda zip/code-server rpm/AWS CLI/Keycloak 镜像统一走区内 CDN（`publish-assets.sh` cn 通道 + `deploy-ide.sh` 内置默认地址），并配 pip（TUNA）/npm（npmmirror）镜像源 |
-| 接口端点服务名 | 已实测修正：secretsmanager 在两个 cn 区均为 `com.amazonaws` 前缀（无 `cn.`） |
-| 出网可达性 | Browser 出网爬 eBay 等境外站点的链路质量以现场实测为准（跨境访问有波动，单商品 2~5 分钟属正常） |
+移植的核心形态：数据面零 RDS Data API（统一 VPC 内 Lambda）、模型统一
+OpenAI 兼容三元组（中国区指区内模型网关）、`direct_code_deploy` 部署
+（aws-cn 无 CodeBuild ARM_CONTAINER）、自部署 Keycloak（无 Cognito）与
+自建 mem0。分区差异明细、宁夏区实测修复清单（接口端点服务名、IAM
+principal、IMDSv2、模型工具 schema 净化等）与实测结论见
+**[docs/中国区移植说明.md](docs/中国区移植说明.md)**。
 
 ## 目录结构
 
 ```
 .
 ├── README.md                        # 本文件
+├── 实验手册.md                       # 动手主线：两个实验的部署与上手（从这里开始）
+├── docs/                            # 设计类文档
+│   ├── 架构与设计.md                 # 架构详解、Skill 机制、认证链、模型接入设计
+│   ├── 中国区移植说明.md             # 分区差异、宁夏区实测修复清单与结论
+│   └── images/                      # 文档截图
+├── agentcore_cn_hands_on/           # 现场活动交付包（浏览器 IDE + 一键建栈 + 学员手册）
+│   ├── 中国区实验手册.md             # 学员视角手册（宁夏区，模型网关信息现场发放）
+│   ├── 运行手册.md                   # 操作员视角 CloudLab 部署手册
+│   ├── cloudformation/              # CloudLab 单栈模板（IDE + 数仓 + 清理钩子）
+│   ├── ide/                         # 部署/销毁/资产发布脚本
+│   └── scripts/                     # IDE 内分步执行脚本
 ├── part1_data_ingestion/            # Part 1：数据摄入 pipeline
 │   ├── README.md                    # Part 1 部署运行指南
 │   ├── agent/                       # Agent 代码（部署到 AgentCore Runtime）
@@ -143,18 +124,30 @@ mem0，不受影响）。本 workshop 先在海外区（`us-west-2`）用等效�
 ## 快速开始
 
 推荐从 [实验手册](实验手册.md) 开始：两个实验的部署与上手操作一份文档走完。
-需要更深入的细节再看各部分的 README：
+参加现场活动（预置 CloudLab 环境）直接看
+[学员版中国区实验手册](agentcore_cn_hands_on/中国区实验手册.md)。
+想理解实现再读 [docs/架构与设计.md](docs/架构与设计.md)，以及各部分 README：
 
 1. [Part 1 部署运行指南](part1_data_ingestion/README.md)
 2. [Part 2 Web Chat 分析门户](part2_chat_portal/README.md)（依赖 Part 1 的数仓）
 
 ## 前置条件
 
-- AWS 账号。区域是唯一开关：海外 `us-west-2`、中国区 `cn-northwest-1`
-  （`AWS_REGION` 驱动分区/域名等全部差异）
-- 模型（标准 OpenAI 兼容 Chat Completions，key 必填）：全球区在 Bedrock
+- AWS 账号。区域是唯一开关：中国区 `cn-northwest-1`（宁夏，已全量实测）、
+  海外 `us-west-2`（`AWS_REGION` 驱动分区/域名等全部差异）
+- 模型（标准 OpenAI 兼容 Chat Completions，key 必填）：中国区 export
+  `OPENAI_BASE_URL + OPENAI_API_KEY + MODEL_ID` 指区内 OpenAI 兼容模型网关
+  （需支持工具调用；启用长期记忆另需 embedding 模型）；全球区在 Bedrock
   控制台开通 OpenAI GPT-5.6 并生成 Bedrock API key
   （`export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>`，默认走
-  bedrock-mantle 端点）；中国区 export
-  `OPENAI_BASE_URL + OPENAI_API_KEY + MODEL_ID` 指区内 OpenAI 兼容服务
-- Python 3.10+，配置好 AWS 凭证（`aws configure`）
+  bedrock-mantle 端点）
+- Python 3.10+，配置好 AWS 凭证（`aws configure`）；
+  `pip install bedrock-agentcore-starter-toolkit uv`
+
+## 成本估算（宁夏区，粗略）
+
+按需计费的常驻部分：Aurora Serverless v2（Min 0.5 ACU warm standby）+
+Keycloak Fargate（0.25 vCPU）+ 若干 Lambda/API Gateway（调用量极小），
+合计约 **¥25~40/天**；走 CloudLab 交付包另加 IDE EC2 t3.large + ALB/NLB，
+合计约 **¥60~90/天**。模型调用费用取决于所接网关的计费方式。实验结束按
+手册「资源清理」一键销毁即不再产生费用。
