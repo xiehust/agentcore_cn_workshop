@@ -30,8 +30,9 @@ Parameters:
   # 同区域 S3，故栈内 AssetFetch 自定义资源先把 zip 从 CDN 拉进自建中转桶
   AssetBaseUrl:
     Type: String
-    Default: https://dbr8mrv63fpuw.cloudfront.net
-    Description: CloudFront base URL serving workshop assets (published by ide/publish-assets.sh)
+    # 默认中国区分发（本模板面向中国区活动；全球区部署显式传回全球 CDN）
+    Default: http://cf.chenxqdu.people.a2z.org.cn/agentcore-workshop
+    Description: CDN base URL serving workshop assets (published by ide/publish-assets.sh)
 
   WorkshopAssetsKey:
     Type: String
@@ -68,11 +69,11 @@ Parameters:
 
   CodeServerRpmUrl:
     Type: String
-    Default: ""
+    # 默认中国区镜像（GitHub 区内不可达；全球区部署可置空回落 GitHub releases）
+    Default: http://cf.chenxqdu.people.a2z.org.cn/agentcore-workshop/tools/code-server-4.91.1-amd64.rpm
     Description: >
-      Optional override URL for the code-server rpm. Leave empty to download from
-      GitHub releases. In China regions set this to an in-region mirror, e.g.
-      https://dqz9mdd9dvd79.cloudfront.net/tools/code-server.rpm
+      URL for the code-server rpm. Set to empty to download from GitHub releases
+      (global regions only; unreachable from China).
 
   IdeVpcCIDR:
     Type: String
