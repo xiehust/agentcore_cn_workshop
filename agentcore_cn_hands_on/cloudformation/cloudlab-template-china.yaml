@@ -949,6 +949,16 @@ Resources:
                     # 抑制 starter-toolkit 的「CLI no longer supported」迁移横幅
                     export AGENTCORE_SUPPRESS_RECOMMENDATION=1
                     EOF
+                    # 中国区：AgentCore SDK/toolkit 内置端点硬编码 .amazonaws.com，
+                    # 交互命令（agentcore invoke/status、local_test.py）会打到不存在的
+                    # 全球域名（实测 Could not connect）。端点覆盖写进 profile.d，
+                    # 学员免记 source cn_env.sh（脚本内的 source 保留，幂等）
+                    case "${AWS::Region}" in cn-*)
+                      {
+                        echo 'export BEDROCK_AGENTCORE_CP_ENDPOINT=https://bedrock-agentcore-control.${AWS::Region}.amazonaws.com.cn'
+                        echo 'export BEDROCK_AGENTCORE_DP_ENDPOINT=https://bedrock-agentcore.${AWS::Region}.amazonaws.com.cn'
+                      } >> /etc/profile.d/agentcore_env.sh
+                    ;; esac
 
                     echo "=== [6/6] code-server config (as ec2-user) ==="
                     PASSWORD_SECRET_VALUE=$(aws secretsmanager get-secret-value \
