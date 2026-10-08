@@ -34,9 +34,104 @@ export default defineConfig(({ mode }) => {
         `/runtimes/${encodeURIComponent(runtimeArn)}/invocations?qualifier=DEFAULT`,
     },
   };
+
+  // Tasks API 私有化代理（中央 Keycloak 形态，VITE_TASKS_API_URL=/api/tasks 时启用）：
+  // 学员账号 execute-api 被 ICP recordal 限制时，公网 Tasks API 整体弃用，
+  // 浏览器流量改走本门户同源——此 middleware 验签 JWT（与原 Tasks authorizer
+  // 等价：中央 KC 的 JWKS + issuer/audience 校验）后，以实例角色 SigV4
+  // lambda.invoke 调 tasks-api（构造 API GW v2 HTTP 事件，Lambda handler 零改动）。
+  const tasksProxyEnabled = (env.VITE_TASKS_API_URL || "") === "/api/tasks" && env.VITE_KC_URL;
+  const makeTasksProxy = () => {
+    const issuer = `${env.VITE_KC_URL}/realms/${env.VITE_KC_REALM || "agentcore-workshop"}`;
+    let jwksPromise: Promise<unknown> | null = null;
+    const handler = async (
+      req: import("node:http").IncomingMessage,
+      res: import("node:http").ServerResponse,
+    ) => {
+      try {
+        const { createRemoteJWKSet, jwtVerify } = await import("jose");
+        const { LambdaClient, InvokeCommand } = await import("@aws-sdk/client-lambda");
+        if (!jwksPromise) {
+          jwksPromise = Promise.resolve(
+            createRemoteJWKSet(new URL(`${issuer}/protocol/openid-connect/certs`)),
+          );
+        }
+        const jwks = (await jwksPromise) as Parameters<typeof jwtVerify>[1];
+        const auth = req.headers["authorization"] || "";
+        const token = Array.isArray(auth) ? "" : auth.replace(/^Bearer\s+/i, "");
+        if (!token) {
+          res.statusCode = 401;
+          res.end(JSON.stringify({ message: "missing bearer token" }));
+          return;
+        }
+        let claims: Record<string, unknown>;
+        try {
+          const verified = await jwtVerify(token, jwks, {
+            issuer,
+            audience: "analysis-runtime",
+          });
+          claims = verified.payload as Record<string, unknown>;
+        } catch {
+          res.statusCode = 401;
+          res.end(JSON.stringify({ message: "invalid token" }));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const bodyRaw = Buffer.concat(chunks);
+        // connect 挂载在 /api/tasks 下，req.url 已去前缀
+        const [pathPart, queryPart] = (req.url || "/").split("?");
+        const qs: Record<string, string> = {};
+        new URLSearchParams(queryPart || "").forEach((v, k) => (qs[k] = v));
+        const event = {
+          version: "2.0",
+          rawPath: pathPart || "/",
+          rawQueryString: queryPart || "",
+          headers: Object.fromEntries(
+            Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? v.join(",") : v]),
+          ),
+          queryStringParameters: Object.keys(qs).length ? qs : undefined,
+          requestContext: {
+            http: { method: req.method || "GET", path: pathPart || "/" },
+            authorizer: { jwt: { claims } },
+          },
+          body: bodyRaw.length ? bodyRaw.toString("base64") : undefined,
+          isBase64Encoded: bodyRaw.length > 0,
+        };
+        const lambda = new LambdaClient({ region });
+        const out = await lambda.send(
+          new InvokeCommand({
+            FunctionName: "agentcore-workshop-tasks-api",
+            Payload: Buffer.from(JSON.stringify(event)),
+          }),
+        );
+        const payload = JSON.parse(Buffer.from(out.Payload ?? []).toString() || "{}");
+        res.statusCode = payload.statusCode || 500;
+        for (const [k, v] of Object.entries(payload.headers || {})) res.setHeader(k, String(v));
+        const respBody = payload.isBase64Encoded
+          ? Buffer.from(payload.body || "", "base64")
+          : payload.body || "";
+        res.end(respBody);
+      } catch (e) {
+        res.statusCode = 502;
+        res.end(JSON.stringify({ message: `tasks proxy error: ${(e as Error).name}` }));
+      }
+    };
+    return {
+      name: "tasks-lambda-proxy",
+      configureServer(server: import("vite").ViteDevServer) {
+        server.middlewares.use("/api/tasks", handler);
+      },
+      configurePreviewServer(server: import("vite").PreviewServer) {
+        server.middlewares.use("/api/tasks", handler);
+      },
+    };
+  };
+
   return {
     plugins: [
       react(),
+      ...(tasksProxyEnabled ? [makeTasksProxy()] : []),
       ...(publicPortalUrl
         ? [
             {

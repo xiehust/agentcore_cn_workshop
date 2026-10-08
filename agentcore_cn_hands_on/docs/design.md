@@ -182,3 +182,29 @@ CloudFront 必须绑定已备案域名，故不采用 CloudFront 方案。
 
 Tasks API 的 JWT authorizer 仍留在 03（create-authorizer 时 API Gateway
 会实际校验 issuer discovery，Keycloak 任务在建栈末段才在线，无法前置）。
+
+### 中央化 Keycloak + Tasks API 私有化（学员账号 ICP recordal 限制，2026-10）
+
+学员 lab 账号未做 ICP 备案信息登记，**execute-api 默认域名全网 403**
+（API/stage/路由/VPC Link 配置全部正常、本机与 jumphost 公网同炸、
+`apigw-requestid` 头证实为网关侧账号级拒绝；CloudFront/S3 直链同受
+备案约束）。AgentCore Runtime/Gateway/Identity 的 JWT authorizer 硬性
+要求公网可信 HTTPS discovery——账号内免备案可信 HTTPS 全灭。两刀：
+
+- **Keycloak 中央化**：身份系统集中跑在已备案账号（独立栈
+  `infra/keycloak-fargate.yaml`，自带 VPC），学员环境经 deploy.sh 第三
+  形态 `KC_URL_OVERRIDE` 指向它——KC 地址在代码里只是 URL，跨账号零
+  限制；realm redirectUris 通配，任意学员门户可回跳。三演示账号密码
+  全场统一（讲师发放，随模型网关进 .env）；用户数据隔离在各学员账号
+  数据面（mem0/会话按用户名存各自 Aurora），4.2 演示无损。模板加
+  `EnableLocalKeycloak=false`（服务 0 副本、bootstrap 跳过构建、
+  KeycloakUrl 输出置空）。边界：全场共享 issuer/audience，token 跨
+  学员环境理论可用（须知道对方端点），演示场景接受。
+- **Tasks API 私有化**：Tasks API 自身也是学员账号 execute-api，同受
+  403。其数据面唯一消费者是学员浏览器——中央 KC 形态下公网 API 整体
+  弃用，浏览器流量改走门户同源 `/api/tasks`：vite middleware（dev 与
+  preview 都挂）用 jose 按中央 KC JWKS 验签（issuer/audience 与原
+  authorizer 等价，强度对齐 Runtime 链路），构造 API GW v2 事件以实例
+  角色 lambda.invoke tasks-api（handler 零改动）。4.3 任务管理/记忆
+  面板/会话列表全部恢复；调度链（Scheduler→runner）不经 API GW 本就
+  不受影响。

@@ -128,12 +128,23 @@ Parameters:
       授权码流程；token 明文传输，仅限 workshop 演示。设为 false 可关闭公网门户
       （仅保留 localhost 端口转发访问）。
 
+  EnableLocalKeycloak:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      默认 true：Keycloak 随本栈就绪（bootstrap 渲染构建镜像，服务 1 副本）。
+      设为 false 用于「中央 Keycloak」活动形态（账号 execute-api 受 ICP 备案
+      登记限制时，身份系统集中跑在已备案账号，学员环境经 KC_URL_OVERRIDE
+      指向它）：本栈不构建镜像、服务 0 副本、KeycloakUrl 输出置空。
+
 Conditions:
   UseDefaultCodeServerUrl: !Equals [!Ref CodeServerRpmUrl, ""]
   # 中国区（aws-cn）的接口端点 ServiceName 带 cn. 前缀
   IsChinaPartition: !Equals [!Ref "AWS::Partition", aws-cn]
   EnablePublicPortal: !Not [!Equals [!Ref PortalCertificateArn, ""]]
   EnableHttpPortalCond: !Equals [!Ref EnableHttpPortal, "true"]
+  LocalKeycloakEnabled: !Equals [!Ref EnableLocalKeycloak, "true"]
 
 # =============================================================================
 # Resources
@@ -955,6 +966,9 @@ Resources:
                     # 先行入仓——学员路径从此不需要 ecs:UpdateService（受管账号 SCP
                     # 常拦该 action，实测）。本段失败即建栈失败（否则服务卡死更难排查）
                     echo "=== [4.8/6] keycloak realm + image（渲染/构建/推送/预写凭证） ==="
+                    if [ "${EnableLocalKeycloak}" != "true" ]; then
+                      echo "    EnableLocalKeycloak=false（中央 Keycloak 形态），跳过本段"
+                    else
                     KC_SRC=/home/ec2-user/environment/agentcore_cn_workshop/part2_chat_portal
                     _sec() { aws secretsmanager get-secret-value --secret-id "$1" \
                       --region ${AWS::Region} --query SecretString --output text | jq -r "$2"; }
@@ -994,6 +1008,7 @@ Resources:
                     chmod 600 "$DEPLOY_DIR/secrets.env"
                     chown -R ec2-user:ec2-user "$DEPLOY_DIR"
                     echo "    镜像已推送: $ECR_URI:latest；secrets.env 已预写"
+                    fi
 
                     echo "=== [5/6] shell env ==="
                     tee /etc/profile.d/agentcore_env.sh <<'EOF'
@@ -1986,10 +2001,11 @@ Resources:
     Properties:
       # 不固定 ServiceName（服务发现配置变更触发替换时避免撞名）；
       # DesiredCount=1：镜像在 bootstrap 已就位，建栈即拉起（学员路径
-      # 不再需要 ecs:UpdateService）
+      # 不再需要 ecs:UpdateService）；中央 KC 形态（EnableLocalKeycloak=false）
+      # 置 0——身份系统在已备案账号集中运行
       Cluster: !Ref KcCluster
       LaunchType: FARGATE
-      DesiredCount: 1
+      DesiredCount: !If [LocalKeycloakEnabled, 1, 0]
       TaskDefinition: !Ref KcTaskDefinition
       NetworkConfiguration:
         AwsvpcConfiguration:
@@ -2621,9 +2637,13 @@ Outputs:
   ClusterEndpoint:
     Value: !GetAtt AuroraCluster.Endpoint.Address
 
-  # --- Keycloak（预建基础设施，场景 2 推镜像后拉起；输出键供 part2 deploy.sh 外部托管模式读取） ---
+  # --- Keycloak（预建基础设施；输出键供 part2 deploy.sh 外部托管模式读取。
+  #     中央 KC 形态输出空串，deploy.sh 据此不走本地 Keycloak 等待） ---
   KeycloakUrl:
-    Value: !Sub 'https://${KcHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+    Value: !If
+      - LocalKeycloakEnabled
+      - !Sub 'https://${KcHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+      - ''
   KeycloakClusterName:
     Value: !Ref KcCluster
   KeycloakServiceName:

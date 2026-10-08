@@ -133,8 +133,38 @@ fi
 mkdir -p "$DEPLOY_DIR"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
+# ---- 中央 Keycloak 第三形态（KC_URL_OVERRIDE 非空时启用） ----
+# 学员账号 execute-api 被 ICP recordal 限制时，Keycloak 集中跑在已备案账号，
+# 本脚本只拿「讲师发放」的地址与凭证：凭证必须与中央 realm 烧入值一致，
+# 来自环境变量（推荐填 workshop 根 .env），缺任一 fail-fast。
+KC_OVERRIDE="0"
+if [ -n "${KC_URL_OVERRIDE:-}" ]; then
+  KC_OVERRIDE="1"
+  _kc_missing=""
+  for _v in AGENT_CLIENT_SECRET ANALYST_PASSWORD VIVIAN_PASSWORD MARCO_PASSWORD; do
+    [ -n "${!_v:-}" ] || _kc_missing="$_kc_missing $_v"
+  done
+  if [ -n "$_kc_missing" ]; then
+    echo "❌ 中央 Keycloak 形态（KC_URL_OVERRIDE）缺少配套凭证:$_kc_missing"
+    echo "   这些值须与中央 Keycloak realm 一致，由讲师发放——推荐填入 workshop 根 .env"
+    exit 1
+  fi
+fi
+
 # ---- 部署机密（首次生成后固定，存 .deploy/，已 gitignore） ----
 SECRETS_FILE="$DEPLOY_DIR/secrets.env"
+# 中央 KC 形态：凭证以讲师发放值为准，直接重写 secrets.env（覆盖本地旧值，
+# 保持 get_token.sh / 手册 grep 的消费口径不变；admin 密码在学员侧无消费，占位）
+if [ "$KC_OVERRIDE" = "1" ]; then
+  cat > "$SECRETS_FILE" <<EOF
+KC_ADMIN_PASSWORD=central-managed
+AGENT_CLIENT_SECRET=$AGENT_CLIENT_SECRET
+ANALYST_PASSWORD=$ANALYST_PASSWORD
+VIVIAN_PASSWORD=$VIVIAN_PASSWORD
+MARCO_PASSWORD=$MARCO_PASSWORD
+EOF
+  chmod 600 "$SECRETS_FILE"
+fi
 if [ ! -f "$SECRETS_FILE" ]; then
   cat > "$SECRETS_FILE" <<EOF
 KC_ADMIN_PASSWORD=$(openssl rand -hex 12)
@@ -227,8 +257,11 @@ fi
 echo "==> [1/10] 部署 Keycloak（ECR + ECS Fargate + API Gateway，首次约需 5-8 分钟）..."
 ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.$AWS_DOMAIN/$KC_ECR_REPO"
 # 镜像已在仓（CloudLab bootstrap 建栈期已渲染构建推送）且非强制重建时跳过——
-# 学员路径零 docker/ecs 写操作；改过 realm-template 用 KC_REDEPLOY=1 重建
-if [ "${KC_REDEPLOY:-0}" != "1" ] && aws ecr describe-images --repository-name "$KC_ECR_REPO" \
+# 学员路径零 docker/ecs 写操作；改过 realm-template 用 KC_REDEPLOY=1 重建；
+# 中央 KC 形态下镜像在中央账号，本账号整段不涉
+if [ "$KC_OVERRIDE" = "1" ]; then
+  echo "    中央 Keycloak 形态：跳过本账号镜像构建与推送"
+elif [ "${KC_REDEPLOY:-0}" != "1" ] && aws ecr describe-images --repository-name "$KC_ECR_REPO" \
     --image-ids imageTag=latest --region "$REGION" >/dev/null 2>&1; then
   echo "    复用已推送的镜像: $ECR_URI:latest（KC_REDEPLOY=1 可强制重建）"
 else
@@ -261,7 +294,28 @@ fi
 #     【独立栈】维持原逻辑：部署 agentcore-workshop-keycloak 栈。
 KC_EXTERNAL="0"
 KC_BASE_URL=$(_aurora_output KeycloakUrl 2>/dev/null || true)
-if [ -n "$KC_BASE_URL" ] && [ "$KC_BASE_URL" != "None" ]; then
+if [ "$KC_OVERRIDE" = "1" ]; then
+  # 【中央 KC 第三形态】地址/凭证来自讲师发放，本账号零 Keycloak 操作。
+  # base 栈为 CloudLab（有 TasksApiId 输出）时仍复用其预建角色/Lambda/Tasks API
+  # 的栈语义（KC_EXTERNAL=1 的子栈跳过逻辑），但不碰其本地 Keycloak
+  KC_URL="${KC_URL_OVERRIDE%/}"
+  DISCOVERY_URL="$KC_URL/realms/$KC_REALM/.well-known/openid-configuration"
+  echo "    中央 Keycloak（讲师发放）: $KC_URL"
+  BASE_TASKS_API=$(_aurora_output TasksApiId 2>/dev/null || true)
+  if [ -n "$BASE_TASKS_API" ] && [ "$BASE_TASKS_API" != "None" ]; then
+    KC_EXTERNAL="1"
+    PART2_STACK="$AURORA_STACK"
+    TASKS_STACK="$AURORA_STACK"
+  fi
+  echo "    等待中央 Keycloak 在线..."
+  for i in $(seq 1 12); do
+    if ISSUER=$(curl -sf "$DISCOVERY_URL" | python3 -c "import sys,json;print(json.load(sys.stdin)['issuer'])" 2>/dev/null); then
+      break
+    fi
+    [ "$i" -eq 12 ] && { echo "❌ 中央 Keycloak 不可达: $DISCOVERY_URL（确认讲师发放的地址）"; exit 1; }
+    sleep 10
+  done
+elif [ -n "$KC_BASE_URL" ] && [ "$KC_BASE_URL" != "None" ]; then
   KC_EXTERNAL="1"
   # 外部托管形态下 part2/part2-tasks 的角色、调度组、Tasks API 也已随 base 栈
   # 预建（输出键一致）——两个子栈的 cloudformation deploy 全部跳过，
@@ -308,7 +362,7 @@ if [ -n "$KC_BASE_URL" ] && [ "$KC_BASE_URL" != "None" ]; then
   done
 fi
 
-if [ "$KC_EXTERNAL" != "1" ]; then
+if [ "$KC_EXTERNAL" != "1" ] && [ "$KC_OVERRIDE" != "1" ]; then
 # 1c-独立栈. 部署 Keycloak 栈（ECS Fargate + Cloud Map + API Gateway HTTP API + VPC Link）
 #     App Runner 自 2026-04-30 起不接受新客户，改用 Fargate；HTTPS 入口由
 #     API Gateway 提供（免域名的 execute-api 端点，无需 ALB）
@@ -376,7 +430,9 @@ echo "    Keycloak 就绪，issuer: $ISSUER"
 # 外部托管模式：补建 Tasks API 的 JWT authorizer 与各方法路由（幂等）。
 # 这两类资源依赖 Keycloak 在线（authorizer 创建时 API Gateway 会实际校验
 # issuer 的 discovery 端点），无法随 base 栈预建，故在此处收敛。
-if [ "$KC_EXTERNAL" = "1" ]; then
+# 中央 KC 形态下公网 Tasks API 整体弃用（浏览器流量改走门户同源 vite 代理
+# + lambda.invoke，见 web/vite.config.ts），authorizer/路由不再补建
+if [ "$KC_EXTERNAL" = "1" ] && [ "$KC_OVERRIDE" != "1" ]; then
   TASKS_API_ID=$(_aurora_output TasksApiId)
   TASKS_INTEG_ID=$(_aurora_output TasksIntegrationId)
   if [ -n "$TASKS_API_ID" ] && [ "$TASKS_API_ID" != "None" ]; then
@@ -883,12 +939,19 @@ else
 
   # 首轮：函数就绪后补建 HTTP API（路由 + JWT authorizer + 调用许可）
   #（外部托管模式下 API 已随 base 栈预建，无鸡生蛋问题）
-  if [ "$TASKS_API_ENABLED" != "true" ] && [ "$KC_EXTERNAL" != "1" ]; then
+  if [ "$TASKS_API_ENABLED" != "true" ] && [ "$KC_EXTERNAL" != "1" ] && [ "$KC_OVERRIDE" != "1" ]; then
     echo "    函数已就绪，补建 Tasks HTTP API ..."
     _deploy_tasks_stack "true"
   fi
-  TASKS_API_URL=$(_tasks_output ApiEndpoint)
-  echo "    Tasks API: $TASKS_API_URL"
+  if [ "$KC_OVERRIDE" = "1" ]; then
+    # 中央 KC 形态：Tasks API 私有化——前端走门户同源代理（vite middleware
+    # 验签 JWT 后以实例角色 lambda.invoke tasks-api），公网 API 不再使用
+    TASKS_API_URL="/api/tasks"
+    echo "    Tasks API: 门户同源代理 $TASKS_API_URL（公网 API 已弃用）"
+  else
+    TASKS_API_URL=$(_tasks_output ApiEndpoint)
+    echo "    Tasks API: $TASKS_API_URL"
+  fi
   echo "VITE_TASKS_API_URL=$TASKS_API_URL" >> "$PART2_DIR/web/.env.local"
 fi
 

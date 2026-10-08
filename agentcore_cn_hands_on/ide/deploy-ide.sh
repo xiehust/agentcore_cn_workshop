@@ -103,6 +103,13 @@ EXTRA_PARAMS=()
 [ -n "$CODE_SERVER_RPM_URL" ] && EXTRA_PARAMS+=("CodeServerRpmUrl=$CODE_SERVER_RPM_URL")
 [ -n "$ASSET_BASE_URL" ] && EXTRA_PARAMS+=("AssetBaseUrl=$ASSET_BASE_URL")
 EXTRA_PARAMS+=("IdeAlbPort=${IDE_ALB_PORT:-8889}")
+# 中央 Keycloak 活动形态：ENABLE_LOCAL_KC=0 时本栈不跑本地 Keycloak
+#（身份系统集中在已备案账号，学员 .env 配 KC_URL_OVERRIDE）
+if [ "${ENABLE_LOCAL_KC:-1}" = "0" ]; then
+  EXTRA_PARAMS+=("EnableLocalKeycloak=false")
+else
+  EXTRA_PARAMS+=("EnableLocalKeycloak=true")
+fi
 
 # 可选：公网门户证书（自签导入 ACM，按域名幂等复用）
 PORTAL_CERT_DOMAIN="agentcore-workshop-portal.local"
