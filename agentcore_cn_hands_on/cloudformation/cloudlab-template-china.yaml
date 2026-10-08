@@ -359,7 +359,12 @@ Resources:
               - cloudformation:TagResource
               - cloudformation:UntagResource
             Resource:
-              - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/agentcore-workshop-*/*'
+              # 本栈用 ${AWS::StackName} 精确覆盖——栈名是用户变量（控制台建栈
+              # 可取任意名），字面前缀模式会漏（实测：栈名恰为 agentcore-workshop
+              # 时不匹配 agentcore-workshop-*，运行期 DescribeStacks 被拒）。
+              # 第二条无连字符通配覆盖场景 2 创建的两个子栈（agentcore-workshop-part2*）
+              - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+              - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/agentcore-workshop*/*'
           - Sid: CfnValidate
             Effect: Allow
             Action:

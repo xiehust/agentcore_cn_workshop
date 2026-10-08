@@ -185,6 +185,7 @@ echo ""
 echo "✅ 发布完成！参与者账号一键部署（二选一）:"
 echo ""
 echo "   方式 A（控制台）: 下载模板后在 CloudFormation 控制台「上传模板文件」创建栈"
+echo "     ⚠️ 栈名必须以 agentcore-workshop 开头（IDE 角色权限按该前缀收敛），推荐 agentcore-workshop-base"
 echo "     curl -O $CDN/cloudlab-template-china.yaml"
 echo ""
 if [ "$TARGET" = "cn" ]; then
