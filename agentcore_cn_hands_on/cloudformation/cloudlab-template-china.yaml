@@ -2490,7 +2490,12 @@ Resources:
                                   w(lambda: ag.delete_authorizer(ApiId=aid, AuthorizerId=au['AuthorizerId']))
                   except Exception: print(traceback.format_exc())
                   ecr = boto3.client('ecr')
+                  # 中央 Keycloak 形态下 KC 镜像仓库不是本栈创建的（bootstrap
+                  # [4.8/6] 跳过）——同账号可能属于中央 KC 栈，不得误删
+                  keep_kc = event['ResourceProperties'].get('EnableLocalKeycloak') == 'false'
                   for r in (w(lambda: ecr.describe_repositories()['repositories']) or []):
+                      if keep_kc and r['repositoryName'] == 'agentcore-workshop/keycloak':
+                          print('kept ecr repo (central kc form):', r['repositoryName']); continue
                       if r['repositoryName'].startswith(('agentcore-workshop','bedrock-agentcore-')):
                           w(lambda: ecr.delete_repository(repositoryName=r['repositoryName'], force=True))
                   # toolkit 的 CodeBuild 项目与构建源码桶
@@ -2572,6 +2577,7 @@ Resources:
       ServiceToken: !GetAtt CleanupLambdaFunction.Arn
       VpcId: !Ref WorkshopVpc
       StackName: !Ref AWS::StackName
+      EnableLocalKeycloak: !Ref EnableLocalKeycloak
 
 # =============================================================================
 # Outputs
