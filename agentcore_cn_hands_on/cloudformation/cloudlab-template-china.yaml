@@ -1029,6 +1029,11 @@ Resources:
                       {
                         echo 'export BEDROCK_AGENTCORE_CP_ENDPOINT=https://bedrock-agentcore-control.${AWS::Region}.amazonaws.com.cn'
                         echo 'export BEDROCK_AGENTCORE_DP_ENDPOINT=https://bedrock-agentcore.${AWS::Region}.amazonaws.com.cn'
+                        # uv 不读 /etc/pip.conf：direct_code_deploy 构建 ARM64 依赖包
+                        # 走 uv，直连 pypi.org 跨境实测 ~230KB/s（02/03 卡 30 分钟+），
+                        # 必须单独给 uv 配国内镜像（新旧版本变量名都写）
+                        echo 'export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple'
+                        echo 'export UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple'
                       } >> /etc/profile.d/agentcore_env.sh
                     ;; esac
 
