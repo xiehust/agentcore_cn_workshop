@@ -106,6 +106,14 @@ export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>   # 全球区默认 bedrock-ma
 ABSK 前缀的 Bedrock API key；显式配了 `OPENAI_BASE_URL` 则信任成对的 key，
 但指向 localhost/私网 IP 会被直接拒绝——公网 Runtime 访问不到）。
 
+Keycloak 的三种形态（脚本自动选择）：
+
+| 形态 | 触发条件 | 行为 |
+|---|---|---|
+| 中央 KC（`KC_URL_OVERRIDE` 非空） | 账号 execute-api 受 ICP 备案登记限制时，身份系统集中跑在已备案账号 | 本账号零 Keycloak/ecs 操作；凭证（`AGENT_CLIENT_SECRET` + 三用户密码）须与中央 realm 一致、由环境变量注入；公网 Tasks API 弃用，前端走门户同源 `/api/tasks` 代理（vite middleware 验签 JWT 后 lambda.invoke） |
+| 外部托管 | 数仓栈（CloudLab base 单栈）输出 `KeycloakUrl` | 复用 base 栈预建的 Keycloak 基础设施与镜像 |
+| 独立栈 | 其余情况 | 部署 `agentcore-workshop-keycloak` 栈 |
+
 脚本幂等，可重复执行。首次部署约 10 分钟，共 10 步：Keycloak（1）→ 分析链路
 基础设施与数据查询 Lambda（2-3）→ 记忆向量 Lambda 与通用数据面 db Lambda（4）→
 Gateway 与工具注册（5）→ Identity credential provider（6）→ 分析 Agent 到
