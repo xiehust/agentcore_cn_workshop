@@ -61,6 +61,28 @@ stack_output() {  # stack_output <stack> <OutputKey>
     --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text
 }
 
+# 基础栈探测：失败时回显真实错误，区分「栈不存在」与「无权限」。
+# 吞 stderr 的写法会把 AccessDenied（受管账号 SCP 拦运行期调用，实测）
+# 误报成「未找到栈」，排障方向直接带偏
+require_base_stack() {
+  local err
+  if err=$(aws cloudformation describe-stacks --stack-name "$BASE_STACK" \
+      --region "$REGION" 2>&1 >/dev/null); then
+    return 0
+  fi
+  echo "❌ 基础栈 ${BASE_STACK} 探测失败："
+  echo "   $(echo "$err" | head -2)"
+  case "$err" in
+    *"does not exist"*)
+      echo "   → 栈不存在：先在操作员机器执行 ide/deploy-ide.sh；栈名非默认时 export BASE_STACK=<实际栈名>" ;;
+    *AccessDenied*|*"not authorized"*|*"explicit deny"*)
+      echo "   → 当前身份（IDE 实例角色）无权 cloudformation:DescribeStacks。"
+      echo "     受管账号常见原因：SCP 只豁免了建栈者，未覆盖运行期角色——"
+      echo "     请管理员按前缀豁免 arn:${PARTITION}:iam::*:role/agentcore-workshop-*" ;;
+  esac
+  exit 1
+}
+
 # ---- 数仓查询助手（经 VPC 内通用数据面 Lambda，Data API 的替代） ----
 DB_QUERY_FN="agentcore-workshop-db"
 

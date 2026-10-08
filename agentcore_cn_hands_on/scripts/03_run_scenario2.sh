@@ -23,9 +23,7 @@ require_model_key
 
 echo "==> [a] 前置检查..."
 # AURORA_STACK 已由 00_env.sh 指向 CloudLab 单栈（part2 deploy.sh 支持该覆盖）
-if ! aws cloudformation describe-stacks --stack-name "$BASE_STACK" --region "$REGION" >/dev/null 2>&1; then
-  echo "❌ 基础环境未部署（缺少栈 ${BASE_STACK}），请先执行 01_deploy_base.sh"; exit 1
-fi
+require_base_stack
 if [ ! -f "$PART1_DIR/agent/.bedrock_agentcore.yaml" ]; then
   echo "⚠️  未检测到场景 1 的 Agent 部署记录——任务管理模块（步骤 10）会被跳过。"
   echo "   建议先执行 02_run_scenario1.sh；也可继续（门户对话功能不受影响）。"

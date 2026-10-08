@@ -23,11 +23,7 @@ done
 aws sts get-caller-identity --query Account --output text >/dev/null \
   || { echo "❌ AWS 凭证不可用"; exit 1; }
 echo "    区域: ${REGION}（分区 ${PARTITION}）"
-if ! aws cloudformation describe-stacks --stack-name "$BASE_STACK" --region "$REGION" >/dev/null 2>&1; then
-  echo "❌ 未找到 CloudLab 基础栈 ${BASE_STACK}（含 IDE 与数仓基础设施）。"
-  echo "   请先在操作员机器上执行 ide/deploy-ide.sh，或 export BASE_STACK=<实际栈名>"
-  exit 1
-fi
+require_base_stack
 ensure_venv
 echo "    agentcore CLI: $(command -v agentcore)"
 

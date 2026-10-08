@@ -22,9 +22,7 @@ ensure_venv
 require_model_key
 
 # ---- 前置检查：基础环境就绪 ----
-if ! aws cloudformation describe-stacks --stack-name "$BASE_STACK" --region "$REGION" >/dev/null 2>&1; then
-  echo "❌ 基础环境未部署（缺少栈 ${BASE_STACK}），请先执行 01_deploy_base.sh"; exit 1
-fi
+require_base_stack
 POLICY_ARN=$(stack_output "$BASE_STACK" AgentWriterInvokePolicyArn)
 aws lambda get-function --function-name "$WRITER_NAME" --region "$REGION" >/dev/null 2>&1 \
   || { echo "❌ 写库 Lambda $WRITER_NAME 不存在，请先执行 01_deploy_base.sh"; exit 1; }
