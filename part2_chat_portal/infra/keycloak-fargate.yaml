@@ -110,15 +110,17 @@ Resources:
       HealthCheckCustomConfig: { FailureThreshold: 1 }
 
   # ---- ECS on Fargate ----
+  # 集群/日志组名从栈名派生（账号内唯一约束）：同账号可共存多套 KC 栈
+  #（如已备案账号同时跑中央 KC 栈与 CloudLab 模拟栈）。消费方均经栈输出取名，零硬编码
   Cluster:
     Type: AWS::ECS::Cluster
     Properties:
-      ClusterName: agentcore-workshop
+      ClusterName: !Ref AWS::StackName
 
   LogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /ecs/agentcore-workshop-keycloak
+      LogGroupName: !Sub /ecs/${AWS::StackName}
       RetentionInDays: 7
 
   ExecutionRole:
