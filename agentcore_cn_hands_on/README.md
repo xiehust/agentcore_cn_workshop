@@ -46,6 +46,7 @@ bash ~/environment/agentcore_cn_workshop/scripts/01_deploy_base.sh
 export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>   # 全球区
 # 中国区改 OpenAI 兼容三元组：
 # export OPENAI_BASE_URL=<模型网关>/v1 OPENAI_API_KEY=<key> MODEL_ID=<模型名>
+#（推荐改填 workshop 根的 .env 文件——模板 .env.example，脚本自动加载，免逐 Terminal export）
 bash ~/environment/agentcore_cn_workshop/scripts/02_run_scenario1.sh
 bash ~/environment/agentcore_cn_workshop/scripts/03_run_scenario2.sh
 ```

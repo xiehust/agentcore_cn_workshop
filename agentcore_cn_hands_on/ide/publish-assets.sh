@@ -75,6 +75,7 @@ if [ ! -d "$WORKSHOP_DIR" ]; then
     rsync -a --exclude '.venv' --exclude 'node_modules' --exclude '.git' \
       --exclude '.deploy' --exclude '__pycache__' --exclude '.DS_Store' \
       --exclude '._*' --exclude '*.bedrock_agentcore.yaml' --exclude '.env.local' \
+      --exclude '.env' \
       "$ROOT_DIR/" "$STAGE/agentcore_cn_workshop/"
     rsync -a --exclude '.DS_Store' --exclude '._*' \
       "$HANDS_ON_DIR/" "$STAGE/agentcore_cn_hands_on/"
@@ -109,6 +110,7 @@ COPYFILE_DISABLE=1 tar czf "$BUILD/workshop-assets.tar.gz" -C "$PACK_ROOT" \
   --exclude='__pycache__' \
   --exclude='*.bedrock_agentcore.yaml' \
   --exclude='.env.local' \
+  --exclude='.env' \
   agentcore_cn_workshop agentcore_cn_hands_on
 echo "    $(du -h "$BUILD/workshop-assets.tar.gz" | cut -f1) workshop-assets.tar.gz"
 

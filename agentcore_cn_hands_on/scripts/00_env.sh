@@ -38,6 +38,24 @@ if [ ! -d "${WORKSHOP_DIR:-}/part1_data_ingestion" ]; then
   echo "   （可用 export WORKSHOP_DIR=/path/to/agentcore_cn_workshop 显式指定）"
   exit 1
 fi
+
+# ---- 模型配置文件（$WORKSHOP_DIR/.env，模板见 .env.example）----
+# 学员在文件里填一次模型三元组 / MEM0 配置即可，免去逐 Terminal export。
+# 语义：终端已 export 的同名变量优先（本文件只兜底）；含 <占位符> 的
+# 未填写行自动跳过——漏填仍会触发 require_model_key 的 fail-fast 提示
+if [ -f "$WORKSHOP_DIR/.env" ]; then
+  while IFS= read -r _line; do
+    _line="${_line#export }"
+    case "$_line" in ''|\#*) continue ;; esac
+    case "$_line" in *=*) ;; *) continue ;; esac
+    _key="${_line%%=*}"; _val="${_line#*=}"
+    _val="${_val%\"}"; _val="${_val#\"}"; _val="${_val%\'}"; _val="${_val#\'}"
+    case "$_val" in *'<'*'>'*) continue ;; esac
+    case "$_key" in *[!A-Za-z0-9_]*) continue ;; esac
+    [ -n "${!_key:-}" ] || export "$_key=$_val"
+  done < "$WORKSHOP_DIR/.env"
+  unset _line _key _val
+fi
 export WORKSHOP_DIR
 
 # starter-toolkit 0.3.12 起每条 agentcore 命令前会打「Starter Toolkit CLI is
