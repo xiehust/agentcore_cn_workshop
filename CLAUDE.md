@@ -45,7 +45,8 @@ python scripts/local_test.py "..."
 
 # Part 2：部署（依赖 Part 1 的 Aurora 栈；本机需 Docker）
 cd part2_chat_portal && ./scripts/deploy.sh
-# 改了 Keycloak realm/镜像后强制重建
+# 改了 Keycloak realm/镜像后强制重建（维护操作：需 ecs:UpdateService 权限；
+# CloudLab 形态下 realm 镜像与服务副本在建栈 bootstrap 已就绪，学员路径零 ecs 写操作）
 KC_REDEPLOY=1 ./scripts/deploy.sh
 
 # Part 2：前端（deploy.sh 已生成 web/.env.local）

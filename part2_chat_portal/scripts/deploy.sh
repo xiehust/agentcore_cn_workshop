@@ -225,27 +225,34 @@ if ! grep -q '"missing": *\[\]' /tmp/check_tables_out.json; then
 fi
 
 echo "==> [1/10] 部署 Keycloak（ECR + ECS Fargate + API Gateway，首次约需 5-8 分钟）..."
-# 1a. 生成 realm.json（注入机密）并准备构建上下文
-KC_BUILD_DIR="$DEPLOY_DIR/kc-build"
-mkdir -p "$KC_BUILD_DIR"
-cp "$PART2_DIR/infra/keycloak/Dockerfile" "$KC_BUILD_DIR/"
-sed -e "s/__AGENT_CLIENT_SECRET__/$AGENT_CLIENT_SECRET/" \
-    -e "s/__ANALYST_PASSWORD__/$ANALYST_PASSWORD/" \
-    -e "s/__VIVIAN_PASSWORD__/$VIVIAN_PASSWORD/" \
-    -e "s/__MARCO_PASSWORD__/$MARCO_PASSWORD/" \
-    "$PART2_DIR/infra/keycloak/realm-template.json" > "$KC_BUILD_DIR/realm.json"
-
-# 1b. ECR 仓库 + 构建推送
-aws ecr describe-repositories --repository-names "$KC_ECR_REPO" --region "$REGION" >/dev/null 2>&1 \
-  || aws ecr create-repository --repository-name "$KC_ECR_REPO" --region "$REGION" >/dev/null
 ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.$AWS_DOMAIN/$KC_ECR_REPO"
-aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin \
-  "$ACCOUNT_ID.dkr.ecr.$REGION.$AWS_DOMAIN" >/dev/null
-# Fargate 任务定义按 ARM64 运行（便宜且本机可原生构建）；平台显式声明，
-# 在 x86 机器上部署也能交叉构建（本 Dockerfile 无 RUN 步骤）
-docker build -q --platform linux/arm64 -t "$ECR_URI:latest" "$KC_BUILD_DIR"
-docker push -q "$ECR_URI:latest"
-echo "    镜像已推送: $ECR_URI:latest"
+# 镜像已在仓（CloudLab bootstrap 建栈期已渲染构建推送）且非强制重建时跳过——
+# 学员路径零 docker/ecs 写操作；改过 realm-template 用 KC_REDEPLOY=1 重建
+if [ "${KC_REDEPLOY:-0}" != "1" ] && aws ecr describe-images --repository-name "$KC_ECR_REPO" \
+    --image-ids imageTag=latest --region "$REGION" >/dev/null 2>&1; then
+  echo "    复用已推送的镜像: $ECR_URI:latest（KC_REDEPLOY=1 可强制重建）"
+else
+  # 1a. 生成 realm.json（注入机密）并准备构建上下文
+  KC_BUILD_DIR="$DEPLOY_DIR/kc-build"
+  mkdir -p "$KC_BUILD_DIR"
+  cp "$PART2_DIR/infra/keycloak/Dockerfile" "$KC_BUILD_DIR/"
+  sed -e "s/__AGENT_CLIENT_SECRET__/$AGENT_CLIENT_SECRET/" \
+      -e "s/__ANALYST_PASSWORD__/$ANALYST_PASSWORD/" \
+      -e "s/__VIVIAN_PASSWORD__/$VIVIAN_PASSWORD/" \
+      -e "s/__MARCO_PASSWORD__/$MARCO_PASSWORD/" \
+      "$PART2_DIR/infra/keycloak/realm-template.json" > "$KC_BUILD_DIR/realm.json"
+
+  # 1b. ECR 仓库 + 构建推送
+  aws ecr describe-repositories --repository-names "$KC_ECR_REPO" --region "$REGION" >/dev/null 2>&1 \
+    || aws ecr create-repository --repository-name "$KC_ECR_REPO" --region "$REGION" >/dev/null
+  aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin \
+    "$ACCOUNT_ID.dkr.ecr.$REGION.$AWS_DOMAIN" >/dev/null
+  # Fargate 任务定义按 ARM64 运行（便宜且本机可原生构建）；平台显式声明，
+  # 在 x86 机器上部署也能交叉构建（本 Dockerfile 无 RUN 步骤）
+  docker build -q --platform linux/arm64 -t "$ECR_URI:latest" "$KC_BUILD_DIR"
+  docker push -q "$ECR_URI:latest"
+  echo "    镜像已推送: $ECR_URI:latest"
+fi
 
 # 1c. Keycloak 基础设施，两种形态自动选择：
 #     【外部托管】数仓栈（AURORA_STACK，如 CloudLab base 单栈）已预建 Keycloak
@@ -279,10 +286,18 @@ if [ -n "$KC_BASE_URL" ] && [ "$KC_BASE_URL" != "None" ]; then
       echo "KC_ADMIN_PASSWORD=$KC_ADMIN_PASSWORD" >> "$SECRETS_FILE"
     fi
   fi
-  # 镜像刚推送：拉起到 1 副本并强制换新任务（首次拉起与 KC_REDEPLOY 同一路径）
-  aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
-    --desired-count 1 --force-new-deployment --region "$REGION" >/dev/null
-  aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$REGION"
+  # 副本已在跑（CloudLab 建栈即 DesiredCount=1）且非强制重建时不碰 ecs——
+  # 学员路径零 ecs:UpdateService（受管账号 SCP 常拦该 action，实测）；
+  # KC_REDEPLOY=1 换新镜像时才需要（维护操作，需 ecs 权限/豁免身份）
+  KC_RUNNING=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+    --region "$REGION" --query 'services[0].runningCount' --output text 2>/dev/null || echo 0)
+  if [ "${KC_REDEPLOY:-0}" != "1" ] && [ "${KC_RUNNING:-0}" -ge 1 ] 2>/dev/null; then
+    echo "    Keycloak 服务已在运行（runningCount=$KC_RUNNING），跳过 ecs update-service"
+  else
+    aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+      --desired-count 1 --force-new-deployment --region "$REGION" >/dev/null
+    aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$REGION"
+  fi
   echo "    Keycloak 地址: $KC_URL，等待启动完成..."
   for i in $(seq 1 40); do
     if ISSUER=$(curl -sf "$DISCOVERY_URL" | python3 -c "import sys,json;print(json.load(sys.stdin)['issuer'])" 2>/dev/null); then

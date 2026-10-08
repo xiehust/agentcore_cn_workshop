@@ -301,6 +301,11 @@ Resources:
                   - !Ref IdePassword
                   # 场景 2 外部托管模式要把 Keycloak 管理员密码同步进 secrets.env
                   - !Ref KcAdminSecret
+                  # bootstrap 渲染 realm / 预写 secrets.env 用的 4 个动态值
+                  - !Ref KcAgentClientSecret
+                  - !Ref KcAnalystPassword
+                  - !Ref KcVivianPassword
+                  - !Ref KcMarcoPassword
               - Sid: ReadWorkshopAssets
                 Effect: Allow
                 Action:
@@ -934,16 +939,61 @@ Resources:
                     '
 
                     # 中国区：预载 Keycloak 基础镜像（quay.io 区内极慢/不可达；本地已有
-                    # 该 tag 时场景 2 的 docker build 走本地缓存，不再访问 quay.io）
+                    # 该 tag 时下方 docker build 走本地缓存，不再访问 quay.io）
                     case "${AWS::Region}" in cn-*)
                       echo "=== [4.7/6] keycloak base image (cn) ==="
                       if ! docker image inspect quay.io/keycloak/keycloak:26.3 >/dev/null 2>&1; then
                         curl -fsSL --retry 5 --retry-delay 3 "${AssetBaseUrl}/tools/keycloak-26.3-arm64.tar.gz" -o /tmp/kc.tar.gz \
                           && gunzip -c /tmp/kc.tar.gz | docker load \
                           && rm -f /tmp/kc.tar.gz \
-                          || echo "WARN: keycloak 镜像预载失败（不阻塞建栈；场景 2 将直接拉 quay.io）"
+                          || echo "WARN: keycloak 镜像预载失败（build 将回退直拉 quay.io，国内可能极慢）"
                       fi
                     ;; esac
+
+                    # Keycloak realm 渲染 + 镜像构建推送（建栈即就绪）：
+                    # KcService 以 DesiredCount=1 创建并 DependsOn 本引导，镜像必须
+                    # 先行入仓——学员路径从此不需要 ecs:UpdateService（受管账号 SCP
+                    # 常拦该 action，实测）。本段失败即建栈失败（否则服务卡死更难排查）
+                    echo "=== [4.8/6] keycloak realm + image（渲染/构建/推送/预写凭证） ==="
+                    KC_SRC=/home/ec2-user/environment/agentcore_cn_workshop/part2_chat_portal
+                    _sec() { aws secretsmanager get-secret-value --secret-id "$1" \
+                      --region ${AWS::Region} --query SecretString --output text | jq -r "$2"; }
+                    AGENT_CLIENT_SECRET=$(_sec '${KcAgentClientSecret}' .value)
+                    ANALYST_PASSWORD=$(_sec '${KcAnalystPassword}' .value)
+                    VIVIAN_PASSWORD=$(_sec '${KcVivianPassword}' .value)
+                    MARCO_PASSWORD=$(_sec '${KcMarcoPassword}' .value)
+                    KC_ADMIN_PASSWORD=$(_sec '${KcAdminSecret}' .password)
+                    KC_BUILD_DIR=$(mktemp -d)
+                    cp "$KC_SRC/infra/keycloak/Dockerfile" "$KC_BUILD_DIR/"
+                    sed -e "s/__AGENT_CLIENT_SECRET__/$AGENT_CLIENT_SECRET/" \
+                        -e "s/__ANALYST_PASSWORD__/$ANALYST_PASSWORD/" \
+                        -e "s/__VIVIAN_PASSWORD__/$VIVIAN_PASSWORD/" \
+                        -e "s/__MARCO_PASSWORD__/$MARCO_PASSWORD/" \
+                        "$KC_SRC/infra/keycloak/realm-template.json" > "$KC_BUILD_DIR/realm.json"
+                    ECR_URI="${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/agentcore-workshop/keycloak"
+                    aws ecr describe-repositories --repository-names agentcore-workshop/keycloak \
+                        --region ${AWS::Region} >/dev/null 2>&1 \
+                      || aws ecr create-repository --repository-name agentcore-workshop/keycloak \
+                        --region ${AWS::Region} >/dev/null
+                    aws ecr get-login-password --region ${AWS::Region} \
+                      | docker login --username AWS --password-stdin "${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}"
+                    docker build -q --platform linux/arm64 -t "$ECR_URI:latest" "$KC_BUILD_DIR"
+                    docker push -q "$ECR_URI:latest"
+                    rm -rf "$KC_BUILD_DIR"
+                    # 预写 part2 的 .deploy/secrets.env：与 realm 烧入值同源，
+                    # deploy.sh 的「已存在则复用」逻辑与手册 grep 密码命令零改动
+                    DEPLOY_DIR="$KC_SRC/.deploy"
+                    mkdir -p "$DEPLOY_DIR"
+                    tee "$DEPLOY_DIR/secrets.env" >/dev/null <<KCSECRETS
+                    KC_ADMIN_PASSWORD=$KC_ADMIN_PASSWORD
+                    AGENT_CLIENT_SECRET=$AGENT_CLIENT_SECRET
+                    ANALYST_PASSWORD=$ANALYST_PASSWORD
+                    VIVIAN_PASSWORD=$VIVIAN_PASSWORD
+                    MARCO_PASSWORD=$MARCO_PASSWORD
+                    KCSECRETS
+                    chmod 600 "$DEPLOY_DIR/secrets.env"
+                    chown -R ec2-user:ec2-user "$DEPLOY_DIR"
+                    echo "    镜像已推送: $ECR_URI:latest；secrets.env 已预写"
 
                     echo "=== [5/6] shell env ==="
                     tee /etc/profile.d/agentcore_env.sh <<'EOF'
@@ -1705,7 +1755,9 @@ Resources:
   #     移植自 part2 的 keycloak-fargate.yaml：小型公有 VPC + Cloud Map(SRV) +
   #     ECS Fargate + API Gateway HTTP API(免域名 HTTPS 入口)。
   #     关键差异：
-  #     - 服务初始 DesiredCount=0（镜像由场景 2 构建推送后再拉起到 1 副本）；
+  #     - 服务 DesiredCount=1 建栈即就绪：realm 镜像由 IDE bootstrap 渲染构建
+  #       并推送 ECR（KcService DependsOn bootstrap），4 个 realm 动态值为
+  #       栈管 Secret——学员路径不再需要 ecs:UpdateService（SCP 常拦）；
   #     - 管理员密码生成在 Secrets Manager（输出 ARN，场景 2 回写 secrets.env）；
   #     - KC_HOSTNAME 同栈直接推导注入，消灭原独立栈的两阶段修正；
   #     - ECR 仓库不入栈：任务定义按 URI 引用即可，仓库由场景 2 脚本按需创建
@@ -1723,6 +1775,63 @@ Resources:
         IncludeSpace: false
         PasswordLength: 24
         SecretStringTemplate: '{"password":""}'
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  # ---- Keycloak realm 的 4 个动态值（栈管生成，bootstrap 渲染 realm 用）----
+  # client secret 与三个门户用户密码在建栈期生成，bootstrap 据此渲染 realm、
+  # 构建推送镜像并预写 part2 的 .deploy/secrets.env——KcService 因而可以
+  # DesiredCount=1 建栈即就绪，学员路径不再需要 ecs:UpdateService
+  #（受管账号 SCP 常拦该 action，实测）。栈管 Secret 随删栈自动清理。
+  KcAgentClientSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-kc-agent-client-secret'
+      GenerateSecretString:
+        ExcludePunctuation: true
+        IncludeSpace: false
+        PasswordLength: 48
+        GenerateStringKey: value
+        SecretStringTemplate: '{"value":""}'
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  KcAnalystPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-kc-analyst-password'
+      GenerateSecretString:
+        ExcludePunctuation: true
+        IncludeSpace: false
+        PasswordLength: 16
+        GenerateStringKey: value
+        SecretStringTemplate: '{"value":""}'
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  KcVivianPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-kc-vivian-password'
+      GenerateSecretString:
+        ExcludePunctuation: true
+        IncludeSpace: false
+        PasswordLength: 16
+        GenerateStringKey: value
+        SecretStringTemplate: '{"value":""}'
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  KcMarcoPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-kc-marco-password'
+      GenerateSecretString:
+        ExcludePunctuation: true
+        IncludeSpace: false
+        PasswordLength: 16
+        GenerateStringKey: value
+        SecretStringTemplate: '{"value":""}'
     UpdateReplacePolicy: Delete
     DeletionPolicy: Delete
 
@@ -1872,13 +1981,15 @@ Resources:
 
   KcService:
     Type: AWS::ECS::Service
-    DependsOn: KcDefaultRoute
+    # DependsOn bootstrap：realm 镜像由 IDE 引导构建推送，先入仓再起副本
+    DependsOn: [KcDefaultRoute, BootstrapCustomResource]
     Properties:
       # 不固定 ServiceName（服务发现配置变更触发替换时避免撞名）；
-      # DesiredCount=0：镜像在场景 2 才构建推送，届时脚本拉起到 1 副本
+      # DesiredCount=1：镜像在 bootstrap 已就位，建栈即拉起（学员路径
+      # 不再需要 ecs:UpdateService）
       Cluster: !Ref KcCluster
       LaunchType: FARGATE
-      DesiredCount: 0
+      DesiredCount: 1
       TaskDefinition: !Ref KcTaskDefinition
       NetworkConfiguration:
         AwsvpcConfiguration:

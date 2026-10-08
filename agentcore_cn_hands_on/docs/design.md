@@ -161,3 +161,24 @@ CloudFront 必须绑定已备案域名，故不采用 CloudFront 方案。
     安全组、EventBridge Scheduler、AgentCore Runtime/Browser/Gateway/
     Identity/Code Interpreter（托管 Memory 未上线，本项目用自建 mem0
     不受影响；原生 Bedrock 端点不存在，模型必须走 OpenAI 兼容网关）。
+
+### Keycloak 建栈即就绪（消除学员路径的 ecs:UpdateService，2026-10）
+
+受管账号 SCP 显式 Deny `ecs:UpdateService`（他账号实测，豁免只给建栈者），
+原「服务 0 副本建栈、03 推完镜像拉到 1 副本」的形态在学员路径上必炸。改为：
+
+- realm 的 4 个动态值（analysis-agent client secret + 三个门户用户密码）
+  从 deploy.sh 运行期生成改为**栈管 Secret**（GenerateSecretString）——
+  删栈自动清理、天然幂等、IDE 角色只需 4 个精确 ARN 的 GetSecretValue；
+- IDE bootstrap 新增 [4.8/6]：读 Secret → sed 渲染 realm →
+  docker build（基镜像 cn 已预载）→ push ECR → **预写
+  part2 的 .deploy/secrets.env**（与 realm 烧入值同源，600 权限）——
+  deploy.sh「secrets.env 已存在则复用」与手册 grep 密码命令零改动；
+- `KcService` DesiredCount 0→1 并 `DependsOn` bootstrap（CFN 对 ECS
+  服务创建会等稳定，镜像先行入仓是硬前置，故本段失败即建栈失败）；
+- deploy.sh：ECR 已有 latest 镜像则跳过渲染/构建/推送；服务
+  runningCount≥1 则跳过 `ecs update-service`（只保留 discovery 在线等待）。
+  `KC_REDEPLOY=1`（换 realm）降级为维护操作，需 ecs 权限/豁免身份。
+
+Tasks API 的 JWT authorizer 仍留在 03（create-authorizer 时 API Gateway
+会实际校验 issuer discovery，Keycloak 任务在建栈末段才在线，无法前置）。
