@@ -308,6 +308,49 @@ except Exception as e:  # mem0ai 未安装 / 版本不兼容
     logger.warning("[mem0] %s，长期记忆禁用", _disabled_reason)
 
 
+# 事实提取范围约束（替换 mem0 默认提取 prompt）。默认 prompt 是通用「个人
+# 信息管理员」，few-shot 明确示范把行为/请求语句当事实存（"Looking for a
+# restaurant"、"Had a meeting with John"）——在本门户表现为：每轮业务提问
+# （"看下选品漏斗"）都被提成记忆写库，记忆面板被一次性问答淹没（实测）。
+# 这里收窄为：只沉淀跨会话仍然成立的分析师偏好/身份/长期规则，一次性业务
+# 问答与数据结论一律不存。mem0 2.0.x 的键名是 custom_fact_extraction_prompt
+# （v3 起改名 custom_instructions，升级跨 2.1 时注意同步）；该 prompt 作为
+# system prompt 使用，本轮对话以 "Input:\n user: ...\n assistant: ..." 形态
+# 作为 user 消息送入，few-shot 必须用 Input/Output 对的形状。
+FACT_EXTRACTION_PROMPT = """你是跨境电商选品分析门户的用户记忆提取器。你的唯一任务：从对话中提取「跨会话仍然成立、值得长期记住」的分析师个人偏好与事实，用于未来会话的个性化。
+
+只提取以下几类（且仅当用户自己明确陈述时）：
+1. 分析偏好：币种与汇率口径、关注的站点或市场、月销/价格等门槛偏好、结论呈现偏好（注明数据来源、附汇率等）
+2. 身份与职责：岗位、负责的品类或业务线
+3. 长期规则：用户要求今后一直遵守的约定（黑名单、合规口径、风格要求）
+4. 用户明确说「记住……」的内容
+
+一律不提取（返回空列表）：
+- 一次性业务问题或查询请求（如「看下最近30天的选品漏斗」「产品点最高的5个商品是什么」）
+- 查询结果、数据、商品信息、分析结论——assistant 消息里的一切内容都不是用户事实
+- 只对本轮生效的指令（如「这次用表格展示」；用户说「以后都」才算长期规则）
+- 问候、闲聊、对系统的抱怨
+
+输出严格 JSON：{"facts": ["..."]}；没有可提取内容时输出 {"facts": []}。
+事实用用户输入的语言记录，每条独立、简洁、可脱离本轮对话理解。
+
+示例：
+Input: user: 看下最近30天的选品漏斗
+Output: {"facts": []}
+Input: user: 候选池里产品点最高的5个商品是什么？给出价格、月销和预估售价
+Output: {"facts": []}
+Input: user: 第一名的商品为什么判 PASS？
+Output: {"facts": []}
+Input: user: 记住我的分析偏好：金额一律换算成人民币，我只关注英国站
+Output: {"facts": ["金额一律换算成人民币", "只关注英国站"]}
+Input: user: 我是风控合规方向的分析师，主要审核选品的合规风险
+Output: {"facts": ["是风控合规方向的分析师", "主要审核选品的合规风险"]}
+Input: user: 以后给我的结论都要注明数据来源和取数时间
+Output: {"facts": ["结论需注明数据来源和取数时间"]}
+
+只输出 JSON 对象本身，不要任何其他文字或代码块标记。"""
+
+
 def _build_config() -> dict:
     """组装 mem0 配置。LLM 与 embedding 都走 OpenAI 兼容端点（显式传
     api_key/base_url，避开被主模型占用的 OPENAI_* 环境变量 fallback）。"""
@@ -338,6 +381,8 @@ def _build_config() -> dict:
             },
         },
         "embedder": {"provider": "openai", "config": embedder_cfg},
+        # 收窄提取范围：只沉淀长期偏好/身份/规则，业务问答不进记忆（见常量注释）
+        "custom_fact_extraction_prompt": FACT_EXTRACTION_PROMPT,
         "vector_store": {
             "provider": "aurora_lambda",
             "config": {

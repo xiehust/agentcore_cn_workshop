@@ -33,6 +33,14 @@
 - **为什么自动模式而非工具模式**：门户是聊天产品形态，记忆应当无感生效；
   代价是每轮多一次 LLM 提取调用。remember/recall 工具模式（travel agent
   的选择）适合演示记忆操作本身，此处不取。
+- **为什么替换事实提取 prompt**（`custom_fact_extraction_prompt`，常量
+  `FACT_EXTRACTION_PROMPT`）：mem0 默认提取 prompt 是通用「个人信息管理员」，
+  few-shot 示范把行为/请求语句当事实（"Looking for a restaurant..."）——
+  在本门户表现为每轮业务提问（"看下选品漏斗"）都被提成记忆写库，面板被
+  一次性问答淹没（实测）。收窄为只沉淀跨会话仍成立的分析偏好/身份/长期
+  规则/明确「记住」指令，业务问答与数据结论返回空 facts。注意键名是
+  mem0 2.0.x（v2）的；v3 起改名 `custom_instructions`，升级跨 2.1 时同步。
+  `seed_memories.py` 直插向量库（`infer=False` 语义），不经提取，不受影响。
 - **为什么会话级 recall（只在首轮检索一次）**：记忆注入 system prompt；
   每轮都 recall 会让 system prompt 逐轮变化，主模型 prompt cache 前缀
   全部失效。首轮检索后缓存整个会话（含空结果），同一会话内 system prompt

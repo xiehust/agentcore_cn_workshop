@@ -296,6 +296,11 @@ Runtime（分析 Agent + mem0，公网）                VPC 内
   交给 mem0 做 LLM 事实提取（与既有记忆去重/合并）。SSE 先正常关闭、输入框立即
   解锁；后台任务用 `HealthyBusy` 保证 microVM 不会提前冻结。提取最坏
   `MEM0_ADD_TIMEOUT`（默认 20s），连续失败自动熔断。
+- **只沉淀长期事实**：提取范围由自定义 prompt 收窄（`memory_backend.py`
+  的 `FACT_EXTRACTION_PROMPT`）——只记跨会话仍成立的分析偏好/身份/长期
+  规则/明确「记住」的内容；一次性业务提问（"看下选品漏斗"）与查询结果
+  不会写入记忆（mem0 默认提取 prompt 会把这类请求语句当事实存，面板会被
+  问答噪音淹没）。
 - **永不阻断对话**：mem0 未配置/Lambda 不可达/数据面瞬时故障/提取失败，只降级为
   "本轮或本进程无记忆"，日志（CloudWatch，前缀 `[mem0]`）可查原因。
 
