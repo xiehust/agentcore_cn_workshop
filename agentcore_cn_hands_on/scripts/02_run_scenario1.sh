@@ -68,7 +68,6 @@ if [ -z "$BROWSER_ID" ] || [ "$BROWSER_ID" = "None" ]; then
       --description "Workshop browser with Web Bot Auth" \
       --network-configuration '{"networkMode": "PUBLIC"}' \
       --execution-role-arn "$BROWSER_ROLE_ARN" \
-      --browser-signing '{"enabled": true}' \
       --query browserId --output text 2>/tmp/create_browser_err); then
       break
     fi
