@@ -12,7 +12,7 @@
 #     IDE_INSTANCE_TYPE   实例类型（默认 t3.large）
 #     IDE_ALB_PORT        IDE 入口端口（默认 8889，中国区免备案必须非标准端口；
 #                         全球区可传 80 兼容只放行 80/443 出站的办公网络）
-#     ASSET_SOURCE        资产分发源 cn|mirror（缺省按区域：cn-* → cn，其余 → mirror）。
+#     ASSET_SOURCE        资产分发源 cn|mirror（缺省 cn，所有区域统一；mirror 为备用，显式切换）。
 #                         cn     = 中国区 CDN（备案别名域，HTTP）
 #                         mirror = cn CDN 在全球区账号的全量镜像（CloudFront 默认域名，HTTPS）
 #                         两者目录一致（含 tools/），一个变量把 AssetBaseUrl 与 code-server
@@ -41,12 +41,10 @@ CODE_SERVER_RPM_URL="${CODE_SERVER_RPM_URL:-}"
 ASSET_BASE_URL="${ASSET_BASE_URL:-}"
 CODE_SERVER_VERSION="${CODE_SERVER_VERSION:-4.91.1}"
 
-# 资产就近分发：中国区默认区内 CDN（全球区 CloudFront 跨境慢，曾致建栈超时回滚），
-# 全球区默认全球镜像。默认值指向维护者私有分发环境，换环境用 ASSET_BASE_URL 覆盖
-ASSET_SOURCE="${ASSET_SOURCE:-}"
-if [ -z "$ASSET_SOURCE" ]; then
-  case "$REGION" in cn-*) ASSET_SOURCE=cn ;; *) ASSET_SOURCE=mirror ;; esac
-fi
+# 资产分发源：所有区域默认中国区 CDN（与模板 AssetBaseUrl 默认值一致；中国区建栈
+# 走区外 CDN 跨境慢，曾致超时回滚）。mirror 内容一致，作为备用与后续切换目标。
+# 默认值指向维护者私有分发环境，换环境用 ASSET_BASE_URL 覆盖
+ASSET_SOURCE="${ASSET_SOURCE:-cn}"
 case "$ASSET_SOURCE" in
   cn)     DEFAULT_ASSET_BASE_URL="http://cf.chenxqdu.people.a2z.org.cn/agentcore-workshop"
           SYNC_CHANNEL=mirror ;;

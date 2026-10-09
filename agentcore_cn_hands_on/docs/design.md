@@ -147,7 +147,8 @@ CloudFront 必须绑定已备案域名，故不采用 CloudFront 方案。
   专用私有桶（全量阻止公开访问）+ CloudFront 默认域名 + OAC 回源（桶策略
   只认该分配），目录与 cn 一一对应（含 tools/，18 个对象逐个比对大小与 MD5）。
   `deploy-ide.sh` 的 `ASSET_SOURCE=cn|mirror` 成对切换 `AssetBaseUrl` 与
-  code-server 地址（缺省按区域就近）；`publish-assets.sh` 一次构建多通道发布，
+  code-server 地址（缺省 cn——活动期间所有区域统一用中国区 CDN，与模板默认值
+  一致；mirror 作备用与后续切换目标）；`publish-assets.sh` 一次构建多通道发布，
   本次消费的通道为必需、另一通道附带同步（失败只告警，不阻断没有对侧凭证的
   协作者）。早期 `global` 通道属另一维护者环境，保留不动。踩坑：新桶的
   S3 全局端点 DNS 未传播时 presigned PUT 返回 307，而 `curl -f` 不把 3xx
@@ -226,14 +227,20 @@ Tasks API 的 JWT authorizer 仍留在 03（create-authorizer 时 API Gateway
 
 - **都扛得住，瓶颈都是单机 CPU**：两者在 100 并发下零错误，但同步突发时
   CPU 打满排队。中央 KC 1 vCPU 时密码登录约 11 次/秒（100 人同一秒登录每人
-  等约 9 秒）；网关代理是单 worker LiteLLM 跑在 1 vCPU 上，逐秒采样持续 100%，
+  等约 9 秒，扩到 2 vCPU 后约 4~6 秒）；网关代理是单 worker LiteLLM 跑在 1 vCPU 上，逐秒采样持续 100%，
   首包 p90 从 1.3s 涨到 6~7s。Bedrock 后端配额余量大（kimi-k3 2000 万 TPM、
   零 throttle），不是瓶颈。
 - **扩容只能纵向**：中央 KC 用 H2 内嵌存储（realm 烧进镜像），多副本会各自
   签发不同密钥——`keycloak-fargate.yaml` 加 `TaskCpu`/`TaskMemory` 参数
-  （默认值不变，现网零影响），活动当天提到 2 vCPU / 4GB。网关代理换多核并
-  开多 worker；代理无弹性 IP 且回源写实例公网 DNS，停机换规格前须先绑 EIP
-  并同步改回源。
+  （默认值不变，独立栈形态零影响）。中央 KC 已提到 2 vCPU / 4GB 并复测：密码
+  登录 11 → 21 次/秒、p99 10.7 → 5.6s，登录页 33 → 78 次/秒，吞吐随 vCPU 近似
+  线性；discovery/JWKS 不随 CPU 变化（网络受限）。网关代理换多核并开多 worker；
+  代理无弹性 IP 且回源写实例公网 DNS，停机换规格前须先绑 EIP 并同步改回源。
+- **任务替换 = 签名密钥轮换**：realm 导入文件不含密钥材料，每个新任务启动时
+  重新生成 RSA 签名密钥（实测扩容前后 JWKS kid 不同）。改规格、任务重启都会
+  让已签发 token 全部失效、在线用户需重新登录；且服务默认先起新再停旧，切换
+  期间两个任务（两套密钥）短暂并存。演示场景接受，故扩容只在无人使用时执行；
+  若要求零感知，需在 realm 里烧入固定密钥（同一密钥材料要妥善保管）。
 - **实际负载远低于压测形态**：Runtime/Gateway authorizer 与门户代理对 JWKS
   有缓存，Identity 对 M2M token 有缓存，登录只发生在开场与换账号时；压测
   闭环打满 100 并发是刻意取的上界。

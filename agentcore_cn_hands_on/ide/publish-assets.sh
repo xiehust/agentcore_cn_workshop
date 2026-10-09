@@ -11,10 +11,10 @@
 #   cloudlab-template-china.yaml      模板本体（供分发：curl -O 后即可部署）
 #
 # 通道:
-#   cn      中国区 CDN（备案别名域 + 区内桶）。中国区部署默认消费
+#   cn      中国区 CDN（备案别名域 + 区内桶）。deploy-ide.sh 所有区域默认消费
 #   mirror  cn 通道在全球区账号的全量镜像（CloudFront 默认域名 + 专用私有桶，
-#           OAC 回源，目录结构与 cn 一致含 tools/）。全球区部署默认消费；
-#           中国区部署可用 deploy-ide.sh 的 ASSET_SOURCE=mirror 切换过来
+#           OAC 回源，目录结构与 cn 一致含 tools/）。备用：deploy-ide.sh 的
+#           ASSET_SOURCE=mirror 显式切换过来
 #   global  早期全球区通道（另一维护者环境，根前缀、无 tools/），保留兼容
 #
 # 注意：cn / mirror 通道还依赖三个大文件工具资产（tools/awscli-exe-linux-x86_64.zip、

@@ -19,9 +19,10 @@ Parameters:
     Type: String
     Default: ""
     Description: 可选。API Gateway 未传 X-Forwarded-Proto 导致 issuer 非 https 时，设为门户完整 URL 强制修正
-  # 单副本（H2 内嵌存储不能多副本）只能纵向扩容。压测实测 1 vCPU 时登录类请求
-  # CPU 打满：100 人同时登录 password grant ~11 次/秒、每人排队 8~11 秒（零失败）；
-  # 集中活动建议活动当天提到 2048/4096
+  # 单副本（H2 内嵌存储不能多副本）只能纵向扩容。100 并发实测（零失败）：
+  # password grant 1024 → ~11 次/秒、p99 10.7s；2048 → ~21 次/秒、p99 5.6s（近似线性）。
+  # 集中活动建议 2048/4096。改规格会替换任务；realm 不含密钥材料，新任务重新生成
+  # 签名密钥，已签发 token 全部失效，在线用户需重新登录
   TaskCpu:
     Type: String
     Default: "1024"

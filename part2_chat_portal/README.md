@@ -116,8 +116,10 @@ Keycloak 的三种形态（脚本自动选择）：
 
 中央 KC 与独立栈都用 `infra/keycloak-fargate.yaml`（集群/日志组名随栈名派生，
 同账号可共存多套）。单副本（H2 内嵌存储）只能纵向扩容：`TaskCpu`/`TaskMemory`
-参数默认 1 vCPU / 2GB，100 人集中活动建议提到 2048/4096（压测数据见
-`agentcore_cn_hands_on/运行手册.md` 第 9 章）。
+参数默认 1 vCPU / 2GB，100 人集中活动建议 2048/4096（中央 KC 已按此运行，压测
+数据见 `agentcore_cn_hands_on/运行手册.md` 第 9 章）。改规格会替换任务并重新生成
+签名密钥（realm 不含密钥材料），已签发 token 失效、在线用户需重新登录，要在无人
+使用时执行。
 
 脚本幂等，可重复执行。首次部署约 10 分钟，共 10 步：Keycloak（1）→ 分析链路
 基础设施与数据查询 Lambda（2-3）→ 记忆向量 Lambda 与通用数据面 db Lambda（4）→
