@@ -229,13 +229,17 @@ Tasks API 的 JWT authorizer 仍留在 03（create-authorizer 时 API Gateway
   CPU 打满排队。中央 KC 1 vCPU 时密码登录约 11 次/秒（100 人同一秒登录每人
   等约 9 秒，扩到 2 vCPU 后约 4~6 秒）；网关代理是单 worker LiteLLM 跑在 1 vCPU 上，逐秒采样持续 100%，
   首包 p90 从 1.3s 涨到 6~7s。Bedrock 后端配额余量大（kimi-k3 2000 万 TPM、
-  零 throttle），不是瓶颈。
+  零 throttle），不是瓶颈。两者均已扩容（见下条）。
 - **扩容只能纵向**：中央 KC 用 H2 内嵌存储（realm 烧进镜像），多副本会各自
   签发不同密钥——`keycloak-fargate.yaml` 加 `TaskCpu`/`TaskMemory` 参数
   （默认值不变，独立栈形态零影响）。中央 KC 已提到 2 vCPU / 4GB 并复测：密码
   登录 11 → 21 次/秒、p99 10.7 → 5.6s，登录页 33 → 78 次/秒，吞吐随 vCPU 近似
-  线性；discovery/JWKS 不随 CPU 变化（网络受限）。网关代理换多核并开多 worker；
-  代理无弹性 IP 且回源写实例公网 DNS，停机换规格前须先绑 EIP 并同步改回源。
+  线性；discovery/JWKS 不随 CPU 变化（网络受限）。网关代理（与中央 KC 不同，
+  LiteLLM 无状态、keys/spend 在 Postgres）可开多 worker：已换 4 vCPU / 16GB 并
+  `--num_workers 4`，复测 100 并发首包 p90 6.2 → 0.94s、长上下文 7.5 → 1.1s，
+  吞吐约翻倍、embedding 152 → 376 次/秒，CPU 峰值约 84%。代理原先没有弹性 IP、
+  CloudFront 回源写的是实例公网 DNS，停机换规格会换 IP——扩容时先绑弹性 IP 并在
+  同一停机窗口改回源（实测停机约 70 秒，含容器重建共约 2 分钟不可用）。
 - **任务替换 = 签名密钥轮换**：realm 导入文件不含密钥材料，每个新任务启动时
   重新生成 RSA 签名密钥（实测扩容前后 JWKS kid 不同）。改规格、任务重启都会
   让已签发 token 全部失效、在线用户需重新登录；且服务默认先起新再停旧，切换
