@@ -152,11 +152,14 @@ Conditions:
 Resources:
 
   # TrialUseOnlyRole created by Cloudlab for user lab access, please do not modify
+  # 角色名按栈名加前缀，保证每栈唯一：CloudLab 账号里 cn-openclaw-workshop 等
+  # 其它栈已占用固定名 TrialUseOnly-ContentGenerated...，同账号 IAM 角色名全局
+  # 唯一会撞 "already exists in stack"。StackName 前缀后仍 < IAM 64 字符上限。
   TrialUseOnlyRole:
     Type: AWS::IAM::Role
     DeletionPolicy: Delete
     Properties:
-      RoleName: TrialUseOnly-ContentGeneratedByGenAIDoesNotRepresentViewsOfAWS
+      RoleName: !Sub "${AWS::StackName}-TrialUseOnlyRole"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
