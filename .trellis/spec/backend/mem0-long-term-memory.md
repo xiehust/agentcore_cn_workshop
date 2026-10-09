@@ -33,13 +33,19 @@
 - **为什么自动模式而非工具模式**：门户是聊天产品形态，记忆应当无感生效；
   代价是每轮多一次 LLM 提取调用。remember/recall 工具模式（travel agent
   的选择）适合演示记忆操作本身，此处不取。
-- **为什么替换事实提取 prompt**（`custom_fact_extraction_prompt`，常量
-  `FACT_EXTRACTION_PROMPT`）：mem0 默认提取 prompt 是通用「个人信息管理员」，
-  few-shot 示范把行为/请求语句当事实（"Looking for a restaurant..."）——
-  在本门户表现为每轮业务提问（"看下选品漏斗"）都被提成记忆写库，面板被
-  一次性问答淹没（实测）。收窄为只沉淀跨会话仍成立的分析偏好/身份/长期
-  规则/明确「记住」指令，业务问答与数据结论返回空 facts。注意键名是
-  mem0 2.0.x（v2）的；v3 起改名 `custom_instructions`，升级跨 2.1 时同步。
+- **为什么要加提取范围约束**（配置键 `custom_instructions`，常量
+  `MEMORY_EXTRACTION_RULES`）：mem0 2.0.x 走 V3「只加不改」流水线（单次 LLM
+  调用，没有 UPDATE/DELETE），内置 `ADDITIVE_EXTRACTION_PROMPT` 要求同时从
+  user 与 assistant 消息尽量多提取（用户的「requests」也算、「拿不准就提取」），
+  且不开语言要求——实测一个漏斗报表提问就写入 5 条带日期的记忆（商品数据、
+  助手说的汇率都在内），面板被问答淹没。约束把范围收窄为：只取用户消息、
+  只沉淀跨会话成立的分析偏好/身份/长期规则/明确「记住」的内容、用中文记录。
+  mem0 把它追加在 user prompt 末尾的 `## Custom Instructions` 段，内置 prompt
+  声明该段优先级最高。**曾误用 `custom_fact_extraction_prompt`**：`MemoryConfig`
+  静默忽略未知字段，规则从未生效，因此 `_get_memory` 初始化后用 `_rules_active`
+  自检，不生效直接禁用记忆（宁可不记，不灌垃圾）。规则里的示例必须沿用 mem0
+  的输出结构 `{"memory": [{"id", "text"}]}`（mem0 按 `.get("memory")` 解析）。
+  语义去重的副作用：同一偏好再说一遍不会新增条目——已有记忆就是它。
   `seed_memories.py` 直插向量库（`infer=False` 语义），不经提取，不受影响。
 - **为什么会话级 recall（只在首轮检索一次）**：记忆注入 system prompt；
   每轮都 recall 会让 system prompt 逐轮变化，主模型 prompt cache 前缀
@@ -76,7 +82,8 @@
   同一 JWT 信任模型——身份取 `preferred_username`，绝不接受前端传参）→
   lambda.invoke 记忆 Lambda `list` op `filters={"user_id": <user>}` →
   映射 `payload.data/created_at` 为 `{memories: [{id, memory, created_at}]}`
-  按时间倒序；tasks-api 使用禁重试的 8 秒读超时，必须在 HTTP API 约 30 秒
+  按创建时间倒序（只加不改：同一偏好再说不会刷新时间，较早的偏好会被后来的
+  条目压到下面）；tasks-api 使用禁重试的 8 秒读超时，必须在 HTTP API 约 30 秒
   集成上限前主动降级（记忆 Lambda 可在后台继续唤醒 Aurora），Lambda 不可达/
   超时统一返回 `{memories: [], degraded: true}`，不抛 500/503。前端镜像类型在
   `web/src/chat/api.ts`（MemoryItem）。
@@ -103,12 +110,16 @@
 - **prompt cache 契约**：`_MEMORY_SECTION[session_id]` 一经写入（含空串）
   本会话不再变化；任何"每轮刷新记忆"的改动都会打穿主模型前缀缓存，
   改之前先想清楚。
-- **mem0 私有 API 触点**（版本锁 `mem0ai>=2.0.17,<2.1` 的原因）：
+- **mem0 私有 API 触点与提取语义**（版本精确锁 `mem0ai==2.0.20` 的原因）：
   `VectorStoreFactory.provider_to_class` 注册表、
   `VectorStoreConfig.__private_attributes__["_provider_configs"]` 默认值、
   `sys.modules["mem0.configs.vector_stores.aurora_lambda"]` 注入、
-  pgvector 表结构约定、检索结果 `.id/.score/.payload` 形状。升级 mem0
-  前跑 `memory_test.sh` 与 memory_backend 的注册冒烟。
+  pgvector 表结构约定、检索结果 `.id/.score/.payload` 形状；以及提取语义——
+  内置 prompt、`custom_instructions` 的拼接位置与输出结构都随补丁版本变化
+  （2.0.x 内已换过整条流水线）。升级 mem0 前先跑
+  `scripts/memory_extraction_check.py`（复用 `_build_config()`/`_add_turn()`，
+  本地 qdrant + 真实模型网关按剧本断言，3 轮全过才算过），再跑
+  `memory_test.sh` 与 memory_backend 的注册冒烟。
 - **禁 import `mem0.vector_stores.pgvector`**：模块级 try-import psycopg，
   Runtime 不装 psycopg（向量操作已远程化）。
 - **env 隔离**：mem0 的 openai provider 会 fallback 读 `OPENAI_API_KEY`/
@@ -134,6 +145,7 @@
 | `MEM0_LLM_*`/`MEM0_EMBEDDER_MODEL` 任一缺失 | 进程级禁用，`[mem0]` 日志说明缺哪个 |
 | 数值型 `MEM0_*` 环境变量为畸形值 | 回退默认并告警（守护解析，import 不抛错） |
 | mem0ai 未安装 / 注册失败 | import 不抛错，进程级禁用 |
+| 提取范围约束未生效（mem0 改了配置名或结构） | 初始化自检 `_rules_active` 失败，进程级禁用（宁可不记，不灌垃圾） |
 | embedding 实际维度 ≠ `MEM0_EMBEDDER_DIMS` | 初始化探测直接禁用，日志给出两种修法 |
 | session 查不到 user_name | recall 跳过；流尾 memorize 前弹掉 None 缓存补查一次（防注册竞态） |
 | recall 超 3s（数据面或模型端点超时） | 本会话无记忆注入，缓存空串不重试 |

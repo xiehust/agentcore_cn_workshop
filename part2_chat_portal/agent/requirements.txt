@@ -7,5 +7,7 @@ strands-agents-tools[agent_core_code_interpreter]>=0.8.0
 mcp>=1.9.0,<2
 boto3>=1.43.0
 # 长期记忆（memory_backend.py）：向量操作走 VPC 内 Lambda，Runtime 侧不需要
-# psycopg/pgvector；上界锁 2.1——自定义向量后端触及 mem0 少量私有注册表
-mem0ai>=2.0.17,<2.1
+# psycopg/pgvector。精确锁定：自定义向量后端触及 mem0 少量私有注册表，且提取
+# 语义（内置 prompt、custom_instructions 的拼接位置、输出结构）随补丁版本变化。
+# 升级前先跑 scripts/memory_extraction_check.py，全部通过再改这里
+mem0ai==2.0.20

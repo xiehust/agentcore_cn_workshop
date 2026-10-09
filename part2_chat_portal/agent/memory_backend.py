@@ -203,7 +203,7 @@ try:
         """mem0 VectorStoreBase → 记忆向量 Lambda 的 RPC 适配器。
 
         协议与返回值形状忠实对应 mem0 自带 pgvector 实现（SQL 在 Lambda 侧），
-        保证 mem0 Memory 的去重/更新决策不因换传输层而变化。
+        保证 mem0 Memory 的检索与去重行为不因换传输层而变化。
         """
 
         def __init__(self, collection_name, embedding_model_dims, function_name, region):
@@ -308,47 +308,57 @@ except Exception as e:  # mem0ai 未安装 / 版本不兼容
     logger.warning("[mem0] %s，长期记忆禁用", _disabled_reason)
 
 
-# 事实提取范围约束（替换 mem0 默认提取 prompt）。默认 prompt 是通用「个人
-# 信息管理员」，few-shot 明确示范把行为/请求语句当事实存（"Looking for a
-# restaurant"、"Had a meeting with John"）——在本门户表现为：每轮业务提问
-# （"看下选品漏斗"）都被提成记忆写库，记忆面板被一次性问答淹没（实测）。
-# 这里收窄为：只沉淀跨会话仍然成立的分析师偏好/身份/长期规则，一次性业务
-# 问答与数据结论一律不存。mem0 2.0.x 的键名是 custom_fact_extraction_prompt
-# （v3 起改名 custom_instructions，升级跨 2.1 时注意同步）；该 prompt 作为
-# system prompt 使用，本轮对话以 "Input:\n user: ...\n assistant: ..." 形态
-# 作为 user 消息送入，few-shot 必须用 Input/Output 对的形状。
-FACT_EXTRACTION_PROMPT = """你是跨境电商选品分析门户的用户记忆提取器。你的唯一任务：从对话中提取「跨会话仍然成立、值得长期记住」的分析师个人偏好与事实，用于未来会话的个性化。
+# 提取范围约束。mem0 2.0.x 走 V3「只加不改」流水线，内置提取 prompt
+# （ADDITIVE_EXTRACTION_PROMPT）要求同时从 user 与 assistant 消息尽量多提取、
+# 「拿不准就提取」——在本门户表现为每个业务提问（"看下选品漏斗"）都写成一条
+# 英文记忆，助手给的建议也进记忆（实测）。本段经配置键 custom_instructions 注入：
+# mem0 把它追加在 user prompt 末尾的 "## Custom Instructions" 段，内置 prompt 声明
+# 该段优先级最高。三条硬约束：
+#   - 键名必须是 custom_instructions：MemoryConfig 静默忽略未知字段，写错不报错
+#     （曾误用 custom_fact_extraction_prompt，规则从未生效），_get_memory 有自检；
+#   - 示例与说明必须沿用 mem0 的输出结构 {"memory": [{"id", "text"}]}：mem0 按
+#     .get("memory") 解析，换成别的键会导致一条都存不进；
+#   - mem0 的输入语言开关（use_input_language）写入路径不开，中文记录全靠本段要求。
+MEMORY_EXTRACTION_RULES = """以下规则针对「跨境电商选品分析门户」，优先级高于上文全部通用指令；与通用指令冲突时（包括「同时从 user 和 assistant 消息提取」「拿不准就提取」），一律以本节为准。
 
-只提取以下几类（且仅当用户自己明确陈述时）：
-1. 分析偏好：币种与汇率口径、关注的站点或市场、月销/价格等门槛偏好、结论呈现偏好（注明数据来源、附汇率等）
+【只从用户消息提取】
+只依据 New Messages 中 role 为 user 的消息提取。assistant 消息只用来理解用户在说什么，其中的建议、数据、结论、汇率、口径一律不提取——除非用户在本轮明确确认并要求以后沿用（如「好，以后都按这个汇率」）。
+
+【只记跨会话长期成立的内容】只提取以下四类：
+1. 分析偏好：币种与汇率口径、关注的站点或市场、月销/价格等门槛、结论的呈现方式（如注明数据来源）
 2. 身份与职责：岗位、负责的品类或业务线
-3. 长期规则：用户要求今后一直遵守的约定（黑名单、合规口径、风格要求）
-4. 用户明确说「记住……」的内容
+3. 长期规则：用户要求今后一直遵守的约定（黑名单、合规口径、输出风格）
+4. 用户明确要求「记住」的内容
 
-一律不提取（返回空列表）：
-- 一次性业务问题或查询请求（如「看下最近30天的选品漏斗」「产品点最高的5个商品是什么」）
-- 查询结果、数据、商品信息、分析结论——assistant 消息里的一切内容都不是用户事实
-- 只对本轮生效的指令（如「这次用表格展示」；用户说「以后都」才算长期规则）
-- 问候、闲聊、对系统的抱怨
+【一律不提取，输出 {"memory": []}】
+- 一次性的业务提问、查询或报表请求（如「看下最近30天的选品漏斗报表」「候选池里产品点最高的5个商品是什么」「第一名为什么判 PASS」）。提问本身不是偏好，也不要据此推断用户的兴趣或意图
+- 查询结果、数据、商品信息、分析结论
+- 只对本轮生效的要求（如「这次用表格展示」；用户说「以后都」才算长期规则）
+- 问候、闲聊、对系统的评价
 
-输出严格 JSON：{"facts": ["..."]}；没有可提取内容时输出 {"facts": []}。
-事实用用户输入的语言记录，每条独立、简洁、可脱离本轮对话理解。
+【写法】
+- 用用户消息的语言书写：用户说中文就写中文，不要翻译成英文，不要用「User …」作主语
+- 每条一句话，简洁、可脱离对话理解，以「用户」开头；不写日期
+- 输出结构保持不变：{"memory": [{"id": "0", "text": "…"}]}
 
-示例：
-Input: user: 看下最近30天的选品漏斗
-Output: {"facts": []}
-Input: user: 候选池里产品点最高的5个商品是什么？给出价格、月销和预估售价
-Output: {"facts": []}
-Input: user: 第一名的商品为什么判 PASS？
-Output: {"facts": []}
-Input: user: 记住我的分析偏好：金额一律换算成人民币，我只关注英国站
-Output: {"facts": ["金额一律换算成人民币", "只关注英国站"]}
-Input: user: 我是风控合规方向的分析师，主要审核选品的合规风险
-Output: {"facts": ["是风控合规方向的分析师", "主要审核选品的合规风险"]}
-Input: user: 以后给我的结论都要注明数据来源和取数时间
-Output: {"facts": ["结论需注明数据来源和取数时间"]}
+【示例】
+New Messages: [{"role": "user", "content": "看下最近30天的选品漏斗报表"}, {"role": "assistant", "content": "最近30天共处理 42 个商品，其中采集 6 个……"}]
+Output: {"memory": []}
 
-只输出 JSON 对象本身，不要任何其他文字或代码块标记。"""
+New Messages: [{"role": "user", "content": "记住我的分析偏好：金额一律换算成人民币，我只关注英国站"}, {"role": "assistant", "content": "好的，今后金额按 £1≈¥9.2 换算成人民币，只看英国站数据。"}]
+Output: {"memory": [{"id": "0", "text": "用户要求报告中的金额一律换算成人民币"}, {"id": "1", "text": "用户只关注英国站（UK）的数据"}]}
+（汇率 £1≈¥9.2 是助手提出的、用户没有确认，不提取）
+
+New Messages: [{"role": "user", "content": "英镑兑人民币按多少算合适？"}, {"role": "assistant", "content": "建议按 £1≈¥9.2 的参考汇率换算。"}]
+Output: {"memory": []}
+
+New Messages: [{"role": "user", "content": "我是风控合规方向的分析师，以后结论都要注明数据来源"}, {"role": "assistant", "content": "明白。"}]
+Output: {"memory": [{"id": "0", "text": "用户是风控合规方向的分析师"}, {"id": "1", "text": "用户要求今后的结论都注明数据来源"}]}"""
+
+
+def _rules_active(mem) -> bool:
+    """提取范围约束是否真的进了 mem0（未来 mem0 改配置名时，静默失效会被这里拦下）。"""
+    return getattr(mem, "custom_instructions", None) == MEMORY_EXTRACTION_RULES
 
 
 def _build_config() -> dict:
@@ -382,7 +392,7 @@ def _build_config() -> dict:
         },
         "embedder": {"provider": "openai", "config": embedder_cfg},
         # 收窄提取范围：只沉淀长期偏好/身份/规则，业务问答不进记忆（见常量注释）
-        "custom_fact_extraction_prompt": FACT_EXTRACTION_PROMPT,
+        "custom_instructions": MEMORY_EXTRACTION_RULES,
         "vector_store": {
             "provider": "aurora_lambda",
             "config": {
@@ -413,6 +423,14 @@ def _get_memory():
             return None
         try:
             mem = Memory.from_config(_build_config())
+            if not _rules_active(mem):
+                # 宁可不记，也不让业务问答与助手内容灌进长期记忆
+                _disabled_reason = (
+                    "提取范围约束未生效（当前 mem0 版本不认 custom_instructions，"
+                    "请核对 requirements.txt 锁定的 mem0ai 版本）"
+                )
+                logger.warning("[mem0] %s，长期记忆禁用", _disabled_reason)
+                return None
             # 收紧 openai client 超时：mem0 用库默认（600s + 重试），挂死的
             # 端点会让被 wait_for 放弃的后台线程占着专用池几十分钟
             import httpx
@@ -493,24 +511,29 @@ async def recall(user_id: str | None, query: str) -> list[str]:
         return []
 
 
-def _memorize_sync(user_id: str, prompt: str, reply: str) -> int:
-    mem = _get_memory()
-    if mem is None:
-        return 0
+def _add_turn(mem, user_id: str, prompt: str, reply: str) -> int:
+    """把一轮问答交给 mem0 提取写回，返回新增记忆条数（scripts/memory_extraction_check.py 复用）。"""
     result = mem.add(
         messages=[
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": reply},
         ],
         user_id=user_id,
-        infer=True,  # LLM 事实提取 + 与既有记忆去重/合并
+        infer=True,  # LLM 按 MEMORY_EXTRACTION_RULES 提取；与已有记忆语义等价的不再写入
     )
     rows = result.get("results", []) if isinstance(result, dict) else (result or [])
     return len(rows)
 
 
+def _memorize_sync(user_id: str, prompt: str, reply: str) -> int:
+    mem = _get_memory()
+    if mem is None:
+        return 0
+    return _add_turn(mem, user_id, prompt, reply)
+
+
 async def memorize(user_id: str | None, prompt: str, reply: str) -> None:
-    """把本轮对话交给 mem0 提取写回（ADD/UPDATE/DELETE 由 mem0 决策）。
+    """把本轮对话交给 mem0 提取写回（只新增；与已有记忆语义等价的由 mem0 跳过）。
 
     由 main.py 的 AgentCore tracked async task 在历史落库之后 await；该 task
     通过 HealthyBusy 防止响应结束后 microVM 冻结，而 SSE 不等待本函数。预算
