@@ -12,11 +12,14 @@
 #     IDE_INSTANCE_TYPE   实例类型（默认 t3.large）
 #     IDE_ALB_PORT        IDE 入口端口（默认 8889，中国区免备案必须非标准端口；
 #                         全球区可传 80 兼容只放行 80/443 出站的办公网络）
-#     ASSET_BASE_URL      资产 CDN 基址（透传模板 AssetBaseUrl）。中国区默认
-#                         http://cf.chenxqdu.people.a2z.org.cn/agentcore-workshop
-#                         （维护者私有分发环境，换环境请覆盖）；全球区留空用模板默认
-#     CODE_SERVER_RPM_URL 区内可达的 code-server rpm 镜像地址（中国区默认从
-#                         ASSET_BASE_URL/tools/ 派生）
+#     ASSET_SOURCE        资产分发源 cn|mirror（缺省按区域：cn-* → cn，其余 → mirror）。
+#                         cn     = 中国区 CDN（备案别名域，HTTP）
+#                         mirror = cn CDN 在全球区账号的全量镜像（CloudFront 默认域名，HTTPS）
+#                         两者目录一致（含 tools/），一个变量把 AssetBaseUrl 与 code-server
+#                         地址成对切换；中国区切 mirror 会走跨境下载（更慢）
+#     ASSET_BASE_URL      显式资产 CDN 基址（透传模板 AssetBaseUrl），优先于 ASSET_SOURCE。
+#                         默认值为维护者私有分发环境，换环境请覆盖
+#     CODE_SERVER_RPM_URL code-server rpm 地址（默认从 ASSET_BASE_URL/tools/ 派生）
 #     ENABLE_PUBLIC_PORTAL=1 公网化场景 2 的 Web 门户（HTTPS）：自动生成自签证书导入
 #                         ACM，ALB 加 8443 HTTPS 监听器转发实例 5173（浏览器一次
 #                         证书告警；8443 非标准端口，中国区免备案）
@@ -38,13 +41,22 @@ CODE_SERVER_RPM_URL="${CODE_SERVER_RPM_URL:-}"
 ASSET_BASE_URL="${ASSET_BASE_URL:-}"
 CODE_SERVER_VERSION="${CODE_SERVER_VERSION:-4.91.1}"
 
-# 中国区：资产必须走区内 CDN（全球区 CloudFront 跨境慢且易致建栈超时回滚）。
-# 默认指向维护者私有分发环境，换环境用 ASSET_BASE_URL 覆盖
-case "$REGION" in cn-*)
-  ASSET_BASE_URL="${ASSET_BASE_URL:-http://cf.chenxqdu.people.a2z.org.cn/agentcore-workshop}"
-  [ -n "$CODE_SERVER_RPM_URL" ] || \
-    CODE_SERVER_RPM_URL="$ASSET_BASE_URL/tools/code-server-$CODE_SERVER_VERSION-amd64.rpm"
-;; esac
+# 资产就近分发：中国区默认区内 CDN（全球区 CloudFront 跨境慢，曾致建栈超时回滚），
+# 全球区默认全球镜像。默认值指向维护者私有分发环境，换环境用 ASSET_BASE_URL 覆盖
+ASSET_SOURCE="${ASSET_SOURCE:-}"
+if [ -z "$ASSET_SOURCE" ]; then
+  case "$REGION" in cn-*) ASSET_SOURCE=cn ;; *) ASSET_SOURCE=mirror ;; esac
+fi
+case "$ASSET_SOURCE" in
+  cn)     DEFAULT_ASSET_BASE_URL="http://cf.chenxqdu.people.a2z.org.cn/agentcore-workshop"
+          SYNC_CHANNEL=mirror ;;
+  mirror) DEFAULT_ASSET_BASE_URL="https://dkbkvrzdiwo2j.cloudfront.net/agentcore-workshop"
+          SYNC_CHANNEL=cn ;;
+  *) echo "❌ ASSET_SOURCE 只能是 cn 或 mirror: $ASSET_SOURCE"; exit 1 ;;
+esac
+ASSET_BASE_URL="${ASSET_BASE_URL:-$DEFAULT_ASSET_BASE_URL}"
+[ -n "$CODE_SERVER_RPM_URL" ] || \
+  CODE_SERVER_RPM_URL="$ASSET_BASE_URL/tools/code-server-$CODE_SERVER_VERSION-amd64.rpm"
 
 case "$STACK_NAME" in
   agentcore-workshop*) ;;
@@ -79,7 +91,10 @@ echo "==> [1/4] 发布资产到 CloudFront 分发桶（SKIP_PUBLISH=1 跳过）.
 if [ "${SKIP_PUBLISH:-0}" = "1" ]; then
   echo "    已跳过（使用 CDN 上现有资产）"
 else
-  bash "$SCRIPT_DIR/publish-assets.sh"
+  # 本次消费的通道为必需，另一通道附带同步（凭证不可用/失败只告警），两边始终一致
+  PUBLISH_TARGET="${PUBLISH_TARGET:-$ASSET_SOURCE,$SYNC_CHANNEL}" \
+  PUBLISH_REQUIRE="${PUBLISH_REQUIRE:-$ASSET_SOURCE}" \
+    bash "$SCRIPT_DIR/publish-assets.sh"
 fi
 
 echo "==> [2/4] 准备模板中转桶: $TRANSFER_BUCKET ..."

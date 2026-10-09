@@ -23,8 +23,12 @@ agentcore_cn_hands_on/
 │                                     #  + 数仓(私有VPC+Aurora+Secrets端点)
 │                                     #  + 删除清理钩子（一键销毁）
 ├── ide/
-│   ├── deploy-ide.sh            # 操作员机器：打包代码上 S3 + 部署单栈
+│   ├── deploy-ide.sh            # 操作员机器：打包代码上 S3 + 部署单栈（ASSET_SOURCE 切资产源）
+│   ├── publish-assets.sh        # 发布资产到 CDN（cn 通道 + 全球镜像 mirror 通道同步）
 │   └── destroy-ide.sh           # 一键销毁（删单栈 + 资产桶）
+├── loadtest/                    # 活动前容量验证（压测机上运行，见运行手册第 9 章）
+│   ├── kc_loadtest.sh           # 中央 Keycloak：discovery/JWKS/登录页/密码登录/M2M 五场景
+│   └── llm_loadtest.py          # 模型网关：流式对话（短提示/长上下文）+ embedding
 └── scripts/                     # IDE Terminal 内执行
     ├── 00_env.sh                # 公共库（区域/分区推导、venv、模型 key 校验）
     ├── 01_deploy_base.sh        # 1/ 部署基础环境（写库 Lambda + 建表）

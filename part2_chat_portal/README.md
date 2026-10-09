@@ -114,6 +114,11 @@ Keycloak 的三种形态（脚本自动选择）：
 | 外部托管 | 数仓栈（CloudLab base 单栈）输出 `KeycloakUrl` | 复用 base 栈预建的 Keycloak 基础设施与镜像 |
 | 独立栈 | 其余情况 | 部署 `agentcore-workshop-keycloak` 栈 |
 
+中央 KC 与独立栈都用 `infra/keycloak-fargate.yaml`（集群/日志组名随栈名派生，
+同账号可共存多套）。单副本（H2 内嵌存储）只能纵向扩容：`TaskCpu`/`TaskMemory`
+参数默认 1 vCPU / 2GB，100 人集中活动建议提到 2048/4096（压测数据见
+`agentcore_cn_hands_on/运行手册.md` 第 9 章）。
+
 脚本幂等，可重复执行。首次部署约 10 分钟，共 10 步：Keycloak（1）→ 分析链路
 基础设施与数据查询 Lambda（2-3）→ 记忆向量 Lambda 与通用数据面 db Lambda（4）→
 Gateway 与工具注册（5）→ Identity credential provider（6）→ 分析 Agent 到

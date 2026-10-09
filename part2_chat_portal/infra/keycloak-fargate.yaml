@@ -19,6 +19,18 @@ Parameters:
     Type: String
     Default: ""
     Description: 可选。API Gateway 未传 X-Forwarded-Proto 导致 issuer 非 https 时，设为门户完整 URL 强制修正
+  # 单副本（H2 内嵌存储不能多副本）只能纵向扩容。压测实测 1 vCPU 时登录类请求
+  # CPU 打满：100 人同时登录 password grant ~11 次/秒、每人排队 8~11 秒（零失败）；
+  # 集中活动建议活动当天提到 2048/4096
+  TaskCpu:
+    Type: String
+    Default: "1024"
+    AllowedValues: ["1024", "2048", "4096"]
+    Description: Fargate 任务 CPU 单位（1024 = 1 vCPU）
+  TaskMemory:
+    Type: String
+    Default: "2048"
+    Description: Fargate 任务内存 MiB（须与 TaskCpu 构成合法组合，如 1024/2048、2048/4096、4096/8192）
 
 Conditions:
   HasHostname: !Not [!Equals [!Ref KcHostname, ""]]
@@ -141,8 +153,8 @@ Resources:
       Family: agentcore-workshop-keycloak
       RequiresCompatibilities: [FARGATE]
       NetworkMode: awsvpc
-      Cpu: "1024"
-      Memory: "2048"
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
       RuntimePlatform:
         CpuArchitecture: ARM64          # 镜像由 deploy.sh 按 arm64 构建
         OperatingSystemFamily: LINUX

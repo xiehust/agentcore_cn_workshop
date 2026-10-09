@@ -142,6 +142,16 @@ CloudFront 必须绑定已备案域名，故不采用 CloudFront 方案。
   共约 420MB）不随每次发布：维护者在 jumphost 下载（github/quay 出口快），
   用本地生成的 S3 presigned PUT URL 直传宁夏桶（us-west-2 → 宁夏实测
   10~25MB/s）。
+- **全球镜像（2026-10）**：cn CDN 依赖个人备案别名域（HTTPS 证书已过期），
+  单点风险高，且全球区部署原本跨境拉 cn CDN。在全球区账号建内容一致的镜像：
+  专用私有桶（全量阻止公开访问）+ CloudFront 默认域名 + OAC 回源（桶策略
+  只认该分配），目录与 cn 一一对应（含 tools/，18 个对象逐个比对大小与 MD5）。
+  `deploy-ide.sh` 的 `ASSET_SOURCE=cn|mirror` 成对切换 `AssetBaseUrl` 与
+  code-server 地址（缺省按区域就近）；`publish-assets.sh` 一次构建多通道发布，
+  本次消费的通道为必需、另一通道附带同步（失败只告警，不阻断没有对侧凭证的
+  协作者）。早期 `global` 通道属另一维护者环境，保留不动。踩坑：新桶的
+  S3 全局端点 DNS 未传播时 presigned PUT 返回 307，而 `curl -f` 不把 3xx
+  当失败——预签名必须用区域端点，并按 HTTP 状态码判定。
 - **Keycloak 基础镜像**：bootstrap cn 分支预载镜像 tar（`docker load`），
   场景 2 `docker build` 命中本地 tag 后不再访问 quay.io；预载失败仅告警，
   回退直拉。
@@ -208,3 +218,25 @@ Tasks API 的 JWT authorizer 仍留在 03（create-authorizer 时 API Gateway
   角色 lambda.invoke tasks-api（handler 零改动）。4.3 任务管理/记忆
   面板/会话列表全部恢复；调度链（Scheduler→runner）不经 API GW 本就
   不受影响。
+
+### 集中依赖的容量验证（100 人活动，2026-10）
+
+中央化后全场共用两个外部依赖：中央 Keycloak 与模型网关。`loadtest/` 两个
+有界压测脚本按 100 并发峰值形态实测（数据见运行手册第 9 章），结论与决策：
+
+- **都扛得住，瓶颈都是单机 CPU**：两者在 100 并发下零错误，但同步突发时
+  CPU 打满排队。中央 KC 1 vCPU 时密码登录约 11 次/秒（100 人同一秒登录每人
+  等约 9 秒）；网关代理是单 worker LiteLLM 跑在 1 vCPU 上，逐秒采样持续 100%，
+  首包 p90 从 1.3s 涨到 6~7s。Bedrock 后端配额余量大（kimi-k3 2000 万 TPM、
+  零 throttle），不是瓶颈。
+- **扩容只能纵向**：中央 KC 用 H2 内嵌存储（realm 烧进镜像），多副本会各自
+  签发不同密钥——`keycloak-fargate.yaml` 加 `TaskCpu`/`TaskMemory` 参数
+  （默认值不变，现网零影响），活动当天提到 2 vCPU / 4GB。网关代理换多核并
+  开多 worker；代理无弹性 IP 且回源写实例公网 DNS，停机换规格前须先绑 EIP
+  并同步改回源。
+- **实际负载远低于压测形态**：Runtime/Gateway authorizer 与门户代理对 JWKS
+  有缓存，Identity 对 M2M token 有缓存，登录只发生在开场与换账号时；压测
+  闭环打满 100 并发是刻意取的上界。
+- **压测方法踩坑**：压测机残留的同名环境变量（`OPENAI_API_KEY=EMPTY`）会静默
+  顶掉 stdin 传入的 key——脚本打印 key 来源与长度并先发预检请求，失败不开压；
+  ab 对 token 端点报的 `Failed requests` 全是 `Length` 误报，以 Non-2xx 为准。
