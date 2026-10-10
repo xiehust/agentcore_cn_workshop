@@ -31,7 +31,8 @@ Parameters:
   AssetBaseUrl:
     Type: String
     # 默认中国区分发（本模板面向中国区活动；全球区部署显式传回全球 CDN）
-    Default: http://cf.chenxqdu.people.a2z.org.cn/agentcore-workshop
+    Default: https://dkbkvrzdiwo2j.cloudfront.net/agentcore-workshop
+    # Default: http://cf.chenxqdu.people.a2z.org.cn/agentcore-workshop
     Description: CDN base URL serving workshop assets (published by ide/publish-assets.sh)
 
   WorkshopAssetsKey:
@@ -70,7 +71,8 @@ Parameters:
   CodeServerRpmUrl:
     Type: String
     # 默认中国区镜像（GitHub 区内不可达；全球区部署可置空回落 GitHub releases）
-    Default: http://cf.chenxqdu.people.a2z.org.cn/agentcore-workshop/tools/code-server-4.91.1-amd64.rpm
+    Default: https://dkbkvrzdiwo2j.cloudfront.net/agentcore-workshop/tools/code-server-4.91.1-amd64.rpm
+    # Default: http://cf.chenxqdu.people.a2z.org.cn/agentcore-workshop/tools/code-server-4.91.1-amd64.rpm
     Description: >
       URL for the code-server rpm. Set to empty to download from GitHub releases
       (global regions only; unreachable from China).
@@ -159,7 +161,7 @@ Resources:
     Type: AWS::IAM::Role
     DeletionPolicy: Delete
     Properties:
-      RoleName: !Sub "${AWS::StackName}-TrialUseOnlyRole"
+      RoleName: TrialUseOnly-ContentGeneratedByGenAIDoesNotRepresentViewsOfAWS
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
