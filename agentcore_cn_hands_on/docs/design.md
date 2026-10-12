@@ -2,6 +2,9 @@
 
 日期：2026-08-29
 
+> 整体 AWS 资源架构图（学员账号 + 中央 Keycloak 账号 + 外部依赖，含编号数据流）：
+> [aws-architecture.drawio](aws-architecture.drawio)（draw.io 打开，AWS 图标版）
+
 ## 目标
 
 1. 从 `openclaw-saas-gcr/cloudformation/cloudlab-template-china.yaml` 中抽离 IDE 部分，
