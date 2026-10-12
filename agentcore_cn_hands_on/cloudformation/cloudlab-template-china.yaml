@@ -2137,7 +2137,11 @@ Resources:
   KcLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /ecs/agentcore-workshop-keycloak
+      # 栈名派生（日志组名账号内唯一）：同账号多套环境（本栈 + 独立 KC 栈
+      # agentcore-workshop-keycloak，其日志组为 /ecs/<栈名>）不再撞名——实测
+      # 固定名与独立 KC 栈冲突导致后者 CREATE_FAILED 回滚。后缀用 -kc 保证
+      # 任何栈名都不可能与独立栈的 /ecs/agentcore-workshop-keycloak 相同
+      LogGroupName: !Sub '/ecs/${AWS::StackName}-kc'
       RetentionInDays: 7
 
   KcExecutionRole:
