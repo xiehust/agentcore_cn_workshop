@@ -159,18 +159,25 @@ ensure_venv() {
   fi
   # shellcheck disable=SC1091
   source "$WORKSHOP_DIR/.venv/bin/activate"
+  # 版本锁定（与模板 bootstrap 保持同一组数字）：toolkit 的 CLI 在弃用流程中、
+  # 行为随版本漂移（0.3.13 起默认 CodeBuild 容器部署，aws-cn 必挂）；uv 是
+  # direct_code_deploy 打包的硬前置。两者都锁到端到端实测过的版本，
+  # 升级前先在一次完整建栈 + 02/03 里验证再改这两个数字
+  TOOLKIT_VERSION="0.3.14"
+  UV_VERSION="0.12.23"
   if ! "$WORKSHOP_DIR/.venv/bin/pip" show bedrock-agentcore-starter-toolkit >/dev/null 2>&1; then
-    echo "==> 安装 bedrock-agentcore-starter-toolkit（agentcore CLI）..."
+    echo "==> 安装 bedrock-agentcore-starter-toolkit==${TOOLKIT_VERSION}（agentcore CLI）..."
     pip install -q --upgrade pip
-    pip install -q bedrock-agentcore-starter-toolkit uv
+    pip install -q "bedrock-agentcore-starter-toolkit==${TOOLKIT_VERSION}" "uv==${UV_VERSION}"
   fi
   # uv：direct_code_deploy 模式打包依赖的硬前置（旧环境可能只装了 toolkit）
-  command -v uv >/dev/null 2>&1 || pip install -q uv
+  command -v uv >/dev/null 2>&1 || pip install -q "uv==${UV_VERSION}"
   # agentcore CLI 可用性自检（npm 有同名命令，识别依据：Python 版帮助里有 configure）
   if ! { agentcore --help >/tmp/.agentcore_help 2>/dev/null && grep -qE '\bconfigure\b' /tmp/.agentcore_help; }; then
     echo "❌ agentcore CLI 异常（PATH 里的可能是 npm 同名命令）。venv: $WORKSHOP_DIR/.venv"
     exit 1
   fi
+  echo "    toolkit $(pip show bedrock-agentcore-starter-toolkit 2>/dev/null | awk '/^Version/{print $2}') / uv $(uv --version 2>/dev/null | awk '{print $2}')"
 }
 
 # ---- 模型三元组校验（fail-fast，与 workshop deploy.sh 完全一致的规则） ----

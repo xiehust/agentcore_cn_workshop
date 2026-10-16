@@ -223,6 +223,29 @@ Tasks API 的 JWT authorizer 仍留在 03（create-authorizer 时 API Gateway
   面板/会话列表全部恢复；调度链（Scheduler→runner）不经 API GW 本就
   不受影响。
 
+### 活动前审查整改（2026-10-16）
+
+外部审查提出 6 项，处置如下（其余 2 项：bootstrap waiter 改 WaitCondition 暂缓、
+CDN 迁出个人账号以双通道互备作为短期缓解）：
+
+- **AssetFetch 加重试**：原来每个 Lambda zip 只有一次 `urlopen(timeout=60)`，
+  CDN 跨境抖一次建栈即回滚。改为每文件 5 次指数退避（1/2/4/8s）、单次超时 120s，
+  函数超时 300→900s 配套放大。
+- **toolkit/uv 锁版本**：`bedrock-agentcore-starter-toolkit==0.3.14`、`uv==0.12.23`
+  （2026-10-08 端到端实测所装版本），00_env.sh 与模板 bootstrap 两处同一组数字；
+  CLI 在弃用流程中、行为随版本漂移（0.3.13 的 CodeBuild 默认已踩过），升级前须
+  完整建栈 + 02/03 验证后同步改两处。
+- **学员路径 Lambda 写操作收口**：数据面函数全部栈预建，脚本只走 update/invoke；
+  IDE 角色策略删去 `lambda:CreateFunction`（DeleteFunction 保留给清理钩子）；
+  01 与 part2 deploy.sh 的「函数不存在」兜底创建分支加明确提示（受管账号 SCP
+  会拒创建，指引重建栈）。
+- **TrialUseOnlyRole 裁剪**（学员控制台角色，openclaw 模板整段遗留）：删
+  `eks:*`、`elasticfilesystem:*` 全部、`ecr:*` 全部、`ec2:RunInstances`、
+  `ec2:CreateLaunchTemplate`（连同失去意义的 DeleteLaunchTemplate）、
+  `ec2:CreateFleet`、`lambda:CreateFunction`——后几项在受管账号本就被 SCP 拦，
+  留着只触发安全审查。`sqs:*`/`cloudformation:*`/`elasticloadbalancing:*`/WAF/
+  IAM 写等按用户决定本轮保留，后续可再按手册控制台动作收敛。
+
 ### 集中依赖的容量验证（100 人活动，2026-10）
 
 中央化后全场共用两个外部依赖：中央 Keycloak 与模型网关。`loadtest/` 两个

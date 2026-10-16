@@ -55,6 +55,9 @@ if aws lambda get-function --function-name "$WRITER_NAME" --region "$REGION" >/d
   aws lambda wait function-updated --function-name "$WRITER_NAME" --region "$REGION"
   echo "    已更新 Lambda: $WRITER_NAME"
 else
+  # CloudLab 栈会预建全部数据面函数，正常不会走到这个分支
+  echo "    ⚠️ $WRITER_NAME 不存在（栈应已预建）。缺失通常意味着栈不完整或被清理过；"
+  echo "       受管学员账号的 SCP 一般会拒绝 lambda:CreateFunction——若下方创建失败，请重建 CloudLab 栈"
   # 新建 IAM 角色到 Lambda 可见有延迟，带重试
   for attempt in $(seq 1 10); do
     if aws lambda create-function --function-name "$WRITER_NAME" --region "$REGION" \
@@ -115,6 +118,8 @@ if aws lambda get-function --function-name "$DB_QUERY_FN" --region "$REGION" >/d
   aws lambda wait function-updated --function-name "$DB_QUERY_FN" --region "$REGION"
   echo "    已更新 Lambda: $DB_QUERY_FN"
 else
+  # CloudLab 栈会预建全部数据面函数，正常不会走到这个分支（同上，SCP 账号创建会被拒）
+  echo "    ⚠️ $DB_QUERY_FN 不存在（栈应已预建），缺失请优先重建 CloudLab 栈"
   for attempt in $(seq 1 10); do
     if aws lambda create-function --function-name "$DB_QUERY_FN" --region "$REGION" \
       --runtime python3.12 --handler handler.lambda_handler \

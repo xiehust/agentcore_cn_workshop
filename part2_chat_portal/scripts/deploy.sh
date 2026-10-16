@@ -525,6 +525,8 @@ if aws lambda get-function --function-name "$LAMBDA_NAME" --region "$REGION" >/d
   aws lambda wait function-updated --function-name "$LAMBDA_NAME" --region "$REGION"
   echo "    已更新 Lambda: $LAMBDA_NAME"
 else
+  # CloudLab 形态下数据面函数由栈预建，正常不该走到创建分支（SCP 账号创建会被拒）
+  [ "$KC_EXTERNAL" = "1" ] && echo "    ⚠️ $LAMBDA_NAME 不存在（CloudLab 栈应已预建），创建被拒时请重建栈"
   # 新建 IAM 角色到 Lambda 可见有延迟，带重试
   for attempt in $(seq 1 10); do
     if aws lambda create-function --function-name "$LAMBDA_NAME" --region "$REGION" \
@@ -565,6 +567,8 @@ if aws lambda get-function --function-name "$MEMORY_LAMBDA_NAME" --region "$REGI
   aws lambda wait function-updated --function-name "$MEMORY_LAMBDA_NAME" --region "$REGION"
   echo "    已更新 Lambda: $MEMORY_LAMBDA_NAME"
 else
+  # CloudLab 形态下数据面函数由栈预建，正常不该走到创建分支（SCP 账号创建会被拒）
+  [ "$KC_EXTERNAL" = "1" ] && echo "    ⚠️ $MEMORY_LAMBDA_NAME 不存在（CloudLab 栈应已预建），创建被拒时请重建栈"
   # 新建 IAM 角色到 Lambda 可见有延迟，带重试
   for attempt in $(seq 1 10); do
     if aws lambda create-function --function-name "$MEMORY_LAMBDA_NAME" --region "$REGION" \
