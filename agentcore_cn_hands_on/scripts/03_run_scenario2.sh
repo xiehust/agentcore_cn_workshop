@@ -53,8 +53,26 @@ fi
 echo "==> [b] 执行 workshop Part 2 一键部署（首次约 10-15 分钟）..."
 bash "$PART2_DIR/scripts/deploy.sh"
 
+# ==> [c] 预灌兜底演示数据（反爬保险）
+# 现场人多并发时 eBay 反爬更严，场景 1 的真实爬取可能颗粒无收，导致数仓没数据、
+# 门户演示翻车。这一步一次性预灌一批真实感的候选/判定数据，保证门户永远有数据可查。
+# 与爬虫完全解耦：现场爬成功是锦上添花，爬不动也不影响演示。
+#   · 幂等——按 asin_or_url 去重，重跑场景 2 不会灌重复行
+#   · best-effort——失败只告警不中断（门户对话功能不依赖这批数据）
+#   · 跳过——export SKIP_PRODUCT_SEED=1（现场确认真实爬取已有充足数据时）
+# 依赖此刻均已就绪：写库 Lambda（$WRITER_NAME，场景 0/1 建）、通用数据面 Lambda
+# （$DB_QUERY_FN，上面 deploy.sh 步骤 4 建）；region/凭证由 00_env.sh 备好。
+if [ "${SKIP_PRODUCT_SEED:-0}" = "1" ]; then
+  echo "==> [c] 预灌兜底数据：SKIP_PRODUCT_SEED=1，跳过"
+else
+  echo "==> [c] 预灌兜底演示数据（反爬保险，幂等）..."
+  python3 "$PART1_DIR/scripts/seed_products.py" \
+    || echo "⚠️  预灌兜底数据未成功——不阻断部署；门户对话不受影响，可稍后手动重试：
+       python3 $PART1_DIR/scripts/seed_products.py"
+fi
+
 echo ""
-echo "==> [c] 预装前端依赖..."
+echo "==> [d] 预装前端依赖..."
 if command -v npm >/dev/null; then
   (cd "$PART2_DIR/web" && npm install --no-audit --no-fund) || echo "⚠️  npm install 失败，可稍后手动重试"
 fi
