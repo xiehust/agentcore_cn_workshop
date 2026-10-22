@@ -103,7 +103,7 @@ cd "$PART1_DIR/agent"
 agentcore configure --entrypoint main.py --name "$AGENT_NAME" --region "$REGION" \
   --requirements-file requirements.txt --non-interactive --disable-memory \
   --deployment-type direct_code_deploy
-agentcore launch \
+agentcore launch --auto-update-on-conflict \
   --env WRITER_LAMBDA_NAME="$WRITER_NAME" \
   ${OPENAI_API_KEY:+--env OPENAI_API_KEY="$OPENAI_API_KEY"} \
   ${AWS_BEARER_TOKEN_BEDROCK:+--env AWS_BEARER_TOKEN_BEDROCK="$AWS_BEARER_TOKEN_BEDROCK"} \

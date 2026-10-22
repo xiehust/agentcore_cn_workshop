@@ -747,7 +747,7 @@ agentcore configure --entrypoint main.py --name "$AGENT_NAME" --region "$REGION"
   --requirements-file requirements.txt --non-interactive --disable-memory \
   --deployment-type direct_code_deploy \
   --authorizer-config "$RUNTIME_AUTH_CONFIG"
-agentcore launch \
+agentcore launch --auto-update-on-conflict \
   --env GATEWAY_URL="$GATEWAY_URL" \
   --env IDENTITY_PROVIDER_NAME="$IDENTITY_PROVIDER_NAME" \
   --env DB_LAMBDA_NAME="$DB_LAMBDA_NAME" \
