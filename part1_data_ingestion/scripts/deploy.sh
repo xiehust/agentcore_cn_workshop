@@ -316,7 +316,7 @@ agentcore configure --entrypoint main.py --name "$AGENT_NAME" --region "$REGION"
   --deployment-type direct_code_deploy
 # launch：direct_code_deploy 模式直接把代码部署到 Runtime（本机无需 Docker）
 #（MODEL_ID / OPENAI_BASE_URL 不设则用 main.py 内置默认值）
-agentcore launch \
+agentcore launch --auto-update-on-conflict \
   --env WRITER_LAMBDA_NAME="$WRITER_NAME" \
   ${OPENAI_API_KEY:+--env OPENAI_API_KEY="$OPENAI_API_KEY"} \
   ${AWS_BEARER_TOKEN_BEDROCK:+--env AWS_BEARER_TOKEN_BEDROCK="$AWS_BEARER_TOKEN_BEDROCK"} \
