@@ -3,6 +3,12 @@
 # 职责：区域/分区推导、workshop 目录定位、Python venv 与 agentcore CLI 保障、
 #       模型三元组校验（与 workshop 原 deploy.sh 的 fail-fast 逻辑一致）。
 
+# ---- 依赖版本锁（单一事实源，见仓库根 versions.sh）----
+# 本文件在 agentcore_cn_hands_on/scripts/ 下，versions.sh 在仓库根（上两级）。
+_VER_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/versions.sh"
+# shellcheck disable=SC1090
+[ -f "$_VER_FILE" ] && . "$_VER_FILE"
+
 # ---- 区域/分区推导：区域代码是唯一开关（us-west-2 / cn-northwest-1 ...） ----
 REGION="${AWS_REGION:-us-west-2}"
 export AWS_REGION="$REGION"
@@ -159,12 +165,10 @@ ensure_venv() {
   fi
   # shellcheck disable=SC1091
   source "$WORKSHOP_DIR/.venv/bin/activate"
-  # 版本锁定（与模板 bootstrap 保持同一组数字）：toolkit 的 CLI 在弃用流程中、
-  # 行为随版本漂移（0.3.13 起默认 CodeBuild 容器部署，aws-cn 必挂）；uv 是
-  # direct_code_deploy 打包的硬前置。两者都锁到端到端实测过的版本，
-  # 升级前先在一次完整建栈 + 02/03 里验证再改这两个数字
-  TOOLKIT_VERSION="0.3.14"
-  UV_VERSION="0.12.23"
+  # 版本锁定：统一取自仓库根 versions.sh（本文件顶部已 source）。versions.sh
+  # 缺失时兜底到实测版本，保证单机独立运行也不崩。改版本请改 versions.sh。
+  TOOLKIT_VERSION="${TOOLKIT_VERSION:-0.3.14}"
+  UV_VERSION="${UV_VERSION:-0.12.23}"
   if ! "$WORKSHOP_DIR/.venv/bin/pip" show bedrock-agentcore-starter-toolkit >/dev/null 2>&1; then
     echo "==> 安装 bedrock-agentcore-starter-toolkit==${TOOLKIT_VERSION}（agentcore CLI）..."
     pip install -q --upgrade pip

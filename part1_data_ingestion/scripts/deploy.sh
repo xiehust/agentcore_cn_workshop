@@ -19,6 +19,12 @@
 #   区内模型服务商。key 必填（IAM 铸 token 路径已随 Responses API 一并移除）
 set -euo pipefail
 
+# 依赖版本锁（单一事实源）：本脚本在 part1_data_ingestion/scripts/ 下，
+# versions.sh 在仓库根（上两级）。缺失则各 pip 行用自身兜底，不中断。
+_VER_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/versions.sh"
+# shellcheck disable=SC1090
+[ -f "$_VER_FILE" ] && . "$_VER_FILE"
+
 REGION="${AWS_REGION:-us-west-2}"
 # ---- 分区/域名推导：区域代码是唯一开关（us-west-2 / cn-northwest-1 ...） ----
 case "$REGION" in
@@ -170,7 +176,7 @@ rm -rf "$WRITER_BUILD_DIR" && mkdir -p "$WRITER_BUILD_DIR"
 cp "$PART1_DIR/infra/writer-lambda/handler.py" "$WRITER_BUILD_DIR/"
 # setup_tables.sql 一起打包：建表也由这个函数执行（步骤 3）
 cp "$PART1_DIR/infra/setup_tables.sql" "$WRITER_BUILD_DIR/"
-pip install -q pg8000 -t "$WRITER_BUILD_DIR" >/dev/null
+pip install -q ${PGLIBS_SPEC:-pg8000==1.31.5 scramp==1.4.17 python-dateutil<3.0.0} -t "$WRITER_BUILD_DIR" >/dev/null
 rm -f "$DEPLOY_DIR/writer-lambda.zip"
 (cd "$WRITER_BUILD_DIR" && zip -qr "$DEPLOY_DIR/writer-lambda.zip" .)
 

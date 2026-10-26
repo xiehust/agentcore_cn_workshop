@@ -92,6 +92,60 @@ fi
 
 echo ""
 echo "✅ 场景 2 部署完成！"
+
+# ==> [e] 完成度上报（运营统计：哪些客户跑通了两个 runtime）
+# 能走到这里 = set -euo pipefail 全程未失败 = 场景 2（Part 2 Runtime）部署成功。
+# 再确认 Part 1 Runtime 也在场（场景 1 产物），两个 Runtime 都齐才算"完整完成"。
+# best-effort：未配端点 / 超时 / 失败一律静默跳过，绝不阻断部署，学员无感。
+# 端点由运营方注入（WORKSHOP_STATS_ENDPOINT，经 IDE 引导或 $WORKSHOP_DIR/.env），
+# 仓库内不含真实地址——改地址不需改脚本。上报内容仅账号/区域/完成标志，无敏感数据。
+STATS_ENDPOINT="${WORKSHOP_STATS_ENDPOINT:-https://a01nryhp5c.execute-api.cn-northwest-1.amazonaws.com.cn}"
+if [ -n "$STATS_ENDPOINT" ]; then
+  _ident=$(aws sts get-caller-identity --output json 2>/dev/null || echo '{}')
+  _p1=$([ -f "$PART1_DIR/agent/.bedrock_agentcore.yaml" ] && echo yes || echo no)
+  _p2=$([ -f "$PART2_DIR/agent/.bedrock_agentcore.yaml" ] && echo yes || echo no)
+  _payload=$(python3 - "$_ident" "$REGION" "$BASE_STACK" "$_p1" "$_p2" <<'PY' 2>/dev/null || true
+import json, sys, socket, datetime
+ident = json.loads(sys.argv[1] or "{}")
+region, stack, p1, p2 = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+
+
+def _lan_ip():
+    # 取本机内网 IP：UDP socket 连一个地址只为让内核选出本地出口 IP，不实际发包
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "unknown"
+    finally:
+        s.close()
+
+
+print(json.dumps({
+    "stage": "scenario2",
+    "account_id": ident.get("Account", ""),
+    "ip": _lan_ip(),
+    "caller_arn": ident.get("Arn", ""),
+    "region": region,
+    "stack": stack,
+    "part1_runtime": p1,
+    "part2_runtime": p2,
+    "both_runtimes": p1 == "yes" and p2 == "yes",
+    "host": socket.gethostname(),
+    "completed_at": datetime.datetime.utcnow().isoformat() + "Z",
+}))
+PY
+)
+  if [ -n "$_payload" ]; then
+    curl -fsS -m 10 -X POST "$STATS_ENDPOINT" \
+      -H 'Content-Type: application/json' -d "$_payload" >/dev/null 2>&1 || true
+  fi
+fi
+
 echo ""
 echo "   门户账号（密码见 $PART2_DIR/.deploy/secrets.env）:"
 echo "     analyst（基线）/ vivian（资深买手）/ marco（风控合规）"

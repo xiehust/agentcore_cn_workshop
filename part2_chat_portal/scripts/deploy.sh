@@ -29,6 +29,12 @@
 #        建表后更换需换 MEM0_COLLECTION 重建）
 set -euo pipefail
 
+# 依赖版本锁（单一事实源）：本脚本在 part2_chat_portal/scripts/ 下，
+# versions.sh 在仓库根（上两级）。缺失则各 pip 行用自身兜底，不中断。
+_VER_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/versions.sh"
+# shellcheck disable=SC1090
+[ -f "$_VER_FILE" ] && . "$_VER_FILE"
+
 REGION="${AWS_REGION:-us-west-2}"
 # ---- 分区/域名推导：区域代码是唯一开关（us-west-2 / cn-northwest-1 ...） ----
 case "$REGION" in
@@ -222,7 +228,7 @@ _bootstrap_writer_check_tables() {
   rm -rf "$build_dir" && mkdir -p "$build_dir"
   cp "$PART1_DIR/infra/writer-lambda/handler.py" "$build_dir/"
   cp "$PART1_DIR/infra/setup_tables.sql" "$build_dir/"
-  pip install -q pg8000 -t "$build_dir" >/dev/null
+  pip install -q ${PGLIBS_SPEC:-pg8000==1.31.5 scramp==1.4.17 python-dateutil<3.0.0} -t "$build_dir" >/dev/null
   rm -f "$DEPLOY_DIR/writer-bootstrap.zip"
   (cd "$build_dir" && zip -qr "$DEPLOY_DIR/writer-bootstrap.zip" .)
   aws lambda update-function-code --function-name "$WRITER_NAME" --region "$REGION" \
@@ -509,7 +515,7 @@ echo "==> [3/10] 打包并部署数据查询 Lambda（VPC 内直连 Aurora）...
 LAMBDA_BUILD_DIR="$DEPLOY_DIR/lambda-build"
 rm -rf "$LAMBDA_BUILD_DIR" && mkdir -p "$LAMBDA_BUILD_DIR"
 cp "$PART2_DIR/infra/analytics-lambda/handler.py" "$LAMBDA_BUILD_DIR/"
-pip install -q pg8000 -t "$LAMBDA_BUILD_DIR" >/dev/null
+pip install -q ${PGLIBS_SPEC:-pg8000==1.31.5 scramp==1.4.17 python-dateutil<3.0.0} -t "$LAMBDA_BUILD_DIR" >/dev/null
 (cd "$LAMBDA_BUILD_DIR" && zip -qr "$DEPLOY_DIR/analytics-lambda.zip" .)
 
 LAMBDA_ENV="Variables={DB_HOST=$CLUSTER_ENDPOINT,DB_NAME=$DATABASE,DB_SECRET_ARN=$DB_SECRET_ARN}"
@@ -552,7 +558,7 @@ echo "==> [4/10] 打包并部署记忆向量 Lambda（mem0 pgvector 数据面）
 MEMORY_BUILD_DIR="$DEPLOY_DIR/memory-lambda-build"
 rm -rf "$MEMORY_BUILD_DIR" && mkdir -p "$MEMORY_BUILD_DIR"
 cp "$PART2_DIR/infra/memory-lambda/handler.py" "$MEMORY_BUILD_DIR/"
-pip install -q pg8000 -t "$MEMORY_BUILD_DIR" >/dev/null
+pip install -q ${PGLIBS_SPEC:-pg8000==1.31.5 scramp==1.4.17 python-dateutil<3.0.0} -t "$MEMORY_BUILD_DIR" >/dev/null
 (cd "$MEMORY_BUILD_DIR" && zip -qr "$DEPLOY_DIR/memory-lambda.zip" .)
 
 MEMORY_LAMBDA_ENV="Variables={DB_HOST=$CLUSTER_ENDPOINT,DB_NAME=$DATABASE,DB_SECRET_ARN=$DB_SECRET_ARN}"
@@ -608,7 +614,7 @@ echo "    打包并部署通用数据面 Lambda（$DB_LAMBDA_NAME）..."
 DB_BUILD_DIR="$DEPLOY_DIR/db-lambda-build"
 rm -rf "$DB_BUILD_DIR" && mkdir -p "$DB_BUILD_DIR"
 cp "$PART2_DIR/infra/db-lambda/handler.py" "$DB_BUILD_DIR/"
-pip install -q pg8000 -t "$DB_BUILD_DIR" >/dev/null
+pip install -q ${PGLIBS_SPEC:-pg8000==1.31.5 scramp==1.4.17 python-dateutil<3.0.0} -t "$DB_BUILD_DIR" >/dev/null
 (cd "$DB_BUILD_DIR" && zip -qr "$DEPLOY_DIR/db-lambda.zip" .)
 
 DB_LAMBDA_ENV="Variables={DB_HOST=$CLUSTER_ENDPOINT,DB_NAME=$DATABASE,DB_SECRET_ARN=$DB_SECRET_ARN}"

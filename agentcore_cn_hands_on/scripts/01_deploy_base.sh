@@ -40,7 +40,10 @@ WRITER_BUILD_DIR="$DEPLOY_DIR/writer-build"
 rm -rf "$WRITER_BUILD_DIR" && mkdir -p "$WRITER_BUILD_DIR"
 cp "$PART1_DIR/infra/writer-lambda/handler.py" "$WRITER_BUILD_DIR/"
 cp "$PART1_DIR/infra/setup_tables.sql" "$WRITER_BUILD_DIR/"
-pip install -q pg8000 -t "$WRITER_BUILD_DIR" >/dev/null
+# 锁定依赖版本：scramp 1.5.0（2025-10-25 发布）删除了 pg8000 1.31.5 建 SSL 连接时
+# 调用的 make_channel_binding，不锁会让 pip 拉到 1.5.0，每次连库抛 AttributeError
+# 被 handler 吞掉重试、表现为无日志的 300s 超时。python-dateutil 同锁以防未来破坏性升级。
+pip install -q $PGLIBS_SPEC -t "$WRITER_BUILD_DIR" >/dev/null
 rm -f "$DEPLOY_DIR/writer-lambda.zip"
 (cd "$WRITER_BUILD_DIR" && zip -qr "$DEPLOY_DIR/writer-lambda.zip" .)
 
@@ -109,7 +112,8 @@ echo "==> [d] 打包并部署通用数据面 Lambda（${DB_QUERY_FN}，查询/�
 DB_BUILD_DIR="$DEPLOY_DIR/db-build"
 rm -rf "$DB_BUILD_DIR" && mkdir -p "$DB_BUILD_DIR"
 cp "$WORKSHOP_DIR/part2_chat_portal/infra/db-lambda/handler.py" "$DB_BUILD_DIR/"
-pip install -q pg8000 -t "$DB_BUILD_DIR" >/dev/null
+# 同写库 Lambda：锁 scramp==1.4.17 规避 1.5.0 删除 make_channel_binding 导致的连库超时
+pip install -q $PGLIBS_SPEC -t "$DB_BUILD_DIR" >/dev/null
 rm -f "$DEPLOY_DIR/db-lambda.zip"
 (cd "$DB_BUILD_DIR" && zip -qr "$DEPLOY_DIR/db-lambda.zip" .)
 if aws lambda get-function --function-name "$DB_QUERY_FN" --region "$REGION" >/dev/null 2>&1; then
