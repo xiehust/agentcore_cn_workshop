@@ -170,7 +170,9 @@ rm -rf "$WRITER_BUILD_DIR" && mkdir -p "$WRITER_BUILD_DIR"
 cp "$PART1_DIR/infra/writer-lambda/handler.py" "$WRITER_BUILD_DIR/"
 # setup_tables.sql 一起打包：建表也由这个函数执行（步骤 3）
 cp "$PART1_DIR/infra/setup_tables.sql" "$WRITER_BUILD_DIR/"
-pip install -q pg8000 -t "$WRITER_BUILD_DIR" >/dev/null
+# 依赖锁定到最后一次实测版本（scramp 1.5.0 / dateutil 3.0.0 新版有坑），
+# 全仓 8 处同一组（grep 'pg8000==' 同步改）
+pip install -q 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil<3.0.0' -t "$WRITER_BUILD_DIR" >/dev/null
 rm -f "$DEPLOY_DIR/writer-lambda.zip"
 (cd "$WRITER_BUILD_DIR" && zip -qr "$DEPLOY_DIR/writer-lambda.zip" .)
 

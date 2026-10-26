@@ -277,3 +277,17 @@ CDN 迁出个人账号以双通道互备作为短期缓解）：
 - **压测方法踩坑**：压测机残留的同名环境变量（`OPENAI_API_KEY=EMPTY`）会静默
   顶掉 stdin 传入的 key——脚本打印 key 来源与长度并先发预检请求，失败不开压；
   ab 对 token 端点报的 `Failed requests` 全是 `Length` 误报，以 Non-2xx 为准。
+
+### 数据面 Lambda 打包依赖锁定（2026-10-26）
+
+全仓 8 处 `pip install pg8000`（publish-assets.sh 的 zip 预构建、01_deploy_base.sh、
+part1/part2 deploy.sh）原先不锁版本，传递依赖随 PyPI 漂移：2026-10 scramp 发布
+1.5.0 后实测出问题，python-dateutil 同期发布 3.0.0（未实测）。已全部锁定到
+最后一次全量实测基线（即 10/22 活动所用 CDN zip 内版本）：
+`pg8000==1.31.5 + scramp==1.4.17 + python-dateutil<3.0.0`——该组合的 pip 解析结果
+与基线 zip 逐包一致（dateutil 2.9.0.post0、asn1crypto 1.5.1、six 1.17.0）。
+升级流程：全仓 `grep 'pg8000=='` 一次同步 8 处，再完整建栈 + 02/03 实测。
+Agent 侧 requirements 不含 pg8000，且 botocore 自带 `python-dateutil<3.0.0`
+上界约束，不受本次漂移影响。注意 CDN 上的预构建 zip（10/16 发布）本就
+含好版本，受影响的是脚本现场 pip 安装的路径——修复需随 workshop 代码包
+重新发布 CDN 才能到达学员环境。
