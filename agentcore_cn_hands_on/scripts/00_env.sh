@@ -4,10 +4,14 @@
 #       模型三元组校验（与 workshop 原 deploy.sh 的 fail-fast 逻辑一致）。
 
 # ---- 依赖版本锁（单一事实源，见仓库根 versions.sh）----
-# 本文件在 agentcore_cn_hands_on/scripts/ 下，versions.sh 在仓库根（上两级）。
-_VER_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/versions.sh"
-# shellcheck disable=SC1090
-[ -f "$_VER_FILE" ] && . "$_VER_FILE"
+# 两种布局：仓库内（本文件上两级 = 仓库根）；学员 IDE 平铺
+# （environment/{agentcore_cn_workshop, agentcore_cn_hands_on}，versions.sh
+# 在 agentcore_cn_workshop/ 里）。两个位置依次探测。
+_VER_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+for _VER_FILE in "$_VER_BASE/versions.sh" "$_VER_BASE/agentcore_cn_workshop/versions.sh"; do
+  # shellcheck disable=SC1090
+  if [ -f "$_VER_FILE" ]; then . "$_VER_FILE"; break; fi
+done
 
 # ---- 区域/分区推导：区域代码是唯一开关（us-west-2 / cn-northwest-1 ...） ----
 REGION="${AWS_REGION:-us-west-2}"
