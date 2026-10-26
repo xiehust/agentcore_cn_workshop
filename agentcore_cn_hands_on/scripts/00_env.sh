@@ -165,9 +165,10 @@ ensure_venv() {
   # 升级前先在一次完整建栈 + 02/03 里验证再改这两个数字
   TOOLKIT_VERSION="0.3.14"
   UV_VERSION="0.12.23"
+  PIP_VERSION="26.2.2"
   if ! "$WORKSHOP_DIR/.venv/bin/pip" show bedrock-agentcore-starter-toolkit >/dev/null 2>&1; then
     echo "==> 安装 bedrock-agentcore-starter-toolkit==${TOOLKIT_VERSION}（agentcore CLI）..."
-    pip install -q --upgrade pip
+    pip install -q --upgrade "pip==${PIP_VERSION}"
     pip install -q "bedrock-agentcore-starter-toolkit==${TOOLKIT_VERSION}" "uv==${UV_VERSION}"
   fi
   # uv：direct_code_deploy 模式打包依赖的硬前置（旧环境可能只装了 toolkit）

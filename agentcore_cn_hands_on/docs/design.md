@@ -291,3 +291,16 @@ Agent 侧 requirements 不含 pg8000，且 botocore 自带 `python-dateutil<3.0.
 上界约束，不受本次漂移影响。注意 CDN 上的预构建 zip（10/16 发布）本就
 含好版本，受影响的是脚本现场 pip 安装的路径——修复需随 workshop 代码包
 重新发布 CDN 才能到达学员环境。
+
+同日第二步，**两个 agent/requirements.txt 也全量冻结**（10/22 实测时的精确
+解析结果已不可考——lab 环境与 cn 维护者环境的 Runtime 产物均已销毁，故取
+「实测过的顶层区间 + 2026-10-26 解析」为基线）：顶层固定为 bedrock-agentcore
+1.23.1 / strands-agents 1.62.0 / strands-agents-tools 0.8.10 / mcp 1.30.0 /
+boto3 1.43.118（mem0ai==2.0.20 不变），其下附
+`uv pip compile --universal --python-version 3.11` 生成的传递依赖冻结段
+（约 90 行，带平台 marker，aarch64-manylinux2014 dry-run 验证轮子齐全）。
+工具链安装路径同步收口：00_env.sh 与模板 bootstrap 的 `--upgrade pip` 锁
+`pip==26.2.2`；实验手册 / 两个 README / 部署脚本提示里的裸
+`pip install bedrock-agentcore-starter-toolkit` 全部补 `==0.3.14`。
+顶层新版本（如 strands 1.62）晚于 10/22 实测——下次活动前的完整彩排
+（建栈 + 02/03）即其验证点，冻结保证彩排通过后不再漂移。

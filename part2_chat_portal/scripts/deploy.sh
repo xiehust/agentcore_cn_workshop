@@ -126,7 +126,7 @@ if ! _agentcore_ok agentcore; then
     echo "ℹ️  agentcore 被同名命令遮蔽或未在 PATH，已改用 $REPO_VENV_BIN/agentcore"
   else
     echo "❌ 找不到可用的 agentcore CLI（当前 PATH 里的没有 configure 子命令，可能是 npm 的同名命令）。"
-    echo "   请 pip install bedrock-agentcore-starter-toolkit，或激活装了它的 venv 后重跑。"
+    echo "   请 pip install \"bedrock-agentcore-starter-toolkit==0.3.14\"（实测锁定版本），或激活装了它的 venv 后重跑。"
     exit 1
   fi
 fi
