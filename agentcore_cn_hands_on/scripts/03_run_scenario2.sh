@@ -74,7 +74,7 @@ fi
 echo ""
 echo "==> [d] 预装前端依赖..."
 if command -v npm >/dev/null; then
-  (cd "$PART2_DIR/web" && npm install --no-audit --no-fund) || echo "⚠️  npm install 失败，可稍后手动重试"
+  (cd "$PART2_DIR/web" && npm ci --no-audit --no-fund) || echo "⚠️  npm ci 失败，可稍后手动重试"
 fi
 
 # 把公网门户地址写进前端 env：npm run dev 启动时 vite.config.ts 直接打印该地址

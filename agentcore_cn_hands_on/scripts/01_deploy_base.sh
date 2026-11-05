@@ -42,7 +42,7 @@ cp "$PART1_DIR/infra/writer-lambda/handler.py" "$WRITER_BUILD_DIR/"
 cp "$PART1_DIR/infra/setup_tables.sql" "$WRITER_BUILD_DIR/"
 # 依赖锁定到最后一次实测版本（scramp 1.5.0 / dateutil 3.0.0 新版有坑），
 # 本文件 2 处 + 全仓共 8 处同一组（grep 'pg8000==' 同步改）
-pip install -q 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil<3.0.0' -t "$WRITER_BUILD_DIR" >/dev/null
+pip install -q 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil==2.9.0.post0' -t "$WRITER_BUILD_DIR" >/dev/null
 rm -f "$DEPLOY_DIR/writer-lambda.zip"
 (cd "$WRITER_BUILD_DIR" && zip -qr "$DEPLOY_DIR/writer-lambda.zip" .)
 
@@ -111,7 +111,7 @@ echo "==> [d] 打包并部署通用数据面 Lambda（${DB_QUERY_FN}，查询/�
 DB_BUILD_DIR="$DEPLOY_DIR/db-build"
 rm -rf "$DB_BUILD_DIR" && mkdir -p "$DB_BUILD_DIR"
 cp "$WORKSHOP_DIR/part2_chat_portal/infra/db-lambda/handler.py" "$DB_BUILD_DIR/"
-pip install -q 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil<3.0.0' -t "$DB_BUILD_DIR" >/dev/null
+pip install -q 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil==2.9.0.post0' -t "$DB_BUILD_DIR" >/dev/null
 rm -f "$DEPLOY_DIR/db-lambda.zip"
 (cd "$DB_BUILD_DIR" && zip -qr "$DEPLOY_DIR/db-lambda.zip" .)
 if aws lambda get-function --function-name "$DB_QUERY_FN" --region "$REGION" >/dev/null 2>&1; then
