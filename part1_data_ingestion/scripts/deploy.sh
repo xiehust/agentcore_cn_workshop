@@ -12,18 +12,12 @@
 # 数据面全程不用 RDS Data API（中国区没有该服务，已整体退役）：Agent 与本脚本
 # 写数仓都经写库 Lambda；Part 2 与 CLI 查数仓也已迁到 VPC 内 db Lambda。
 #
-# 前置：aws CLI 已配置凭证；pip install bedrock-agentcore-starter-toolkit
+# 前置：aws CLI 已配置凭证；pip install "bedrock-agentcore-starter-toolkit==0.3.14"
 # 模型：标准 OpenAI 兼容 Chat Completions 端点 + key 三元组——
 #   全球区默认 bedrock-mantle（export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>）；
 #   中国区/自定义端点 export OPENAI_BASE_URL + OPENAI_API_KEY + MODEL_ID 指向
 #   区内模型服务商。key 必填（IAM 铸 token 路径已随 Responses API 一并移除）
 set -euo pipefail
-
-# 依赖版本锁（单一事实源）：本脚本在 part1_data_ingestion/scripts/ 下，
-# versions.sh 在仓库根（上两级）。缺失则各 pip 行用自身兜底，不中断。
-_VER_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/versions.sh"
-# shellcheck disable=SC1090
-[ -f "$_VER_FILE" ] && . "$_VER_FILE"
 
 REGION="${AWS_REGION:-us-west-2}"
 # ---- 分区/域名推导：区域代码是唯一开关（us-west-2 / cn-northwest-1 ...） ----
@@ -103,7 +97,7 @@ if ! _agentcore_ok agentcore; then
     echo "ℹ️  agentcore 被同名命令遮蔽或未在 PATH，已改用 $REPO_VENV_BIN/agentcore"
   else
     echo "❌ 找不到可用的 agentcore CLI（当前 PATH 里的没有 configure 子命令，可能是 npm 的同名命令）。"
-    echo "   请 pip install bedrock-agentcore-starter-toolkit，或激活装了它的 venv 后重跑。"
+    echo "   请 pip install \"bedrock-agentcore-starter-toolkit==0.3.14\"（实测锁定版本），或激活装了它的 venv 后重跑。"
     exit 1
   fi
 fi
@@ -176,7 +170,9 @@ rm -rf "$WRITER_BUILD_DIR" && mkdir -p "$WRITER_BUILD_DIR"
 cp "$PART1_DIR/infra/writer-lambda/handler.py" "$WRITER_BUILD_DIR/"
 # setup_tables.sql 一起打包：建表也由这个函数执行（步骤 3）
 cp "$PART1_DIR/infra/setup_tables.sql" "$WRITER_BUILD_DIR/"
-pip install -q ${PGLIBS_SPEC:-pg8000==1.31.5 scramp==1.4.17 python-dateutil<3.0.0} -t "$WRITER_BUILD_DIR" >/dev/null
+# 依赖锁定到最后一次实测版本（scramp 1.5.0 / dateutil 3.0.0 新版有坑），
+# 全仓 8 处同一组（grep 'pg8000==' 同步改）
+pip install -q 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil==2.9.0.post0' -t "$WRITER_BUILD_DIR" >/dev/null
 rm -f "$DEPLOY_DIR/writer-lambda.zip"
 (cd "$WRITER_BUILD_DIR" && zip -qr "$DEPLOY_DIR/writer-lambda.zip" .)
 

@@ -55,9 +55,9 @@ export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>
 # 3. 安装部署工具链（本 demo 的脚本用 Python 版 CLI 验证过。官方另有 npm 版
 #    @aws/agentcore，但子命令不同——它没有 configure，若装在 PATH 前面会遮蔽
 #    Python 版，导致 deploy.sh 报 unknown command 'configure'；见常见问题）
-pip install bedrock-agentcore-starter-toolkit
+pip install "bedrock-agentcore-starter-toolkit==0.3.14"
 
-# 4.（本地测试需要）安装 Agent 依赖
+# 4.（本地测试需要）安装 Agent 依赖（requirements.txt 已全量锁定版本）
 pip install -r agent/requirements.txt
 ```
 

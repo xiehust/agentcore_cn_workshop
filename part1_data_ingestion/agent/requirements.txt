@@ -1,13 +1,111 @@
+# ============ 顶层依赖（版本锁定） ============
+# 锁定于 2026-10-26（scramp 1.5.0 传递依赖漂移事件后全量冻结）：顶层区间
+# （bedrock-agentcore>=1.1 / strands-agents>=1.50 / tools>=0.8 / boto3>=1.43）
+# 已被 10/22 活动全量实测覆盖，此处固定为 2026-10-26 的解析结果；下方冻结段由
+# `uv pip compile requirements.txt --universal --python-version 3.11` 生成。
+# 升级流程：只改本段版本 → 删掉冻结段重新 compile → 完整建栈 + 02/03 实测。
+
 # AgentCore SDK（Runtime 入口 + 内置工具客户端；
 # tools/browser_ext.py 基于 1.1.x 的 BrowserClient 扩展）
-bedrock-agentcore>=1.1.0
-# Strands Agents 框架（含 Skill / AgentSkills 插件，需要较新版本）
+bedrock-agentcore==1.23.1
+# Strands Agents 框架（含 Skill / AgentSkills 插件）
 # openai extra：OpenAIModel（标准 Chat Completions）依赖 openai SDK
 #（全球区默认模型 openai.gpt-5.6-terra 走 bedrock-mantle 兼容端点，中国区换三元组）
-strands-agents[openai]>=1.50.0
+strands-agents[openai]==1.62.0
 # Strands 官方工具集（AgentCoreBrowser / AgentCoreCodeInterpreter）
 # extras 会带上 playwright、nest_asyncio 等浏览器/沙箱工具的底层依赖
-strands-agents-tools[agent_core_browser,agent_core_code_interpreter]>=0.8.0
+strands-agents-tools[agent_core_browser,agent_core_code_interpreter]==0.8.10
 # AWS SDK（redshift-data 入库；browser profile / browserSigning
 # 参数需要较新的 botocore API 模型）
-boto3>=1.43.0
+boto3==1.43.118
+
+# ============ 传递依赖冻结（勿手改；重新生成见文件头） ============
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.5
+aiosignal==1.4.0
+annotated-types==0.8.0
+anyio==4.15.1
+attrs==26.1.0
+aws-bedrock-token-generator==1.1.0
+aws-requests-auth==0.4.3
+beautifulsoup4==4.15.0
+botocore==1.43.118
+certifi==2026.10.23
+cffi==2.1.1 ; platform_python_implementation != 'PyPy'
+charset-normalizer==3.5.2
+click==8.5.0
+colorama==0.4.6 ; sys_platform == 'win32'
+cryptography==50.0.2
+dill==0.4.1
+distro==1.9.0
+docstring-parser==0.18.0
+frozenlist==1.8.0
+greenlet==3.5.6
+h11==0.16.0
+httpcore==1.0.9
+httpcore2==2.16.0 ; sys_platform != 'emscripten'
+httpx==0.28.1
+httpx2==2.16.0
+httpx2-jsfetch==1.0 ; python_full_version >= '3.12' and sys_platform == 'emscripten'
+idna==3.20
+jiter==0.18.0
+jmespath==1.1.0
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+markdown-it-py==4.2.0
+markdownify==1.2.3
+mcp==2.1.1
+mcp-types==2.1.1
+mdurl==0.1.2
+mpmath==1.3.0
+multidict==7.2.1
+nest-asyncio==1.6.0
+openai==2.54.0
+opentelemetry-api==1.45.1
+opentelemetry-instrumentation==0.66b1
+opentelemetry-instrumentation-threading==0.66b1
+opentelemetry-sdk==1.45.1
+opentelemetry-semantic-conventions==0.66b1
+packaging==26.3
+pillow==12.3.0
+playwright==1.64.1
+prompt-toolkit==3.0.53
+propcache==0.5.4
+pycparser==3.12 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
+pydantic==2.14.1
+pydantic-core==2.50.1
+pyee==13.0.1 ; python_full_version < '3.12'
+pyee==14.0.0 ; python_full_version >= '3.12'
+pygments==2.21.0
+pyjwt==2.15.1
+python-dateutil==2.9.0.post0
+python-multipart==0.0.32
+pywin32==312 ; sys_platform == 'win32'
+pyyaml==6.0.3
+referencing==0.37.0
+requests==2.34.2
+rich==15.0.0
+rpds-py==2026.9.1
+s3transfer==0.19.3
+six==1.17.0
+slack-bolt==1.30.0
+slack-sdk==3.45.0
+sniffio==1.3.1
+soupsieve==2.10 ; python_full_version < '3.11.5'
+soupsieve==3.0.4 ; python_full_version >= '3.11.5'
+sse-starlette==3.6.0
+starlette==1.10.0
+sympy==1.14.0
+tenacity==9.2.1
+tqdm==4.70.1
+truststore==0.10.5 ; sys_platform != 'emscripten'
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+tzdata==2026.5 ; sys_platform == 'win32'
+urllib3==2.8.0
+uvicorn==0.54.0
+watchdog==6.0.0
+wcwidth==0.9.4
+websockets==17.3
+wrapt==2.5.1
+yarl==1.25.1

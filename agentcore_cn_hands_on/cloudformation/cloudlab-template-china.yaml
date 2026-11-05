@@ -1114,7 +1114,7 @@ Resources:
                     sudo -u ec2-user bash -c '
                       cd /home/ec2-user/environment/agentcore_cn_workshop
                       [ -x .venv/bin/pip ] || python3.11 -m venv .venv
-                      .venv/bin/pip -q install --upgrade pip
+                      .venv/bin/pip -q install --upgrade "pip==26.2.2"
                       # uv：starter-toolkit direct_code_deploy 模式打包依赖的硬前置
                       .venv/bin/pip -q install "bedrock-agentcore-starter-toolkit==0.3.14" "uv==0.12.23"
                     '

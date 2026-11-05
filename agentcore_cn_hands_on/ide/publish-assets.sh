@@ -169,12 +169,10 @@ COPYFILE_DISABLE=1 tar czf "$BUILD/workshop-assets.tar.gz" -C "$PACK_ROOT" \
 echo "    $(du -h "$BUILD/workshop-assets.tar.gz" | cut -f1) workshop-assets.tar.gz"
 
 echo "==> [2/4] 构建 6 个数据面 Lambda 包（pg8000 打包）..."
-# 依赖版本锁来自仓库根 versions.sh（scramp 1.5.0 删了 pg8000 调用的
-# make_channel_binding——预构建 zip 不锁版本的话，下一次发布就会把毒化的
-# zip 推给所有新建栈）。source 不到时用与 versions.sh 相同的回退默认值
-_VER_FILE="$WORKSHOP_DIR/versions.sh"
-[ -f "$_VER_FILE" ] && . "$_VER_FILE"
-python3 -m venv "$BUILD/venv" && "$BUILD/venv/bin/pip" -q install ${PGLIBS_SPEC:-pg8000==1.31.5 scramp==1.4.17 python-dateutil<3.0.0} -t "$BUILD/deps"
+# 依赖锁定（最后一次全量实测基线 = 10/22 活动所用 zip）：scramp 1.5.0（2026-10 新发）
+# 实测有问题，锁 1.4.17；python-dateutil 3.0.0 刚发布未经实测，锁 <3。
+# 全仓 8 处 pip install 同一组版本（grep 'pg8000==' 同步改），升级前先完整建栈实测
+python3 -m venv "$BUILD/venv" && "$BUILD/venv/bin/pip" -q install 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil<3.0.0' -t "$BUILD/deps"
 # 写库 Lambda：handler + 建表 SQL + pg8000
 mkdir -p "$BUILD/writer" && cp -R "$BUILD/deps/." "$BUILD/writer/"
 cp "$WORKSHOP_DIR/part1_data_ingestion/infra/writer-lambda/handler.py" \

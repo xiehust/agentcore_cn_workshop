@@ -142,7 +142,8 @@ principal、IMDSv2、模型工具 schema 净化等）与实测结论见
   （`export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>`，默认走
   bedrock-mantle 端点）
 - Python 3.10+，配置好 AWS 凭证（`aws configure`）；
-  `pip install bedrock-agentcore-starter-toolkit uv`
+  `pip install "bedrock-agentcore-starter-toolkit==0.3.14" "uv==0.12.23"`
+  （端到端实测锁定的版本组合）
 
 ## 成本估算（宁夏区，粗略）
 

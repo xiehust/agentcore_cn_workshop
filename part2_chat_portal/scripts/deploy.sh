@@ -29,12 +29,6 @@
 #        建表后更换需换 MEM0_COLLECTION 重建）
 set -euo pipefail
 
-# 依赖版本锁（单一事实源）：本脚本在 part2_chat_portal/scripts/ 下，
-# versions.sh 在仓库根（上两级）。缺失则各 pip 行用自身兜底，不中断。
-_VER_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/versions.sh"
-# shellcheck disable=SC1090
-[ -f "$_VER_FILE" ] && . "$_VER_FILE"
-
 REGION="${AWS_REGION:-us-west-2}"
 # ---- 分区/域名推导：区域代码是唯一开关（us-west-2 / cn-northwest-1 ...） ----
 case "$REGION" in
@@ -132,7 +126,7 @@ if ! _agentcore_ok agentcore; then
     echo "ℹ️  agentcore 被同名命令遮蔽或未在 PATH，已改用 $REPO_VENV_BIN/agentcore"
   else
     echo "❌ 找不到可用的 agentcore CLI（当前 PATH 里的没有 configure 子命令，可能是 npm 的同名命令）。"
-    echo "   请 pip install bedrock-agentcore-starter-toolkit，或激活装了它的 venv 后重跑。"
+    echo "   请 pip install \"bedrock-agentcore-starter-toolkit==0.3.14\"（实测锁定版本），或激活装了它的 venv 后重跑。"
     exit 1
   fi
 fi
@@ -228,7 +222,9 @@ _bootstrap_writer_check_tables() {
   rm -rf "$build_dir" && mkdir -p "$build_dir"
   cp "$PART1_DIR/infra/writer-lambda/handler.py" "$build_dir/"
   cp "$PART1_DIR/infra/setup_tables.sql" "$build_dir/"
-  pip install -q ${PGLIBS_SPEC:-pg8000==1.31.5 scramp==1.4.17 python-dateutil<3.0.0} -t "$build_dir" >/dev/null
+  # 依赖锁定到最后一次实测版本（scramp 1.5.0 / dateutil 3.0.0 新版有坑），
+  # 本文件 4 处 + 全仓共 8 处同一组（grep 'pg8000==' 同步改）
+  pip install -q 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil==2.9.0.post0' -t "$build_dir" >/dev/null
   rm -f "$DEPLOY_DIR/writer-bootstrap.zip"
   (cd "$build_dir" && zip -qr "$DEPLOY_DIR/writer-bootstrap.zip" .)
   aws lambda update-function-code --function-name "$WRITER_NAME" --region "$REGION" \
@@ -515,7 +511,7 @@ echo "==> [3/10] 打包并部署数据查询 Lambda（VPC 内直连 Aurora）...
 LAMBDA_BUILD_DIR="$DEPLOY_DIR/lambda-build"
 rm -rf "$LAMBDA_BUILD_DIR" && mkdir -p "$LAMBDA_BUILD_DIR"
 cp "$PART2_DIR/infra/analytics-lambda/handler.py" "$LAMBDA_BUILD_DIR/"
-pip install -q ${PGLIBS_SPEC:-pg8000==1.31.5 scramp==1.4.17 python-dateutil<3.0.0} -t "$LAMBDA_BUILD_DIR" >/dev/null
+pip install -q 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil==2.9.0.post0' -t "$LAMBDA_BUILD_DIR" >/dev/null
 (cd "$LAMBDA_BUILD_DIR" && zip -qr "$DEPLOY_DIR/analytics-lambda.zip" .)
 
 LAMBDA_ENV="Variables={DB_HOST=$CLUSTER_ENDPOINT,DB_NAME=$DATABASE,DB_SECRET_ARN=$DB_SECRET_ARN}"
@@ -558,7 +554,7 @@ echo "==> [4/10] 打包并部署记忆向量 Lambda（mem0 pgvector 数据面）
 MEMORY_BUILD_DIR="$DEPLOY_DIR/memory-lambda-build"
 rm -rf "$MEMORY_BUILD_DIR" && mkdir -p "$MEMORY_BUILD_DIR"
 cp "$PART2_DIR/infra/memory-lambda/handler.py" "$MEMORY_BUILD_DIR/"
-pip install -q ${PGLIBS_SPEC:-pg8000==1.31.5 scramp==1.4.17 python-dateutil<3.0.0} -t "$MEMORY_BUILD_DIR" >/dev/null
+pip install -q 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil==2.9.0.post0' -t "$MEMORY_BUILD_DIR" >/dev/null
 (cd "$MEMORY_BUILD_DIR" && zip -qr "$DEPLOY_DIR/memory-lambda.zip" .)
 
 MEMORY_LAMBDA_ENV="Variables={DB_HOST=$CLUSTER_ENDPOINT,DB_NAME=$DATABASE,DB_SECRET_ARN=$DB_SECRET_ARN}"
@@ -614,7 +610,7 @@ echo "    打包并部署通用数据面 Lambda（$DB_LAMBDA_NAME）..."
 DB_BUILD_DIR="$DEPLOY_DIR/db-lambda-build"
 rm -rf "$DB_BUILD_DIR" && mkdir -p "$DB_BUILD_DIR"
 cp "$PART2_DIR/infra/db-lambda/handler.py" "$DB_BUILD_DIR/"
-pip install -q ${PGLIBS_SPEC:-pg8000==1.31.5 scramp==1.4.17 python-dateutil<3.0.0} -t "$DB_BUILD_DIR" >/dev/null
+pip install -q 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil==2.9.0.post0' -t "$DB_BUILD_DIR" >/dev/null
 (cd "$DB_BUILD_DIR" && zip -qr "$DEPLOY_DIR/db-lambda.zip" .)
 
 DB_LAMBDA_ENV="Variables={DB_HOST=$CLUSTER_ENDPOINT,DB_NAME=$DATABASE,DB_SECRET_ARN=$DB_SECRET_ARN}"
@@ -978,5 +974,5 @@ if [ -n "${TASKS_API_URL:-}" ]; then
   echo "   Tasks API:     $TASKS_API_URL（任务管理模块，需 Keycloak token）"
 fi
 echo ""
-echo "   启动前端: cd $PART2_DIR/web && npm install && npm run dev"
+echo "   启动前端: cd $PART2_DIR/web && npm ci && npm run dev"
 echo "   然后浏览器打开 http://localhost:5173（用上面的测试账号登录）"
