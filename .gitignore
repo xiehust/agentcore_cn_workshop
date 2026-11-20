@@ -13,5 +13,7 @@ part2_chat_portal/.deploy/
 # 前端
 node_modules/
 part2_chat_portal/web/.env.local
+# workshop 模型配置（含密钥，模板见 .env.example）
+/.env
 part2_chat_portal/web/dist/
 *.tsbuildinfo

@@ -12,7 +12,7 @@
 # 数据面全程不用 RDS Data API（中国区没有该服务，已整体退役）：Agent 与本脚本
 # 写数仓都经写库 Lambda；Part 2 与 CLI 查数仓也已迁到 VPC 内 db Lambda。
 #
-# 前置：aws CLI 已配置凭证；pip install bedrock-agentcore-starter-toolkit
+# 前置：aws CLI 已配置凭证；pip install "bedrock-agentcore-starter-toolkit==0.3.14"
 # 模型：标准 OpenAI 兼容 Chat Completions 端点 + key 三元组——
 #   全球区默认 bedrock-mantle（export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>）；
 #   中国区/自定义端点 export OPENAI_BASE_URL + OPENAI_API_KEY + MODEL_ID 指向
@@ -22,14 +22,17 @@ set -euo pipefail
 REGION="${AWS_REGION:-us-west-2}"
 # ---- 分区/域名推导：区域代码是唯一开关（us-west-2 / cn-northwest-1 ...） ----
 case "$REGION" in
-  cn-*) PARTITION="aws-cn"; AWS_DOMAIN="amazonaws.com.cn"; VPCE_PREFIX="cn.com.amazonaws"
+  cn-*) PARTITION="aws-cn"; AWS_DOMAIN="amazonaws.com.cn"
         # SDK/starter-toolkit 库内硬编码 .amazonaws.com 端点，中国区用官方
         # 环境变量覆盖（agentcore CLI 与 Runtime 内 SDK 都认这两个变量）
         export BEDROCK_AGENTCORE_CP_ENDPOINT="https://bedrock-agentcore-control.$REGION.$AWS_DOMAIN"
         export BEDROCK_AGENTCORE_DP_ENDPOINT="https://bedrock-agentcore.$REGION.$AWS_DOMAIN"
         ;;
-  *)    PARTITION="aws"; AWS_DOMAIN="amazonaws.com"; VPCE_PREFIX="com.amazonaws" ;;
+  *)    PARTITION="aws"; AWS_DOMAIN="amazonaws.com" ;;
 esac
+# 接口端点服务名前缀：cn 分区按服务不一致（execute-api/lambda 带 cn. 前缀），
+# 本脚本只用它探测 secretsmanager——该服务两个 cn 区实测均为 com.amazonaws 前缀
+VPCE_PREFIX="com.amazonaws"
 
 # ---- 模型三元组校验（fail-fast，不再静默丢弃） ----
 # 显式配了 OPENAI_BASE_URL：视为自定义端点，信任成对的 key（任意前缀——中国区
@@ -94,7 +97,7 @@ if ! _agentcore_ok agentcore; then
     echo "ℹ️  agentcore 被同名命令遮蔽或未在 PATH，已改用 $REPO_VENV_BIN/agentcore"
   else
     echo "❌ 找不到可用的 agentcore CLI（当前 PATH 里的没有 configure 子命令，可能是 npm 的同名命令）。"
-    echo "   请 pip install bedrock-agentcore-starter-toolkit，或激活装了它的 venv 后重跑。"
+    echo "   请 pip install \"bedrock-agentcore-starter-toolkit==0.3.14\"（实测锁定版本），或激活装了它的 venv 后重跑。"
     exit 1
   fi
 fi
@@ -167,7 +170,9 @@ rm -rf "$WRITER_BUILD_DIR" && mkdir -p "$WRITER_BUILD_DIR"
 cp "$PART1_DIR/infra/writer-lambda/handler.py" "$WRITER_BUILD_DIR/"
 # setup_tables.sql 一起打包：建表也由这个函数执行（步骤 3）
 cp "$PART1_DIR/infra/setup_tables.sql" "$WRITER_BUILD_DIR/"
-pip install -q pg8000 -t "$WRITER_BUILD_DIR" >/dev/null
+# 依赖锁定到最后一次实测版本（scramp 1.5.0 / dateutil 3.0.0 新版有坑），
+# 全仓 8 处同一组（grep 'pg8000==' 同步改）
+pip install -q 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil==2.9.0.post0' -t "$WRITER_BUILD_DIR" >/dev/null
 rm -f "$DEPLOY_DIR/writer-lambda.zip"
 (cd "$WRITER_BUILD_DIR" && zip -qr "$DEPLOY_DIR/writer-lambda.zip" .)
 
@@ -235,23 +240,30 @@ echo "    建表完成（selection_verdicts / product_candidates + Part 2 的五
 echo "==> [4/6] 创建自定义 Browser（Web Bot Auth）与 Browser Profile..."
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
-# 4a. 自定义 browser 的执行角色：Web Bot Auth 只要求信任策略，无需附加权限策略
+# 4a. 自定义 browser 的执行角色：Web Bot Auth 只要求信任策略，无需附加权限策略。
+# IAM 角色名全局唯一，SourceArn 必须区域通配（锁账号即可）——锁区域会让同账号
+# 第二个区域复用该角色时 CreateBrowser 校验失败；角色已存在时同样收敛信任
+# 策略，自愈旧版脚本创建的锁区域角色
+BROWSER_TRUST_POLICY="{
+  \"Version\": \"2012-10-17\",
+  \"Statement\": [{
+    \"Sid\": \"BedrockAgentCoreBuiltInTools\",
+    \"Effect\": \"Allow\",
+    \"Principal\": {\"Service\": \"bedrock-agentcore.amazonaws.com\"},
+    \"Action\": \"sts:AssumeRole\",
+    \"Condition\": {
+      \"StringEquals\": {\"aws:SourceAccount\": \"$ACCOUNT_ID\"},
+      \"ArnLike\": {\"aws:SourceArn\": \"arn:$PARTITION:bedrock-agentcore:*:$ACCOUNT_ID:*\"}
+    }
+  }]
+}"
 if ! aws iam get-role --role-name "$BROWSER_ROLE_NAME" >/dev/null 2>&1; then
   aws iam create-role --role-name "$BROWSER_ROLE_NAME" \
-    --assume-role-policy-document "{
-      \"Version\": \"2012-10-17\",
-      \"Statement\": [{
-        \"Sid\": \"BedrockAgentCoreBuiltInTools\",
-        \"Effect\": \"Allow\",
-        \"Principal\": {\"Service\": \"bedrock-agentcore.amazonaws.com\"},
-        \"Action\": \"sts:AssumeRole\",
-        \"Condition\": {
-          \"StringEquals\": {\"aws:SourceAccount\": \"$ACCOUNT_ID\"},
-          \"ArnLike\": {\"aws:SourceArn\": \"arn:$PARTITION:bedrock-agentcore:$REGION:$ACCOUNT_ID:*\"}
-        }
-      }]
-    }" >/dev/null
+    --assume-role-policy-document "$BROWSER_TRUST_POLICY" >/dev/null
   echo "    已创建 browser 执行角色: $BROWSER_ROLE_NAME"
+else
+  aws iam update-assume-role-policy --role-name "$BROWSER_ROLE_NAME" \
+    --policy-document "$BROWSER_TRUST_POLICY"
 fi
 BROWSER_ROLE_ARN=$(aws iam get-role --role-name "$BROWSER_ROLE_NAME" --query Role.Arn --output text)
 
@@ -299,11 +311,14 @@ cd "$PART1_DIR/agent"
 # configure：生成 .bedrock_agentcore.yaml（自动创建执行角色 / ECR 仓库）
 # --disable-memory：不自动创建 AgentCore Memory（本 demo 不用自带记忆，
 # Agent 每次调用无状态，历史数据都在 Aurora）
+# 显式 direct_code_deploy：toolkit 0.3.13 起默认 container+CodeBuild，
+# 而 aws-cn 分区无 CodeBuild ARM_CONTAINER；直接代码部署也免本机 Docker
 agentcore configure --entrypoint main.py --name "$AGENT_NAME" --region "$REGION" \
-  --requirements-file requirements.txt --non-interactive --disable-memory
-# launch：默认 direct_code_deploy 模式，直接把代码部署到 Runtime（本机无需 Docker）
+  --requirements-file requirements.txt --non-interactive --disable-memory \
+  --deployment-type direct_code_deploy
+# launch：direct_code_deploy 模式直接把代码部署到 Runtime（本机无需 Docker）
 #（MODEL_ID / OPENAI_BASE_URL 不设则用 main.py 内置默认值）
-agentcore launch \
+agentcore launch --auto-update-on-conflict \
   --env WRITER_LAMBDA_NAME="$WRITER_NAME" \
   ${OPENAI_API_KEY:+--env OPENAI_API_KEY="$OPENAI_API_KEY"} \
   ${AWS_BEARER_TOKEN_BEDROCK:+--env AWS_BEARER_TOKEN_BEDROCK="$AWS_BEARER_TOKEN_BEDROCK"} \

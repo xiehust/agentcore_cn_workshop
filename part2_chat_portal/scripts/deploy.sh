@@ -77,7 +77,9 @@ if [ -n "${OPENAI_BASE_URL:-}" ]; then
 else
   echo "ℹ️  模型端点: bedrock-mantle 默认端点（Bedrock API key 认证）"
 fi
-AURORA_STACK="agentcore-workshop-aurora"
+# 数仓栈名可用环境变量覆盖：hands_on 的 CloudLab 单栈（IDE+数仓合一）输出键
+# 与原 aurora 栈一致，export AURORA_STACK=<栈名> 即可直接复用
+AURORA_STACK="${AURORA_STACK:-agentcore-workshop-aurora}"
 PART2_STACK="agentcore-workshop-part2"
 KC_STACK="agentcore-workshop-keycloak"
 KC_ECR_REPO="agentcore-workshop/keycloak"
@@ -124,15 +126,45 @@ if ! _agentcore_ok agentcore; then
     echo "ℹ️  agentcore 被同名命令遮蔽或未在 PATH，已改用 $REPO_VENV_BIN/agentcore"
   else
     echo "❌ 找不到可用的 agentcore CLI（当前 PATH 里的没有 configure 子命令，可能是 npm 的同名命令）。"
-    echo "   请 pip install bedrock-agentcore-starter-toolkit，或激活装了它的 venv 后重跑。"
+    echo "   请 pip install \"bedrock-agentcore-starter-toolkit==0.3.14\"（实测锁定版本），或激活装了它的 venv 后重跑。"
     exit 1
   fi
 fi
 mkdir -p "$DEPLOY_DIR"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
+# ---- 中央 Keycloak 第三形态（KC_URL_OVERRIDE 非空时启用） ----
+# 学员账号 execute-api 被 ICP recordal 限制时，Keycloak 集中跑在已备案账号，
+# 本脚本只拿「讲师发放」的地址与凭证：凭证必须与中央 realm 烧入值一致，
+# 来自环境变量（推荐填 workshop 根 .env），缺任一 fail-fast。
+KC_OVERRIDE="0"
+if [ -n "${KC_URL_OVERRIDE:-}" ]; then
+  KC_OVERRIDE="1"
+  _kc_missing=""
+  for _v in AGENT_CLIENT_SECRET ANALYST_PASSWORD VIVIAN_PASSWORD MARCO_PASSWORD; do
+    [ -n "${!_v:-}" ] || _kc_missing="$_kc_missing $_v"
+  done
+  if [ -n "$_kc_missing" ]; then
+    echo "❌ 中央 Keycloak 形态（KC_URL_OVERRIDE）缺少配套凭证:$_kc_missing"
+    echo "   这些值须与中央 Keycloak realm 一致，由讲师发放——推荐填入 workshop 根 .env"
+    exit 1
+  fi
+fi
+
 # ---- 部署机密（首次生成后固定，存 .deploy/，已 gitignore） ----
 SECRETS_FILE="$DEPLOY_DIR/secrets.env"
+# 中央 KC 形态：凭证以讲师发放值为准，直接重写 secrets.env（覆盖本地旧值，
+# 保持 get_token.sh / 手册 grep 的消费口径不变；admin 密码在学员侧无消费，占位）
+if [ "$KC_OVERRIDE" = "1" ]; then
+  cat > "$SECRETS_FILE" <<EOF
+KC_ADMIN_PASSWORD=central-managed
+AGENT_CLIENT_SECRET=$AGENT_CLIENT_SECRET
+ANALYST_PASSWORD=$ANALYST_PASSWORD
+VIVIAN_PASSWORD=$VIVIAN_PASSWORD
+MARCO_PASSWORD=$MARCO_PASSWORD
+EOF
+  chmod 600 "$SECRETS_FILE"
+fi
 if [ ! -f "$SECRETS_FILE" ]; then
   cat > "$SECRETS_FILE" <<EOF
 KC_ADMIN_PASSWORD=$(openssl rand -hex 12)
@@ -190,7 +222,9 @@ _bootstrap_writer_check_tables() {
   rm -rf "$build_dir" && mkdir -p "$build_dir"
   cp "$PART1_DIR/infra/writer-lambda/handler.py" "$build_dir/"
   cp "$PART1_DIR/infra/setup_tables.sql" "$build_dir/"
-  pip install -q pg8000 -t "$build_dir" >/dev/null
+  # 依赖锁定到最后一次实测版本（scramp 1.5.0 / dateutil 3.0.0 新版有坑），
+  # 本文件 4 处 + 全仓共 8 处同一组（grep 'pg8000==' 同步改）
+  pip install -q 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil==2.9.0.post0' -t "$build_dir" >/dev/null
   rm -f "$DEPLOY_DIR/writer-bootstrap.zip"
   (cd "$build_dir" && zip -qr "$DEPLOY_DIR/writer-bootstrap.zip" .)
   aws lambda update-function-code --function-name "$WRITER_NAME" --region "$REGION" \
@@ -223,29 +257,115 @@ if ! grep -q '"missing": *\[\]' /tmp/check_tables_out.json; then
 fi
 
 echo "==> [1/10] 部署 Keycloak（ECR + ECS Fargate + API Gateway，首次约需 5-8 分钟）..."
-# 1a. 生成 realm.json（注入机密）并准备构建上下文
-KC_BUILD_DIR="$DEPLOY_DIR/kc-build"
-mkdir -p "$KC_BUILD_DIR"
-cp "$PART2_DIR/infra/keycloak/Dockerfile" "$KC_BUILD_DIR/"
-sed -e "s/__AGENT_CLIENT_SECRET__/$AGENT_CLIENT_SECRET/" \
-    -e "s/__ANALYST_PASSWORD__/$ANALYST_PASSWORD/" \
-    -e "s/__VIVIAN_PASSWORD__/$VIVIAN_PASSWORD/" \
-    -e "s/__MARCO_PASSWORD__/$MARCO_PASSWORD/" \
-    "$PART2_DIR/infra/keycloak/realm-template.json" > "$KC_BUILD_DIR/realm.json"
-
-# 1b. ECR 仓库 + 构建推送
-aws ecr describe-repositories --repository-names "$KC_ECR_REPO" --region "$REGION" >/dev/null 2>&1 \
-  || aws ecr create-repository --repository-name "$KC_ECR_REPO" --region "$REGION" >/dev/null
 ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.$AWS_DOMAIN/$KC_ECR_REPO"
-aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin \
-  "$ACCOUNT_ID.dkr.ecr.$REGION.$AWS_DOMAIN" >/dev/null
-# Fargate 任务定义按 ARM64 运行（便宜且本机可原生构建）；平台显式声明，
-# 在 x86 机器上部署也能交叉构建（本 Dockerfile 无 RUN 步骤）
-docker build -q --platform linux/arm64 -t "$ECR_URI:latest" "$KC_BUILD_DIR"
-docker push -q "$ECR_URI:latest"
-echo "    镜像已推送: $ECR_URI:latest"
+# 镜像已在仓（CloudLab bootstrap 建栈期已渲染构建推送）且非强制重建时跳过——
+# 学员路径零 docker/ecs 写操作；改过 realm-template 用 KC_REDEPLOY=1 重建；
+# 中央 KC 形态下镜像在中央账号，本账号整段不涉
+if [ "$KC_OVERRIDE" = "1" ]; then
+  echo "    中央 Keycloak 形态：跳过本账号镜像构建与推送"
+elif [ "${KC_REDEPLOY:-0}" != "1" ] && aws ecr describe-images --repository-name "$KC_ECR_REPO" \
+    --image-ids imageTag=latest --region "$REGION" >/dev/null 2>&1; then
+  echo "    复用已推送的镜像: $ECR_URI:latest（KC_REDEPLOY=1 可强制重建）"
+else
+  # 1a. 生成 realm.json（注入机密）并准备构建上下文
+  KC_BUILD_DIR="$DEPLOY_DIR/kc-build"
+  mkdir -p "$KC_BUILD_DIR"
+  cp "$PART2_DIR/infra/keycloak/Dockerfile" "$KC_BUILD_DIR/"
+  sed -e "s/__AGENT_CLIENT_SECRET__/$AGENT_CLIENT_SECRET/" \
+      -e "s/__ANALYST_PASSWORD__/$ANALYST_PASSWORD/" \
+      -e "s/__VIVIAN_PASSWORD__/$VIVIAN_PASSWORD/" \
+      -e "s/__MARCO_PASSWORD__/$MARCO_PASSWORD/" \
+      "$PART2_DIR/infra/keycloak/realm-template.json" > "$KC_BUILD_DIR/realm.json"
 
-# 1c. 部署 Keycloak 栈（ECS Fargate + Cloud Map + API Gateway HTTP API + VPC Link）
+  # 1b. ECR 仓库 + 构建推送
+  aws ecr describe-repositories --repository-names "$KC_ECR_REPO" --region "$REGION" >/dev/null 2>&1 \
+    || aws ecr create-repository --repository-name "$KC_ECR_REPO" --region "$REGION" >/dev/null
+  aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin \
+    "$ACCOUNT_ID.dkr.ecr.$REGION.$AWS_DOMAIN" >/dev/null
+  # Fargate 任务定义按 ARM64 运行（便宜且本机可原生构建）；平台显式声明，
+  # 在 x86 机器上部署也能交叉构建（本 Dockerfile 无 RUN 步骤）
+  docker build -q --platform linux/arm64 -t "$ECR_URI:latest" "$KC_BUILD_DIR"
+  docker push -q "$ECR_URI:latest"
+  echo "    镜像已推送: $ECR_URI:latest"
+fi
+
+# 1c. Keycloak 基础设施，两种形态自动选择：
+#     【外部托管】数仓栈（AURORA_STACK，如 CloudLab base 单栈）已预建 Keycloak
+#     基础设施（输出 KeycloakUrl 存在）——服务初始 0 副本，本脚本只负责推镜像后
+#     拉起到 1 副本；KC_HOSTNAME 已由栈内直出，无需两阶段修正。
+#     【独立栈】维持原逻辑：部署 agentcore-workshop-keycloak 栈。
+KC_EXTERNAL="0"
+KC_BASE_URL=$(_aurora_output KeycloakUrl 2>/dev/null || true)
+if [ "$KC_OVERRIDE" = "1" ]; then
+  # 【中央 KC 第三形态】地址/凭证来自讲师发放，本账号零 Keycloak 操作。
+  # base 栈为 CloudLab（有 TasksApiId 输出）时仍复用其预建角色/Lambda/Tasks API
+  # 的栈语义（KC_EXTERNAL=1 的子栈跳过逻辑），但不碰其本地 Keycloak
+  KC_URL="${KC_URL_OVERRIDE%/}"
+  DISCOVERY_URL="$KC_URL/realms/$KC_REALM/.well-known/openid-configuration"
+  echo "    中央 Keycloak（讲师发放）: $KC_URL"
+  BASE_TASKS_API=$(_aurora_output TasksApiId 2>/dev/null || true)
+  if [ -n "$BASE_TASKS_API" ] && [ "$BASE_TASKS_API" != "None" ]; then
+    KC_EXTERNAL="1"
+    PART2_STACK="$AURORA_STACK"
+    TASKS_STACK="$AURORA_STACK"
+  fi
+  echo "    等待中央 Keycloak 在线..."
+  for i in $(seq 1 12); do
+    if ISSUER=$(curl -sf "$DISCOVERY_URL" | python3 -c "import sys,json;print(json.load(sys.stdin)['issuer'])" 2>/dev/null); then
+      break
+    fi
+    [ "$i" -eq 12 ] && { echo "❌ 中央 Keycloak 不可达: $DISCOVERY_URL（确认讲师发放的地址）"; exit 1; }
+    sleep 10
+  done
+elif [ -n "$KC_BASE_URL" ] && [ "$KC_BASE_URL" != "None" ]; then
+  KC_EXTERNAL="1"
+  # 外部托管形态下 part2/part2-tasks 的角色、调度组、Tasks API 也已随 base 栈
+  # 预建（输出键一致）——两个子栈的 cloudformation deploy 全部跳过，
+  # 输出直接从 base 栈读
+  PART2_STACK="$AURORA_STACK"
+  TASKS_STACK="$AURORA_STACK"
+  KC_URL="$KC_BASE_URL"
+  ECS_CLUSTER=$(_aurora_output KeycloakClusterName)
+  ECS_SERVICE=$(_aurora_output KeycloakServiceName)
+  DISCOVERY_URL="$KC_URL/realms/$KC_REALM/.well-known/openid-configuration"
+  echo "    复用预建的 Keycloak 基础设施（外部托管模式）: $KC_URL"
+  # 管理员密码在 base 栈的 Secrets Manager 里，回写 secrets.env 保持后续口径一致
+  KC_ADMIN_SECRET_ARN=$(_aurora_output KeycloakAdminSecretArn 2>/dev/null || true)
+  if [ -n "$KC_ADMIN_SECRET_ARN" ] && [ "$KC_ADMIN_SECRET_ARN" != "None" ]; then
+    KC_ADMIN_PASSWORD=$(aws secretsmanager get-secret-value --secret-id "$KC_ADMIN_SECRET_ARN" \
+      --region "$REGION" --query SecretString --output text \
+      | python3 -c "import sys,json;print(json.load(sys.stdin)['password'])")
+    if grep -q '^KC_ADMIN_PASSWORD=' "$SECRETS_FILE"; then
+      sed -i.bak "s|^KC_ADMIN_PASSWORD=.*|KC_ADMIN_PASSWORD=$KC_ADMIN_PASSWORD|" "$SECRETS_FILE"
+      rm -f "$SECRETS_FILE.bak"
+    else
+      echo "KC_ADMIN_PASSWORD=$KC_ADMIN_PASSWORD" >> "$SECRETS_FILE"
+    fi
+  fi
+  # 副本已在跑（CloudLab 建栈即 DesiredCount=1）且非强制重建时不碰 ecs——
+  # 学员路径零 ecs:UpdateService（受管账号 SCP 常拦该 action，实测）；
+  # KC_REDEPLOY=1 换新镜像时才需要（维护操作，需 ecs 权限/豁免身份）
+  KC_RUNNING=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+    --region "$REGION" --query 'services[0].runningCount' --output text 2>/dev/null || echo 0)
+  if [ "${KC_REDEPLOY:-0}" != "1" ] && [ "${KC_RUNNING:-0}" -ge 1 ] 2>/dev/null; then
+    echo "    Keycloak 服务已在运行（runningCount=$KC_RUNNING），跳过 ecs update-service"
+  else
+    aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+      --desired-count 1 --force-new-deployment --region "$REGION" >/dev/null
+    aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$REGION"
+  fi
+  echo "    Keycloak 地址: $KC_URL，等待启动完成..."
+  for i in $(seq 1 40); do
+    if ISSUER=$(curl -sf "$DISCOVERY_URL" | python3 -c "import sys,json;print(json.load(sys.stdin)['issuer'])" 2>/dev/null); then
+      break
+    fi
+    [ "$i" -eq 40 ] && { echo "❌ 等待 Keycloak 启动超时: $DISCOVERY_URL"; exit 1; }
+    sleep 15
+  done
+fi
+
+if [ "$KC_EXTERNAL" != "1" ] && [ "$KC_OVERRIDE" != "1" ]; then
+# 1c-独立栈. 部署 Keycloak 栈（ECS Fargate + Cloud Map + API Gateway HTTP API + VPC Link）
 #     App Runner 自 2026-04-30 起不接受新客户，改用 Fargate；HTTPS 入口由
 #     API Gateway 提供（免域名的 execute-api 端点，无需 ALB）
 aws cloudformation deploy \
@@ -306,9 +426,63 @@ if [[ "$ISSUER" != https://* ]]; then
     sleep 15
   done
 fi
+fi  # KC_EXTERNAL（独立栈分支结束）
 echo "    Keycloak 就绪，issuer: $ISSUER"
 
+# 外部托管模式：补建 Tasks API 的 JWT authorizer 与各方法路由（幂等）。
+# 这两类资源依赖 Keycloak 在线（authorizer 创建时 API Gateway 会实际校验
+# issuer 的 discovery 端点），无法随 base 栈预建，故在此处收敛。
+# 中央 KC 形态下公网 Tasks API 整体弃用（浏览器流量改走门户同源 vite 代理
+# + lambda.invoke，见 web/vite.config.ts），authorizer/路由不再补建
+if [ "$KC_EXTERNAL" = "1" ] && [ "$KC_OVERRIDE" != "1" ]; then
+  TASKS_API_ID=$(_aurora_output TasksApiId)
+  TASKS_INTEG_ID=$(_aurora_output TasksIntegrationId)
+  if [ -n "$TASKS_API_ID" ] && [ "$TASKS_API_ID" != "None" ]; then
+    echo "    同步 Tasks API 的 JWT authorizer 与路由..."
+    AUTH_ID=$(aws apigatewayv2 get-authorizers --api-id "$TASKS_API_ID" --region "$REGION" \
+      --query "Items[?Name=='keycloak-jwt'].AuthorizerId" --output text)
+    if [ -z "$AUTH_ID" ] || [ "$AUTH_ID" = "None" ]; then
+      AUTH_ID=$(aws apigatewayv2 create-authorizer --api-id "$TASKS_API_ID" --region "$REGION" \
+        --name keycloak-jwt --authorizer-type JWT \
+        --identity-source '$request.header.Authorization' \
+        --jwt-configuration "Audience=analysis-runtime,Issuer=$ISSUER" \
+        --query AuthorizerId --output text)
+      echo "    已创建 authorizer: $AUTH_ID"
+    else
+      # Keycloak 重建后 issuer 可能变化，保持同步
+      aws apigatewayv2 update-authorizer --api-id "$TASKS_API_ID" --region "$REGION" \
+        --authorizer-id "$AUTH_ID" \
+        --jwt-configuration "Audience=analysis-runtime,Issuer=$ISSUER" >/dev/null
+      echo "    复用 authorizer: $AUTH_ID（已同步 issuer）"
+    fi
+    EXISTING_ROUTES=$(aws apigatewayv2 get-routes --api-id "$TASKS_API_ID" --region "$REGION" \
+      --query 'Items[].RouteKey' --output text)
+    while IFS= read -r rk; do
+      if ! printf '%s' "$EXISTING_ROUTES" | grep -qF "$rk"; then
+        aws apigatewayv2 create-route --api-id "$TASKS_API_ID" --region "$REGION" \
+          --route-key "$rk" --authorization-type JWT --authorizer-id "$AUTH_ID" \
+          --target "integrations/$TASKS_INTEG_ID" >/dev/null
+        echo "    已创建路由: $rk"
+      fi
+    done <<'ROUTES'
+GET /tasks
+POST /tasks
+GET /tasks/{proxy+}
+POST /tasks/{proxy+}
+DELETE /tasks/{proxy+}
+GET /runs/{proxy+}
+GET /chat/{proxy+}
+POST /chat/{proxy+}
+PATCH /chat/{proxy+}
+DELETE /chat/{proxy+}
+ROUTES
+  fi
+fi
+
 echo "==> [2/10] 部署分析链路基础设施（CloudFormation）..."
+if [ "$KC_EXTERNAL" = "1" ]; then
+  echo "    外部托管模式：角色已随 base 栈预建，跳过子栈部署"
+else
 aws cloudformation deploy \
   --template-file "$PART2_DIR/infra/part2-analytics.yaml" \
   --stack-name "$PART2_STACK" \
@@ -322,6 +496,7 @@ aws cloudformation deploy \
     "AnalyticsFunctionName=$LAMBDA_NAME" \
     "MemoryFunctionName=$MEMORY_LAMBDA_NAME" \
     "DbFunctionName=$DB_LAMBDA_NAME"
+fi
 
 _part2_output() {
   aws cloudformation describe-stacks --stack-name "$PART2_STACK" --region "$REGION" \
@@ -336,7 +511,7 @@ echo "==> [3/10] 打包并部署数据查询 Lambda（VPC 内直连 Aurora）...
 LAMBDA_BUILD_DIR="$DEPLOY_DIR/lambda-build"
 rm -rf "$LAMBDA_BUILD_DIR" && mkdir -p "$LAMBDA_BUILD_DIR"
 cp "$PART2_DIR/infra/analytics-lambda/handler.py" "$LAMBDA_BUILD_DIR/"
-pip install -q pg8000 -t "$LAMBDA_BUILD_DIR" >/dev/null
+pip install -q 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil==2.9.0.post0' -t "$LAMBDA_BUILD_DIR" >/dev/null
 (cd "$LAMBDA_BUILD_DIR" && zip -qr "$DEPLOY_DIR/analytics-lambda.zip" .)
 
 LAMBDA_ENV="Variables={DB_HOST=$CLUSTER_ENDPOINT,DB_NAME=$DATABASE,DB_SECRET_ARN=$DB_SECRET_ARN}"
@@ -352,6 +527,8 @@ if aws lambda get-function --function-name "$LAMBDA_NAME" --region "$REGION" >/d
   aws lambda wait function-updated --function-name "$LAMBDA_NAME" --region "$REGION"
   echo "    已更新 Lambda: $LAMBDA_NAME"
 else
+  # CloudLab 形态下数据面函数由栈预建，正常不该走到创建分支（SCP 账号创建会被拒）
+  [ "$KC_EXTERNAL" = "1" ] && echo "    ⚠️ $LAMBDA_NAME 不存在（CloudLab 栈应已预建），创建被拒时请重建栈"
   # 新建 IAM 角色到 Lambda 可见有延迟，带重试
   for attempt in $(seq 1 10); do
     if aws lambda create-function --function-name "$LAMBDA_NAME" --region "$REGION" \
@@ -377,7 +554,7 @@ echo "==> [4/10] 打包并部署记忆向量 Lambda（mem0 pgvector 数据面）
 MEMORY_BUILD_DIR="$DEPLOY_DIR/memory-lambda-build"
 rm -rf "$MEMORY_BUILD_DIR" && mkdir -p "$MEMORY_BUILD_DIR"
 cp "$PART2_DIR/infra/memory-lambda/handler.py" "$MEMORY_BUILD_DIR/"
-pip install -q pg8000 -t "$MEMORY_BUILD_DIR" >/dev/null
+pip install -q 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil==2.9.0.post0' -t "$MEMORY_BUILD_DIR" >/dev/null
 (cd "$MEMORY_BUILD_DIR" && zip -qr "$DEPLOY_DIR/memory-lambda.zip" .)
 
 MEMORY_LAMBDA_ENV="Variables={DB_HOST=$CLUSTER_ENDPOINT,DB_NAME=$DATABASE,DB_SECRET_ARN=$DB_SECRET_ARN}"
@@ -392,6 +569,8 @@ if aws lambda get-function --function-name "$MEMORY_LAMBDA_NAME" --region "$REGI
   aws lambda wait function-updated --function-name "$MEMORY_LAMBDA_NAME" --region "$REGION"
   echo "    已更新 Lambda: $MEMORY_LAMBDA_NAME"
 else
+  # CloudLab 形态下数据面函数由栈预建，正常不该走到创建分支（SCP 账号创建会被拒）
+  [ "$KC_EXTERNAL" = "1" ] && echo "    ⚠️ $MEMORY_LAMBDA_NAME 不存在（CloudLab 栈应已预建），创建被拒时请重建栈"
   # 新建 IAM 角色到 Lambda 可见有延迟，带重试
   for attempt in $(seq 1 10); do
     if aws lambda create-function --function-name "$MEMORY_LAMBDA_NAME" --region "$REGION" \
@@ -431,7 +610,7 @@ echo "    打包并部署通用数据面 Lambda（$DB_LAMBDA_NAME）..."
 DB_BUILD_DIR="$DEPLOY_DIR/db-lambda-build"
 rm -rf "$DB_BUILD_DIR" && mkdir -p "$DB_BUILD_DIR"
 cp "$PART2_DIR/infra/db-lambda/handler.py" "$DB_BUILD_DIR/"
-pip install -q pg8000 -t "$DB_BUILD_DIR" >/dev/null
+pip install -q 'pg8000==1.31.5' 'scramp==1.4.17' 'python-dateutil==2.9.0.post0' -t "$DB_BUILD_DIR" >/dev/null
 (cd "$DB_BUILD_DIR" && zip -qr "$DEPLOY_DIR/db-lambda.zip" .)
 
 DB_LAMBDA_ENV="Variables={DB_HOST=$CLUSTER_ENDPOINT,DB_NAME=$DATABASE,DB_SECRET_ARN=$DB_SECRET_ARN}"
@@ -558,10 +737,13 @@ RUNTIME_AUTH_CONFIG="{\"customJWTAuthorizer\": {\"discoveryUrl\": \"$DISCOVERY_U
 cd "$PART2_DIR/agent"
 # --disable-memory 禁用的是 AgentCore 托管 Memory；本 workshop 的长期记忆是
 # 自建 mem0（memory_backend.py + 记忆向量 Lambda），两者无关
+# 显式 direct_code_deploy：toolkit 0.3.13 起默认 container+CodeBuild，
+# 而 aws-cn 分区无 CodeBuild ARM_CONTAINER；直接代码部署也免本机 Docker
 agentcore configure --entrypoint main.py --name "$AGENT_NAME" --region "$REGION" \
   --requirements-file requirements.txt --non-interactive --disable-memory \
+  --deployment-type direct_code_deploy \
   --authorizer-config "$RUNTIME_AUTH_CONFIG"
-agentcore launch \
+agentcore launch --auto-update-on-conflict \
   --env GATEWAY_URL="$GATEWAY_URL" \
   --env IDENTITY_PROVIDER_NAME="$IDENTITY_PROVIDER_NAME" \
   --env DB_LAMBDA_NAME="$DB_LAMBDA_NAME" \
@@ -662,7 +844,8 @@ if [ -z "$PART1_RUNTIME_ARN" ]; then
 else
   # 生产入口（如 CloudFront）通常在首次部署后另行建立。重跑 Part 2 时若没有
   # 显式传 TASKS_ALLOWED_ORIGINS，沿用栈里的现值，不能退回本地默认值。
-  if [ -z "$TASKS_ALLOWED_ORIGINS" ]; then
+  #（外部托管模式下 CORS 由 base 栈的 CFN 管理，本段跳过）
+  if [ -z "$TASKS_ALLOWED_ORIGINS" ] && [ "$KC_EXTERNAL" != "1" ]; then
     TASKS_ALLOWED_ORIGINS=$(aws cloudformation describe-stacks \
       --stack-name "$TASKS_STACK" --region "$REGION" \
       --query "Stacks[0].Parameters[?ParameterKey=='AllowedOrigins'].ParameterValue | [0]" \
@@ -703,7 +886,11 @@ else
     aws cloudformation describe-stacks --stack-name "$TASKS_STACK" --region "$REGION" \
       --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
   }
-  _deploy_tasks_stack "$TASKS_API_ENABLED"
+  if [ "$KC_EXTERNAL" = "1" ]; then
+    echo "    外部托管模式：任务管理角色/调度组/HTTP API 已随 base 栈预建，跳过子栈部署"
+  else
+    _deploy_tasks_stack "$TASKS_API_ENABLED"
+  fi
 
   TASKS_API_ROLE_ARN=$(_tasks_output TasksApiRoleArn)
   RUNNER_ROLE_ARN=$(_tasks_output RunnerRoleArn)
@@ -757,12 +944,20 @@ else
     "Variables={$DB_ENV,RUNNER_FUNCTION_NAME=$RUNNER_NAME,RUNNER_FUNCTION_ARN=$RUNNER_ARN,SCHEDULE_GROUP=$SCHEDULE_GROUP,SCHEDULER_ROLE_ARN=$SCHEDULER_ROLE_ARN,MEMORY_LAMBDA_NAME=$MEMORY_LAMBDA_NAME,MEM0_COLLECTION=$MEM0_COLLECTION,MEM0_EMBEDDER_DIMS=$MEM0_EMBEDDER_DIMS}"
 
   # 首轮：函数就绪后补建 HTTP API（路由 + JWT authorizer + 调用许可）
-  if [ "$TASKS_API_ENABLED" != "true" ]; then
+  #（外部托管模式下 API 已随 base 栈预建，无鸡生蛋问题）
+  if [ "$TASKS_API_ENABLED" != "true" ] && [ "$KC_EXTERNAL" != "1" ] && [ "$KC_OVERRIDE" != "1" ]; then
     echo "    函数已就绪，补建 Tasks HTTP API ..."
     _deploy_tasks_stack "true"
   fi
-  TASKS_API_URL=$(_tasks_output ApiEndpoint)
-  echo "    Tasks API: $TASKS_API_URL"
+  if [ "$KC_OVERRIDE" = "1" ]; then
+    # 中央 KC 形态：Tasks API 私有化——前端走门户同源代理（vite middleware
+    # 验签 JWT 后以实例角色 lambda.invoke tasks-api），公网 API 不再使用
+    TASKS_API_URL="/api/tasks"
+    echo "    Tasks API: 门户同源代理 $TASKS_API_URL（公网 API 已弃用）"
+  else
+    TASKS_API_URL=$(_tasks_output ApiEndpoint)
+    echo "    Tasks API: $TASKS_API_URL"
+  fi
   echo "VITE_TASKS_API_URL=$TASKS_API_URL" >> "$PART2_DIR/web/.env.local"
 fi
 
@@ -779,6 +974,5 @@ if [ -n "${TASKS_API_URL:-}" ]; then
   echo "   Tasks API:     $TASKS_API_URL（任务管理模块，需 Keycloak token）"
 fi
 echo ""
-echo "   启动前端: cd $PART2_DIR/web && npm install && npm run dev"
+echo "   启动前端: cd $PART2_DIR/web && npm ci && npm run dev"
 echo "   然后浏览器打开 http://localhost:5173（用上面的测试账号登录）"
-echo "   命令行冒烟测试: $SCRIPT_DIR/chat_test.sh '看下最近30天的选品漏斗'"

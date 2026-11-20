@@ -21,6 +21,7 @@
     agentcore invoke '{"prompt": "从 eBay 英国站搜索 desk organizer 选品，处理前 3 个非广告商品"}'
 """
 
+import asyncio
 import os
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
@@ -50,6 +51,32 @@ SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 
 # ---- Runtime 入口：HTTP 服务封装（/invocations、/ping 由 SDK 自动提供） ----
 app = BedrockAgentCoreApp()
+
+
+def _sanitize_tool_schema(tool):
+    """剔除工具 schema 里的非标准 JSON Schema 键。
+
+    strands_tools 的 Code Interpreter schema 带 OpenAPI 专有的
+    `"format": "binary"`（FileContent.blob），严格校验的模型端点
+    （实测 Bedrock kimi-k3）会 400 拒绝整个请求，strands 将其吞成
+    空事件流——表象是 Agent 静默零输出。统一剥掉 format 键（JSON
+    Schema 中本为可选注解，对函数调用无语义损失）。
+    """
+    def strip(o):
+        if isinstance(o, dict):
+            return {k: strip(v) for k, v in o.items() if k != "format"}
+        if isinstance(o, list):
+            return [strip(x) for x in o]
+        return o
+
+    try:
+        spec = tool.tool_spec
+        js = spec.get("inputSchema", {}).get("json")
+        if js:
+            spec["inputSchema"]["json"] = strip(js)
+    except Exception:
+        pass
+    return tool
 
 
 def create_browser() -> ExtendedAgentCoreBrowser:
@@ -116,8 +143,8 @@ def create_agent(browser: ExtendedAgentCoreBrowser | None = None) -> Agent:
         conversation_manager=SummarizingConversationManager(summary_ratio=0.5),
         plugins=[skills_plugin],
         tools=[
-            browser.browser,                      # 浏览器工具
-            code_interpreter.code_interpreter,    # 沙箱代码执行工具
+            _sanitize_tool_schema(browser.browser),                    # 浏览器工具
+            _sanitize_tool_schema(code_interpreter.code_interpreter),  # 沙箱代码执行工具
             save_verdict,                         # 判定入库
             save_candidate,                       # 候选档案入库
         ],
@@ -188,10 +215,35 @@ async def invoke(payload: dict):
 
     seen_tool_use_ids: set[str] = set()
     browser_session_reported = False
+    next_event: asyncio.Task | None = None
 
     try:
-        stream = agent.stream_async(prompt)
-        async for event in stream:
+        stream = agent.stream_async(prompt).__aiter__()
+        while True:
+            if next_event is None:
+                next_event = asyncio.ensure_future(stream.__anext__())
+
+            # 浏览器会话是模型第一次调 browser 工具时才惰性创建的，而流事件可能
+            # 被上游整体缓冲到运行末尾才集中到达（实测出现过全程静默、事件挤在
+            # 最后 1 秒的情况）；若上报只挂在流事件上，门户的 Live View 要到
+            # 运行结束前才可见。这里在等流事件的间隙每秒独立轮询一次，
+            # 会话一建立立刻上报，与流事件是否到达解耦。
+            if run_id and not browser_session_reported:
+                done, _ = await asyncio.wait({next_event}, timeout=1.0)
+                session_event = _browser_session_event(browser)
+                if session_event:
+                    browser_session_reported = True
+                    yield session_event
+                if not done:
+                    continue
+
+            try:
+                event = await next_event
+            except StopAsyncIteration:
+                next_event = None
+                break
+            next_event = None
+
             # 结构化进度事件只在门户任务模式（有 run_id）下发，避免影响 CLI 输出
             if run_id:
                 tool_use = event.get("current_tool_use") or {}
@@ -204,16 +256,14 @@ async def invoke(payload: dict):
                         "name": tool_use.get("name", ""),
                         "tool_use_id": tool_use_id,
                     }
-                if not browser_session_reported:
-                    session_event = _browser_session_event(browser)
-                    if session_event:
-                        browser_session_reported = True
-                        yield session_event
 
             # 只转发文本增量事件，减小响应体积；需要完整事件可直接 yield event
             if "data" in event:
                 yield event["data"]
     finally:
+        # 生成器被提前关闭（调用方断流）时，别让挂着的 __anext__ 任务泄漏
+        if next_event is not None and not next_event.done():
+            next_event.cancel()
         # 停止云端浏览器会话；配置了 BROWSER_PROFILE_ID 时会先把会话状态
         # 存回 profile（见 tools/browser_ext.py），不能依赖模型主动 close
         browser._cleanup()

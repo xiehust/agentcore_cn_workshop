@@ -19,6 +19,19 @@ Parameters:
     Type: String
     Default: ""
     Description: 可选。API Gateway 未传 X-Forwarded-Proto 导致 issuer 非 https 时，设为门户完整 URL 强制修正
+  # 单副本（H2 内嵌存储不能多副本）只能纵向扩容。100 并发实测（零失败）：
+  # password grant 1024 → ~11 次/秒、p99 10.7s；2048 → ~21 次/秒、p99 5.6s（近似线性）。
+  # 集中活动建议 2048/4096。改规格会替换任务；realm 不含密钥材料，新任务重新生成
+  # 签名密钥，已签发 token 全部失效，在线用户需重新登录
+  TaskCpu:
+    Type: String
+    Default: "1024"
+    AllowedValues: ["1024", "2048", "4096"]
+    Description: Fargate 任务 CPU 单位（1024 = 1 vCPU）
+  TaskMemory:
+    Type: String
+    Default: "2048"
+    Description: Fargate 任务内存 MiB（须与 TaskCpu 构成合法组合，如 1024/2048、2048/4096、4096/8192）
 
 Conditions:
   HasHostname: !Not [!Equals [!Ref KcHostname, ""]]
@@ -110,15 +123,17 @@ Resources:
       HealthCheckCustomConfig: { FailureThreshold: 1 }
 
   # ---- ECS on Fargate ----
+  # 集群/日志组名从栈名派生（账号内唯一约束）：同账号可共存多套 KC 栈
+  #（如已备案账号同时跑中央 KC 栈与 CloudLab 模拟栈）。消费方均经栈输出取名，零硬编码
   Cluster:
     Type: AWS::ECS::Cluster
     Properties:
-      ClusterName: agentcore-workshop
+      ClusterName: !Ref AWS::StackName
 
   LogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /ecs/agentcore-workshop-keycloak
+      LogGroupName: !Sub /ecs/${AWS::StackName}
       RetentionInDays: 7
 
   ExecutionRole:
@@ -139,8 +154,8 @@ Resources:
       Family: agentcore-workshop-keycloak
       RequiresCompatibilities: [FARGATE]
       NetworkMode: awsvpc
-      Cpu: "1024"
-      Memory: "2048"
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
       RuntimePlatform:
         CpuArchitecture: ARM64          # 镜像由 deploy.sh 按 arm64 构建
         OperatingSystemFamily: LINUX

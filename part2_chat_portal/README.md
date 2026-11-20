@@ -81,7 +81,9 @@ part2_chat_portal/
 │   ├── deploy.sh                 # 一键部署（Keycloak + 基础设施 + Gateway + Runtime + 任务管理模块）
 │   ├── get_token.sh              # 测试辅助：demo 账号换取用户 token
 │   ├── chat_test.sh              # 命令行冒烟测试（流式打印 Agent 回复）
-│   └── memory_test.sh            # 长期记忆冒烟（向量 Lambda 生命周期 + 跨会话回忆）
+│   ├── memory_test.sh            # 长期记忆冒烟（向量 Lambda 生命周期 + 跨会话回忆）
+│   ├── memory_extraction_check.py # 记忆提取行为检查（真实模型 + 本地 qdrant，升级 mem0 前必跑）
+│   └── seed_memories.py          # 预置 vivian/marco 人设记忆；--wipe <用户> 清空某用户记忆
 └── web/                          # 前端 SPA（Vite + React + TS，本地 dev server）
     └── src/
         ├── chat/                 # 会话历史接口（列表 / 注册 / 消息 / 重命名 / 删除）
@@ -105,6 +107,21 @@ export AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>   # 全球区默认 bedrock-ma
 模型 key 必填，脚本会 fail-fast 校验（未配 `OPENAI_BASE_URL` 时 key 必须是
 ABSK 前缀的 Bedrock API key；显式配了 `OPENAI_BASE_URL` 则信任成对的 key，
 但指向 localhost/私网 IP 会被直接拒绝——公网 Runtime 访问不到）。
+
+Keycloak 的三种形态（脚本自动选择）：
+
+| 形态 | 触发条件 | 行为 |
+|---|---|---|
+| 中央 KC（`KC_URL_OVERRIDE` 非空） | 账号 execute-api 受 ICP 备案登记限制时，身份系统集中跑在已备案账号 | 本账号零 Keycloak/ecs 操作；凭证（`AGENT_CLIENT_SECRET` + 三用户密码）须与中央 realm 一致、由环境变量注入；公网 Tasks API 弃用，前端走门户同源 `/api/tasks` 代理（vite middleware 验签 JWT 后 lambda.invoke） |
+| 外部托管 | 数仓栈（CloudLab base 单栈）输出 `KeycloakUrl` | 复用 base 栈预建的 Keycloak 基础设施与镜像 |
+| 独立栈 | 其余情况 | 部署 `agentcore-workshop-keycloak` 栈 |
+
+中央 KC 与独立栈都用 `infra/keycloak-fargate.yaml`（集群/日志组名随栈名派生，
+同账号可共存多套）。单副本（H2 内嵌存储）只能纵向扩容：`TaskCpu`/`TaskMemory`
+参数默认 1 vCPU / 2GB，100 人集中活动建议 2048/4096（中央 KC 已按此运行，压测
+数据见 `agentcore_cn_hands_on/运行手册.md` 第 9 章）。改规格会替换任务并重新生成
+签名密钥（realm 不含密钥材料），已签发 token 失效、在线用户需重新登录，要在无人
+使用时执行。
 
 脚本幂等，可重复执行。首次部署约 10 分钟，共 10 步：Keycloak（1）→ 分析链路
 基础设施与数据查询 Lambda（2-3）→ 记忆向量 Lambda 与通用数据面 db Lambda（4）→
@@ -285,9 +302,17 @@ Runtime（分析 Agent + mem0，公网）                VPC 内
   变化——保证主模型 prompt cache 前缀稳定（每轮检索会把缓存全部打穿）。
   本会话新学到的偏好下个新会话生效。
 - **每轮结束自动沉淀**：正文结束后，本轮问答由 AgentCore tracked async task
-  交给 mem0 做 LLM 事实提取（与既有记忆去重/合并）。SSE 先正常关闭、输入框立即
-  解锁；后台任务用 `HealthyBusy` 保证 microVM 不会提前冻结。提取最坏
-  `MEM0_ADD_TIMEOUT`（默认 20s），连续失败自动熔断。
+  交给 mem0 做 LLM 提取（只新增，与已有记忆语义等价的跳过）。SSE 先正常关闭、
+  输入框立即解锁；后台任务用 `HealthyBusy` 保证 microVM 不会提前冻结。提取最坏
+  `MEM0_ADD_TIMEOUT`（默认 20s，实测单次 2~4s），连续失败自动熔断。
+- **只沉淀长期事实**：提取范围由 `memory_backend.py` 的 `MEMORY_EXTRACTION_RULES`
+  收窄（经 mem0 的 `custom_instructions` 注入）——只从用户消息里记跨会话仍成立的
+  分析偏好/身份/长期规则/明确「记住」的内容，用中文记录；一次性业务提问
+  （"看下选品漏斗"）、查询结果与助手的建议不写入记忆（mem0 内置 prompt 会把
+  这些全记下来，实测一个漏斗提问写入 5 条）。同一偏好再说一遍不会新增条目——
+  已有的那条就是它。规则没进 mem0（如升级 mem0 后配置名变了）时记忆整体禁用。
+  改规则或升级 mem0 前先跑 `scripts/memory_extraction_check.py`（只需模型网关，
+  不碰 AWS）。
 - **永不阻断对话**：mem0 未配置/Lambda 不可达/数据面瞬时故障/提取失败，只降级为
   "本轮或本进程无记忆"，日志（CloudWatch，前缀 `[mem0]`）可查原因。
 

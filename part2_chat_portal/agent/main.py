@@ -98,6 +98,30 @@ SYSTEM_PROMPT = """你是跨境电商选品数据分析助手，运行在 Amazon
 """
 
 
+def _sanitize_tool_schema(tool):
+    """剔除工具 schema 里的非标准 JSON Schema 键（与 part1 同款）。
+
+    strands_tools 的 Code Interpreter schema 带 OpenAPI 专有的
+    `"format": "binary"`，严格校验的模型端点（实测 Bedrock kimi-k3）
+    会 400 拒绝整个请求，strands 将其吞成空事件流。
+    """
+    def strip(o):
+        if isinstance(o, dict):
+            return {k: strip(v) for k, v in o.items() if k != "format"}
+        if isinstance(o, list):
+            return [strip(x) for x in o]
+        return o
+
+    try:
+        spec = tool.tool_spec
+        js = spec.get("inputSchema", {}).get("json")
+        if js:
+            spec["inputSchema"]["json"] = strip(js)
+    except Exception:
+        pass
+    return tool
+
+
 def _create_model() -> OpenAIModel:
     """标准 OpenAI 兼容 Chat Completions：端点 + key + 模型名三元组。
 
@@ -570,7 +594,7 @@ async def invoke(payload: dict, context=None):
         gateway_tools = mcp_client.list_tools_sync()
         agent = Agent(
             model=_create_model(),
-            tools=[*gateway_tools, code_interpreter.code_interpreter],
+            tools=[*gateway_tools, _sanitize_tool_schema(code_interpreter.code_interpreter)],
             # 记忆块拼在 SYSTEM_PROMPT 之后，且整个会话固定不变（见 _MEMORY_SECTION）；
             # 不碰 messages，_HISTORY 与 chat_messages 落库零污染
             system_prompt=SYSTEM_PROMPT + _MEMORY_SECTION.get(session_id, ""),
